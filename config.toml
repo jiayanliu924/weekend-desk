@@ -1,0 +1,113 @@
+# Weekend Desk 配置（对应研究备忘《把世界整理成表格》第七、八章）
+# 规则：本文件只能在周一复核时修改（备忘第八章第四条）。
+# 周五收盘到周日决策之间改动本文件，当周结果会被自动作废。
+
+[market]
+# 7.1 一个品种
+instrument = "xyz:XYZ100"
+# 周边市场（7.2 系统架构：BTC 周末走势）
+peripheral = ["BTC"]
+# XYZ100 前十大权重股（7.3 特征：涉及前十大权重股的事件数）。权重会变，每季度复核一次。
+top10 = ["NVDA", "MSFT", "AAPL", "AMZN", "GOOGL", "GOOG", "META", "AVGO", "TSLA", "NFLX"]
+
+[clock]
+timezone = "America/New_York"
+# 周五外部价格停止时间（美东）
+friday_close = "17:00"
+# 外部参考价格恢复时间（美东，周日晚纳指期货开盘）。备忘 7.1 要求先查清；见 `desk metadata` 报告。
+resume = "18:00"
+# 决策时刻 = 恢复前 15 分钟（备忘 7.1）
+decision_lead_min = 15
+# 恢复后多少秒内的第一个预言机价格算"重开价"
+reopen_grace_sec = 5
+# 模拟平仓：恢复后多少分钟按中间价平仓
+exit_delay_min = 5
+
+[collect]
+# 盘口每隔多少秒存一次（原样保存，只降低采样频率以控制磁盘）
+l2_every_sec = 5
+# 预言机 / 标记价 / 资金费率：每隔多少秒存一次
+ctx_every_sec = 1
+# REST 参数快照间隔（第八章：每周记录预言机与部署方参数快照）
+params_every_sec = 600
+flush_every_sec = 60
+
+[news]
+poll_every_sec = 300
+user_agent = "WeekendDesk research (contact: set-in-.env)"
+# 免费新闻源（7.2 新闻与文本）。某个源失效不影响其他源，`desk status` 会显示每个源最后一次成功时间。
+feeds = [
+  "https://www.federalreserve.gov/feeds/press_all.xml",
+  "https://www.cnbc.com/id/100003114/device/rss/rss.html",
+  "https://www.cnbc.com/id/19854910/device/rss/rss.html",
+  "https://feeds.content.dowjones.io/public/rss/mw_topstories",
+  "https://news.google.com/rss/search?q=Nasdaq+OR+Nvidia+OR+Apple+OR+Microsoft+OR+tariff+OR+Fed+when:1d&hl=en-US&gl=US&ceid=US:en",
+  "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=8-K&count=40&output=atom",
+]
+
+[llm]
+# 7.3 大语言模型抽取：只把文本变成事件表，不做任何价格判断
+model = "claude-haiku-4-5-20251001"
+prompt_version = "v0.1"
+# 模型知识截止日（7.4 第三条：正式成绩只算截止日之后的周末）
+knowledge_cutoff = "2025-03-01"
+# 只抽取这个时间窗内收到的新闻（周五 16:00 至周日决策时刻），控制费用
+window_start = "16:00"
+max_items_per_run = 60
+
+[model]
+# 7.1 主假设 H1：无实质新闻 → 偏离被抹掉；有实质新闻 → 偏离被确认
+# 积累到 min_train 个周末前用 H1 原样规则；之后用线性模型（7.7 第 7–8 周）
+min_train = 12
+materiality_threshold = 2
+feature_version = "f1"
+
+[costs]
+# 7.5 trade.xyz 基础费率（bps）。系统会读取链上 growthMode；开启时按 growth_discount 打折。
+taker_bps = 9.0
+maker_bps = 3.0
+growth_discount = 0.9
+# 交易门槛：预期收益至少超过成本这么多 bps 才模拟出手（7.5："只够容纳选择性出手"）
+edge_buffer_bps = 2.0
+
+[risk]
+# 第八章
+paper_notional_usd = 1000.0
+capital_usd = 2000.0
+max_depth_fraction = 0.10
+rolling_weeks = 8
+rolling_loss_limit = 0.15
+eval_after_weekends = 30
+
+[live]
+# 7.7 第 9–12 周的极小资金实盘。按备忘第八章：实盘前须律师书面确认主体与账户结构。
+enabled = false
+lawyer_confirmed = false
+# 至少跑满多少个"运行干净"的模拟周末才允许实盘（备忘原文为 8 周；实盘阶段目的是验证成交与滑点）
+min_paper_weekends = 3
+
+[options]
+# 第九章 第二阶段：加密期权的事件波动率研究。只做研究，不做市，不卖期权，不下单。
+enabled = true
+currency = "BTC"
+# Deribit 公开行情（免费，无需账户）
+poll_every_sec = 300
+index_every_sec = 60
+# 只保存 10 天内到期、行权价在现价 ±10% 以内的期权，控制磁盘
+max_expiry_days = 10
+moneyness_band = 0.10
+# 事件前多少分钟锁定预测；观察窗口多长
+event_lead_min = 60
+window_hours = 24
+# 每天这个时间（UTC，Deribit 每日到期时刻）锁定一次"对照组"预测
+daily_lock_utc = "08:00"
+# 抽取事件意外程度：事件后多少小时内收到的新闻
+surprise_hours = 3
+# 预测模型：某类样本攒够多少个后改用该类历史均值
+min_history = 5
+# 多少个正式事件后判断假设
+eval_after_events = 20
+
+[notify]
+# 手机推送（ntfy.sh，免费）：在 .env 里填 NTFY_TOPIC
+server = "https://ntfy.sh"
