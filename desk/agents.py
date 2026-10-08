@@ -1,4 +1,4 @@
-"""Agent 讨论团队：22 个 AI 角色分 6 个讨论室 + 主席 + 白话编辑。
+"""Agent 讨论团队：25 个 AI 角色分 7 个讨论室 + 主席 + 白话编辑。
 
 原则（三份设计报告的共识）：
 - Agent 不碰真钱、不改规则、不替代正式预测。正式预测仍由 jobs/model 的固定规则在决策时刻锁定；
@@ -39,6 +39,7 @@ ROOMS = [
     {"key": "niche", "name": "选品种室", "goal": "7 个周末合约（XYZ100、SP500、BRENTOIL、NVDA、TSLA、INTC、SMSN）里，哪个最值得重点做、哪个该放弃；看偏离大小、盘口深浅、手续费、数据干不干净、能放多少钱。"},
     {"key": "trading", "name": "交易室", "goal": "针对下一个周末，每个合约给出模拟盘的倾向：反向押回撤（fade）、顺着偏离（follow）、还是不做（skip），以及仓位比例。这是纸面提案，不会下单，也不改变正式规则。"},
     {"key": "risk", "name": "风控室", "goal": "看交易室的提案和全部资料，找会让我们亏大钱的情形：止损线、开盘跳空、7 个合约同涨同跌、平台/预言机/清算/合规风险。可以否决某个合约的提案。"},
+    {"key": "algo", "name": "算法室", "goal": "设计新的交易算法（周末 7 个合约 + BTC 期权），目标是比现行规则更好。你只能提'方案'，回测由代码在历史数据上做：前 2/3 训练、后 1/3 考试（样本外），试得越多门槛越高。只有考试段赢了现行规则、并过了门槛的方案才算数。"},
     {"key": "audit", "name": "审计室", "goal": "检查今天这场讨论本身靠不靠谱：有没有用到开会之后才出现的信息、引用对不对得上、有没有编数字、规则有没有被改过、实盘锁是否还锁着。代码核对结果已经附上，你要解读并补充。"},
 ]
 
@@ -65,6 +66,10 @@ AGENTS = [
     {"id": "TAIL", "room": "risk", "name": "尾部风险员", "stance": "你想最坏情况：周末出大新闻、开盘跳空 3% 以上、杠杆下会亏多少。"},
     {"id": "CORR", "room": "risk", "name": "相关性员", "stance": "你看 7 个合约是不是其实是一个赌注（美股指数和个股同涨同跌），分散是不是假的。"},
     {"id": "PLATFORM", "room": "risk", "name": "平台风险员", "stance": "你看 Hyperliquid/trade.xyz 本身的风险：预言机、规则变更、清算、提币、合规与律师确认。"},
+    # 算法室（重要：2 个算法设计 + 1 个过拟合法官；数字全部由代码回测）
+    {"id": "QUANT_STAT", "room": "algo", "name": "统计套利算法师", "stance": "你是顶级量化研究员，擅长从价格偏离、均值回归、条件分组里找规律（哪些合约、多大的偏离、什么方向最该做）。你知道 Jane Street 这类公司的优势在数据、速度和纪律，所以你只找我们这种小资金真能做的空隙。"},
+    {"id": "QUANT_VOL", "room": "algo", "name": "波动率算法师", "stance": "你是顶级期权/波动率交易员，擅长隐含波动和实际波动的差（什么时候卖波动、什么时候买、按隐含波动高低分档），也可以设计周末合约的方案。你清楚卖波动平时赚小钱、极端行情亏大钱。"},
+    {"id": "OVERFIT", "room": "algo", "name": "过拟合法官", "stance": "你专门判断算法师的方案是不是在'背答案'：训练段好看、考试段崩；条件设得太细只剩几笔；试了很多次才撞到一个好的。你有权宣布方案无效。"},
     # 审计室（重要：3 个，每个配一个代码核对）
     {"id": "CLOCK", "room": "audit", "name": "时间审计", "stance": "你核对时间：资料是否都早于开会时间，有没有用到之后才出现的信息。"},
     {"id": "CITE", "room": "audit", "name": "引用审计", "stance": "你核对引用：每个论点有没有引用资料编号、引用的编号存不存在、文中数字是不是资料里有的。"},
@@ -105,7 +110,7 @@ def _dir(settings) -> Path:
 def cfg(settings) -> dict:
     d = {"enabled": True, "member_model": "claude-haiku-4-5-20251001", "lead_model": "claude-sonnet-5-5",
          "daily_hour_pt": 6, "daily_minute_pt": 30, "weekend_lead_min": 120, "budget_day_usd": 1.5,
-         "budget_month_usd": 40.0, "max_parallel": 6, "rounds": 2, "manual_cooldown_min": 30,
+         "budget_month_usd": 40.0, "max_parallel": 6, "algo_model": "claude-opus-5-5", "rounds": 2, "manual_cooldown_min": 30,
          "prices": {"claude-haiku-4-5-20251001": [1.0, 5.0], "claude-sonnet-5-5": [2.0, 10.0], "claude-opus-5-5": [4.0, 20.0]}}
     d.update(settings.raw.get("agents", {}) if hasattr(settings, "raw") else {})
     return d
@@ -476,6 +481,54 @@ class Meeting:
         return {"room": room, "rounds": rounds, "synth": synth}
 
 
+    ALGO_SCHEMA = """输出 JSON：
+{"stance": "一句话思路", "plain": "大白话（≤70字）", "points": [{"claim": "理由", "cite": ["F1"]}], "confidence": 0-100,
+ "specs": [方案, 最多 %d 个]}
+方案只能是下面两种格式之一（字段名和取值必须照抄）：
+周末：{"kind": "weekend", "name": "简短名字", "instruments": ["NVDA","INTC"] 或 "all", "direction": "fade" 或 "follow",
+       "min_abs_dev_bps": 数字, "max_abs_dev_bps": 数字, "size": "flat" 或 "proportional"}
+期权：{"kind": "options", "name": "简短名字", "side": "short" 或 "long", "when": "control" 或 "event" 或 "all",
+       "min_implied": 年化隐含波动下限（0.4 表示 40%%）, "max_implied": 上限}"""
+
+    def algo_room(self, facts: Facts, pool=None) -> dict:
+        from . import algolab
+        quants = [BY_ID["QUANT_STAT"], BY_ID["QUANT_VOL"]]
+        judge = BY_ID["OVERFIT"]
+        model = self.c["algo_model"]
+        base = f"资料包：\n{facts.render()}\n\n{algolab.data_summary(self.s)}\n"
+        bt_lines: list[str] = []
+
+        def test(o):
+            res = []
+            for sp in (o["out"].get("specs") or [])[:3]:
+                r = algolab.run_spec(self.s, sp, o["agent"], self.run_id)
+                r["text"] = algolab.describe(r)
+                res.append(r)
+            o["out"]["backtest"] = res
+            bt_lines.extend(f"{o['agent']}：{r['text']}" for r in res)
+            return o
+
+        u1 = base + "\n第一轮：提出你认为能赢现行规则的方案（最多 3 个），说清楚为什么这个规律存在、为什么别人没把它抹平。\n" + (self.ALGO_SCHEMA % 3)
+        r1 = list(pool.map(lambda a: test({"agent": a["id"], "out": self.call(a["id"], model, self.system_for(a), u1)}), quants))
+        res1 = "\n".join(bt_lines)
+        u2q = (base + f"\n第一轮代码回测结果（考试段是样本外）：\n{res1}\n\n第二轮：根据考试段结果改进或放弃。最多 2 个新方案；"
+               "如果都不行就老实说不行、specs 留空。加 \"rebut\" 字段回应过拟合风险。\n" + (self.ALGO_SCHEMA % 2))
+        u2j = (base + f"\n算法师第一轮发言：\n" + "\n".join(f"{o['agent']}：{json.dumps(_strip(o['out']), ensure_ascii=False)}" for o in r1)
+               + f"\n\n代码回测结果：\n{res1}\n\n判断每个方案是不是过拟合、值不值得继续。\n" + self.schema_for("algo"))
+        n_before = len(bt_lines)
+        r2 = list(pool.map(lambda a: test({"agent": a["id"], "out": self.call(a["id"], model, self.system_for(a), u2q)}), quants))
+        r2.append({"agent": judge["id"], "out": self.call(judge["id"], self.c["lead_model"], self.system_for(judge), u2j)})
+        res2 = "\n".join(bt_lines[n_before:])
+        transcript = "\n".join(f"第{i + 1}轮 {o['agent']}：{json.dumps(_strip({k: v for k, v in o['out'].items() if k != 'backtest'}), ensure_ascii=False)}"
+                               for i, rr in enumerate([r1, r2]) for o in rr)
+        sys = ("你是「算法室」的记录员。根据代码回测（不是根据算法师的自我评价）整理结论：哪个方案最好、是否真的赢了现行规则、"
+               "是否过了多次尝试门槛。没有方案过门槛就直说'今天没有找到更好的算法'。\n" + COMMON_RULES)
+        synth = self.call("algo-SYNTH", self.c["lead_model"], sys,
+                          base + f"\n全部回测结果：\n{res1}\n{res2}\n\n讨论记录：\n{transcript}\n\n"
+                          + (SYNTH_SCHEMA % ', "best": "最好的方案名或 无", "beats_rule": true/false'))
+        return {"room": "algo", "rounds": [r1, r2], "synth": synth, "backtests": bt_lines}
+
+
 def _strip(o: dict) -> dict:
     return {k: v for k, v in o.items() if not k.startswith("_") and k not in ("error",)}
 
@@ -543,10 +596,14 @@ def _run(settings, reason, llm, now, push) -> dict:
         m = Meeting(settings, llm or AnthropicLLM(), rid, reason)
         try:
             with ThreadPoolExecutor(max_workers=c["max_parallel"]) as pool:
-                set_state(settings, running=True, stage="期权 / 方法 / 选品种 / 交易 四个室讨论中", run=rid)
-                first = ["options", "js", "niche", "trading"]
-                with ThreadPoolExecutor(max_workers=4) as outer:
-                    res = list(outer.map(lambda r: m.room(r, facts, pool=pool), first))
+                set_state(settings, running=True, stage="期权 / 方法 / 选品种 / 交易 / 算法 五个室讨论中", run=rid)
+                first = ["options", "js", "niche", "trading", "algo"]
+                with ThreadPoolExecutor(max_workers=5) as outer:
+                    res = list(outer.map(lambda r: m.algo_room(facts, pool=pool) if r == "algo" else m.room(r, facts, pool=pool), first))
+                algo = next(r for r in res if r["room"] == "algo")
+                for line in algo.get("backtests", []):
+                    facts.add("算法回测（代码算）", line)
+                rec["facts"] = facts.items
                 for r in res:
                     rec["rooms"][r["room"]] = r
                 ctx = "\n".join(f"【{ROOM_BY_KEY[r['room']]['name']}】{json.dumps(_strip(r['synth']), ensure_ascii=False)}" for r in res)

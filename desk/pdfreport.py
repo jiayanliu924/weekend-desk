@@ -113,7 +113,7 @@ def agents_section(settings) -> list:
     r = agents.last_full_run(settings, within_h=36)
     if not r:
         return []
-    out = [Paragraph("Agent 团队会议（22 个角色）", H2)]
+    out = [Paragraph("Agent 团队会议（25 个角色）", H2)]
     ch = r.get("chair", {})
     out.append(Paragraph(f"<b>{_x(ch.get('headline'))}</b>", P))
     if ch.get("plain"):

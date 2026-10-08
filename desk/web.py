@@ -609,6 +609,10 @@ def _say(o: dict) -> str:
     for pr in out.get("proposal") or []:
         if isinstance(pr, dict):
             extra += f'<span class="tag">{E(str(pr.get("name")))} {E(str(pr.get("lean")))} {E(str(pr.get("size")))}</span>'
+    for bt in out.get("backtest") or []:
+        if isinstance(bt, dict):
+            good = "样本外显著" in bt.get("text", "")
+            extra += f'<div class="note" style="margin:6px 0">代码回测：{E(bt.get("text", ""))}{" ← 过门槛" if good else ""}</div>'
     for v in out.get("veto") or []:
         if isinstance(v, dict):
             extra += f'<span class="tag bad">否决 {E(str(v.get("name")))}：{E(str(v.get("why")))}</span>'
@@ -637,13 +641,13 @@ def agents_page(req: Request, run: str | None = None):
               else f"上次开会：{E(rec['run_id']) if rec else '还没开过'}")
     key_ok = bool(os.environ.get("ANTHROPIC_API_KEY"))
     body = f"""<h1>Agent 讨论室</h1>
-<p class="sub">22 个 AI 角色分 6 个讨论室：期权研究、Jane Street 方法、选品种、交易、风控、审计，外加主席和白话编辑。每天 6:30（加州时间）开一次会，周末决策前 2 小时再开一次。
+<p class="sub">25 个 AI 角色分 7 个讨论室：期权研究、Jane Street 方法、选品种、交易、算法、风控、审计，外加主席和白话编辑。算法室的两个算法师提新算法，代码在历史数据上做样本外回测，过拟合法官判定。每天 6:30（加州时间）开一次会，周末决策前 2 小时再开一次。
 每个室的成员先各自发言，再互相反驳一轮，然后整理出结论和分歧。所有数字只能来自下面的"资料包"，审计室用代码核对。Agent 不碰钱、不改规则。</p>
 <div class="grid">
 <div class="card"><div class="k">状态</div><div class="v s">{status}</div></div>
 <div class="card"><div class="k">今天 / 本月费用（上限）</div><div class="v s">${sp['day']:.2f} / ${sp['month']:.2f}</div><div class="k">上限 ${sp['cap_day']:.2f}/天，${sp['cap_month']:.0f}/月</div></div>
 <div class="card"><div class="k">API key</div><div class="v s {'good' if key_ok else 'bad'}">{'已填' if key_ok else '未填：只能做代码审计'}</div></div>
-<div class="card"><div class="k">手动开会</div><form method="post" action="/agents/run"><button {'disabled' if st.get('running') else ''}>现在开会</button></form><div class="k">约 3–5 分钟，约 $0.5</div></div>
+<div class="card"><div class="k">手动开会</div><form method="post" action="/agents/run"><button {'disabled' if st.get('running') else ''}>现在开会</button></form><div class="k">约 4–6 分钟，约 $0.8</div></div>
 </div>
 {('<p class="note">' + E(req.query_params.get('msg', '')) + '</p>') if req.query_params.get('msg') else ''}
 <div class="daynav" style="margin-top:12px"><span class="k">历次会议：</span>{''.join(f'<a class="tag" href="/agents?run={E(p.stem)}">{E(p.stem[5:10] + " " + p.stem[11:13] + ":" + p.stem[13:15])}</a>' for p in runs)}</div>"""
@@ -687,6 +691,9 @@ def agents_page(req: Request, run: str | None = None):
                 f'<tr><td>{E(str(p.get("name")))}</td><td>{ {"fade": "反向押回撤", "follow": "顺着偏离", "skip": "不做"}.get(str(p.get("lean")), E(str(p.get("lean")))) }</td>'
                 f'<td>{E(str(p.get("size")))}</td><td>{E(str(p.get("why", "")))}</td></tr>' for p in sy["proposal"] if isinstance(p, dict)) + "</table></div>"
                 '<p class="ev">纸面提案，不下单、不改变正式预测规则。</p>')
+        if m["key"] == "algo":
+            prop += (f'<div class="k" style="margin-top:8px">最好的方案：{E(str(sy.get("best", "—")))} · '
+                     f'{"<b class=good>赢了现行规则</b>" if sy.get("beats_rule") is True else "没有赢现行规则"}</div>')
         if sy.get("veto"):
             prop += "<div class=k>否决</div><ul>" + "".join(f'<li class="bad">否决 {E(str(v.get("name")))}：{E(str(v.get("why", "")))}</li>' for v in sy["veto"] if isinstance(v, dict)) + "</ul>"
         rounds = "".join(f"<h3 style='font-size:14px;margin:12px 0 0'>第 {i + 1} 轮</h3>" + "".join(_say(o) for o in rr)

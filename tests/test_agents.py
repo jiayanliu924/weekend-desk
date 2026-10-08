@@ -15,7 +15,8 @@ def test_roster_shape():
         rooms.setdefault(a["room"], []).append(a)
     assert len(agents.AGENTS) >= 20
     for r in agents.ROOMS:
-        assert len(rooms[r["key"]]) >= 3, r["key"]          # 每个室至少 3 个（要求 ≥2，重要的 3）
+        assert len(rooms[r["key"]]) >= 3, r["key"]
+    assert len(agents.AGENTS) >= 25          # 每个室至少 3 个（要求 ≥2，重要的 3）
     assert len({a["id"] for a in agents.AGENTS}) == len(agents.AGENTS)
 
 
@@ -35,6 +36,12 @@ def fake_llm_factory(calls):
                 out["proposal"] = [{"name": "NVDA", "lean": "fade", "size": 0.5, "why": "无新闻"}]
             if "风控室" in system:
                 out["veto"] = [{"name": "TSLA", "why": "跳空风险"}]
+        elif '"specs"' in user:
+            out = {"stance": "找规律", "plain": "偏离大的个股反向做。", "points": [{"claim": "回测", "cite": [c]}], "confidence": 40,
+                   "specs": [{"kind": "weekend", "name": "大偏离反向", "instruments": "all", "direction": "fade",
+                              "min_abs_dev_bps": 30, "max_abs_dev_bps": 1000, "size": "flat"},
+                             {"kind": "options", "name": "普通日卖波动", "side": "short", "when": "control", "min_implied": 0, "max_implied": 9},
+                             {"kind": "bogus"}]}
         else:
             out = {"stance": "谨慎", "plain": "样本太少，先别下结论。", "points": [{"claim": "资料显示样本少", "cite": [c]},
                                                                            {"claim": "编一个数 98765", "cite": ["F999"]}],
@@ -59,7 +66,13 @@ def test_full_meeting_and_audit(env):  # noqa: F811
     assert rec["mode"] == "full", rec.get("degraded_reason")
     members = [a for a in agents.AGENTS if a["room"] not in ("chair", "editor")]
     # 20 members × 2 rounds + 6 room syntheses + chair + editor
-    assert rec["calls"] == len(members) * 2 + 6 + 2 == len(calls)
+    # members × 2 rounds (algo judge only speaks in round 2) + 7 room syntheses + chair + editor
+    assert rec["calls"] == len(members) * 2 - 1 + 7 + 2 == len(calls)
+    algo = rec["rooms"]["algo"]
+    bts = [b for o in algo["rounds"][0] for b in o["out"].get("backtest", [])]
+    assert len(bts) == 6 and sum(1 for b in bts if b.get("error")) == 2       # bogus spec rejected
+    assert all("考试段" in b["text"] for b in bts if not b.get("error"))
+    assert any(f["topic"].startswith("算法回测") for f in rec["facts"])
     assert set(rec["rooms"]) == {r["key"] for r in agents.ROOMS}
     ck = rec["checks"]["cite"]
     assert ck["bad_ids"] and not ck["ok"]                       # F999 doesn't exist
@@ -74,7 +87,7 @@ def test_full_meeting_and_audit(env):  # noqa: F811
     c.post("/login", data={"username": "kea", "password": "correct horse battery"})
     r = c.get("/agents")
     assert r.status_code == 200
-    for t in ("主席结论", "数据正常，继续模拟", "期权研究室", "风控室", "否决 TSLA", "资料包", "引用与数字", "反向押回撤"):
+    for t in ("主席结论", "数据正常，继续模拟", "期权研究室", "风控室", "否决 TSLA", "算法室", "代码回测", "资料包", "引用与数字", "反向押回撤"):
         assert t in r.text, t
     assert c.get(f"/agents?run={rec['run_id']}").status_code == 200
     assert c.get("/agents?run=../../etc").status_code == 200   # bad id → falls back to empty, no traversal
@@ -132,3 +145,16 @@ def test_sdk_call_signature_matches():
         for call in _re.findall(r"messages\.create\((.*?)\)\n", (root / f).read_text(), flags=_re.S):
             for kw in _re.findall(r"(\w+)=", call):
                 assert kw in ok, (f, kw)
+
+
+def test_algolab_backtest(env):  # noqa: F811
+    s, _ = env
+    from desk import algolab
+    r = algolab.run_spec(s, {"kind": "weekend", "name": "x", "instruments": ["XYZ100"], "direction": "fade",
+                             "min_abs_dev_bps": 0, "max_abs_dev_bps": 999}, "T", "run")
+    res = r["result"]
+    assert res["train"]["n"] + res["test"]["n"] == 2          # 2 of 3 history rows exceed the threshold
+    assert res["trials_total"] == 1 and res["bar"] == 0.05
+    r2 = algolab.run_spec(s, {"kind": "options", "name": "y", "side": "short", "when": "all"}, "T", "run")
+    assert r2["result"]["trials_total"] == 2 and r2["result"]["bar"] == 0.025
+    assert algolab.validate({"kind": "weekend", "direction": "sideways"})[0] is None
