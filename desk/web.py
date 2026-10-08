@@ -641,7 +641,7 @@ def money(req: Request, capital: float = 2000, lev: float = 2, mode: str = "make
 <li><span class="n">3</span><b>周日 14:45 / 16:45</b><span class="t">收到锁定推送后下单</span><span class="d">按推送里每个合约的方向挂限价单，仓位按推送比例；推送写"不做"的不碰。</span></li>
 <li><span class="n">4</span><b>周日 15:05 / 17:05</b><span class="t">开盘 5 分钟后平仓</span><span class="d">全部平掉，盈亏当场到账户，随时可以提走。不是周一才结算。</span></li>
 </ol></div>"""
-    body = manual + f"""<h1>如果放真钱，会赚多少或亏多少</h1>
+    body = f"""<h1>如果放真钱，会赚多少或亏多少</h1>{manual}
 <p class="sub">按每个周末的真实结果，换算成你填的本金和杠杆。"历史回测"用上线前的小时 K 线，没有新闻过滤、成交价取得理想，<b>会偏乐观</b>；"实时模拟"是上线后锁定的正式记录。</p>
 <form class="inline card" method="get" action="/money">
 <label>本金（美元）<input type="number" name="capital" value="{capital:g}" min="100" step="100"></label>
