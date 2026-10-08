@@ -104,6 +104,38 @@ def daily_section(settings, day: date) -> list:
     return out
 
 
+def _x(t) -> str:
+    return str(t or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def agents_section(settings) -> list:
+    from . import agents
+    r = agents.last_full_run(settings, within_h=36)
+    if not r:
+        return []
+    out = [Paragraph("Agent 团队会议（22 个角色）", H2)]
+    ch = r.get("chair", {})
+    out.append(Paragraph(f"<b>{_x(ch.get('headline'))}</b>", P))
+    if ch.get("plain"):
+        out.append(Paragraph(_x(ch["plain"]), P))
+    for t in (ch.get("today") or [])[:5]:
+        out.append(Paragraph("· " + _x(t), SMALL))
+    rows = [["讨论室", "结论（大白话）", "把握", "分歧"]]
+    cell = ParagraphStyle("c", parent=SMALL, textColor=colors.black)
+    for meta in r.get("rooms_meta", []):
+        room = r.get("rooms", {}).get(meta["key"])
+        if not room:
+            continue
+        sy = room.get("synth", {})
+        rows.append([meta["name"], Paragraph(_x(sy.get("plain")), cell), f"{sy.get('confidence', '—')}%",
+                     str(len(sy.get("dissent") or []))])
+    out.append(_table(rows, [30 * mm, 112 * mm, 16 * mm, 14 * mm]))
+    ck = r.get("checks", {})
+    out.append(Paragraph("代码审计：" + "；".join(f"{'[通过]' if v.get('ok') else '[有问题]'} {_x(v.get('text'))}" for v in ck.values())
+                         + f"。本次费用 ${r.get('cost_usd', 0):.2f}，{r.get('calls', 0)} 次调用。", SMALL))
+    return out
+
+
 def build(settings, capital: float = 2000.0, leverage: float = 2.0, daily_for: date | None = None) -> bytes:
     tz = ZoneInfo("America/Los_Angeles")
     now = datetime.now(timezone.utc).astimezone(tz)
@@ -122,6 +154,7 @@ def build(settings, capital: float = 2000.0, leverage: float = 2.0, daily_for: d
 
     if daily_for:
         s += daily_section(settings, daily_for - timedelta(days=1))
+    s += agents_section(settings)
 
     led = Ledger(settings.data)
     card = evaluate.scorecard(led.completed(), settings)

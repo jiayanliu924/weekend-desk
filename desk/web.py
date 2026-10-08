@@ -22,7 +22,7 @@ from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from starlette.middleware.sessions import SessionMiddleware
 
-from . import config, evaluate, notify, options, pdfreport, rawstore, sim
+from . import agents, config, evaluate, notify, options, pdfreport, rawstore, sim
 from .clock import current_or_next_weekend, friday_of, name_of
 from .ledger import Ledger
 
@@ -150,9 +150,19 @@ ul.news{list-style:none;padding:0;margin:0}ul.news li{padding:8px 0;border-botto
 .ev{font-size:12.5px;color:var(--mut);margin-top:2px}
 canvas{max-width:100%}
 .login{max-width:360px;margin:12vh auto;padding:0 16px}
+.big{font-size:18px;font-weight:650;line-height:1.5;margin:6px 0}
+.bar{height:6px;background:var(--chip);border-radius:9px;overflow:hidden;margin:4px 0 8px}.bar i{display:block;height:100%;background:var(--acc)}
+.room{margin:14px 0}.room h2{margin:0 0 2px}
+details{margin-top:10px}summary{cursor:pointer;color:var(--acc);font-size:14px}
+.say{border-left:3px solid var(--line);padding:6px 0 6px 12px;margin:10px 0}
+.say .who{margin:0;font-weight:600;font-size:13.5px;color:var(--ink)}
+.cite{font-size:11.5px;text-decoration:none;color:var(--acc);margin-left:3px}
+.ok{color:var(--good)}.no{color:var(--bad)}
+.roster{display:flex;flex-wrap:wrap;gap:6px;margin:6px 0}
+.fact{font-size:13px;padding:5px 0;border-bottom:1px solid var(--line)}.fact:target{background:var(--chip)}
 """
 
-TABS = [("/", "概览"), ("/day", "每日记录"), ("/weekends", "周末预测"), ("/options", "期权研究"),
+TABS = [("/", "概览"), ("/agents", "Agent 讨论室"), ("/day", "每日记录"), ("/weekends", "周末预测"), ("/options", "期权研究"),
         ("/money", "放真钱会怎样"), ("/history", "历史回测"), ("/guide", "这是什么")]
 
 
@@ -575,6 +585,148 @@ def guide(req: Request):
 <h2>4. 怎么赚钱</h2><p>在价格被"推过头"时反着买，开盘被拉回来时卖掉，赚那一截差价——本质是周末替着急的人接盘、扛两天风险。真出大事的周末不接（这就是读新闻的用处）。按历史粗算，股票类合约平均每周末每个合约赚约 0.05%–0.1%，金额很小，还不能确定不是运气。具体看"放真钱会怎样"。</p>
 <h2>期权研究</h2><p>CPI、美联储开会前，记下期权市场预期 24 小时比特币会波动多大，事后对比实际波动。只研究，不交易。</p></div>"""
     return page(req, "/guide", "这是什么", body)
+
+
+def _conf(c):
+    try:
+        v = max(0, min(100, int(c)))
+    except (TypeError, ValueError):
+        return ""
+    return f'<div class="k">把握 {v}%</div><div class="bar"><i style="width:{v}%"></i></div>'
+
+
+def _cites(cs):
+    return "".join(f'<a class="cite" href="#{E(str(c))}">[{E(str(c))}]</a>' for c in (cs or []) if isinstance(c, str))
+
+
+def _say(o: dict) -> str:
+    a = agents.BY_ID.get(o["agent"], {"name": o["agent"]})
+    out = o.get("out", {})
+    pts = "".join(f"<li>{E(str(p.get('claim', '')))}{_cites(p.get('cite'))}</li>" for p in (out.get("points") or []) if isinstance(p, dict))
+    extra = ""
+    if out.get("rebut"):
+        extra += f'<div class="ev">回应：{E(str(out["rebut"]))}{" · 改了主意" if out.get("changed") else ""}</div>'
+    for pr in out.get("proposal") or []:
+        if isinstance(pr, dict):
+            extra += f'<span class="tag">{E(str(pr.get("name")))} {E(str(pr.get("lean")))} {E(str(pr.get("size")))}</span>'
+    for v in out.get("veto") or []:
+        if isinstance(v, dict):
+            extra += f'<span class="tag bad">否决 {E(str(v.get("name")))}：{E(str(v.get("why")))}</span>'
+    return (f'<div class="say"><p class="who">{E(a["name"])} <span class="mut">{E(o["agent"])}</span>'
+            f'{" · 把握 " + E(str(out.get("confidence"))) + "%" if out.get("confidence") is not None else ""}</p>'
+            f'<div>{E(str(out.get("plain", "")))}</div>'
+            f'{"<div class=ev>立场：" + E(str(out.get("stance"))) + "</div>" if out.get("stance") else ""}'
+            f'{"<ul class=ev>" + pts + "</ul>" if pts else ""}{extra}</div>')
+
+
+def _chips(room: str) -> str:
+    return "".join('<span class="tag" title="' + E(a["stance"]) + '">' + E(a["name"]) + "</span>"
+                   for a in agents.AGENTS if a["room"] == room)
+
+
+@app.get("/agents", response_class=HTMLResponse)
+def agents_page(req: Request, run: str | None = None):
+    if (r := _guard(req)):
+        return r
+    st = agents.get_state(S)
+    sp = agents.spend(S)
+    rec = agents.load_run(S, run)
+    runs = agents.list_runs(S, 12)
+    head = '<meta http-equiv="refresh" content="15">' if st.get("running") else ""
+    status = (f'<span class="good">正在开会：{E(st.get("stage", ""))}</span>（页面每 15 秒自动刷新）' if st.get("running")
+              else f"上次开会：{E(rec['run_id']) if rec else '还没开过'}")
+    key_ok = bool(os.environ.get("ANTHROPIC_API_KEY"))
+    body = f"""<h1>Agent 讨论室</h1>
+<p class="sub">22 个 AI 角色分 6 个讨论室：期权研究、Jane Street 方法、选品种、交易、风控、审计，外加主席和白话编辑。每天 6:30（加州时间）开一次会，周末决策前 2 小时再开一次。
+每个室的成员先各自发言，再互相反驳一轮，然后整理出结论和分歧。所有数字只能来自下面的"资料包"，审计室用代码核对。Agent 不碰钱、不改规则。</p>
+<div class="grid">
+<div class="card"><div class="k">状态</div><div class="v s">{status}</div></div>
+<div class="card"><div class="k">今天 / 本月费用（上限）</div><div class="v s">${sp['day']:.2f} / ${sp['month']:.2f}</div><div class="k">上限 ${sp['cap_day']:.2f}/天，${sp['cap_month']:.0f}/月</div></div>
+<div class="card"><div class="k">API key</div><div class="v s {'good' if key_ok else 'bad'}">{'已填' if key_ok else '未填：只能做代码审计'}</div></div>
+<div class="card"><div class="k">手动开会</div><form method="post" action="/agents/run"><button {'disabled' if st.get('running') else ''}>现在开会</button></form><div class="k">约 3–5 分钟，约 $0.5</div></div>
+</div>
+{('<p class="note">' + E(req.query_params.get('msg', '')) + '</p>') if req.query_params.get('msg') else ''}
+<div class="daynav" style="margin-top:12px"><span class="k">历次会议：</span>{''.join(f'<a class="tag" href="/agents?run={E(p.stem)}">{E(p.stem[5:10] + " " + p.stem[11:13] + ":" + p.stem[13:15])}</a>' for p in runs)}</div>"""
+    roster_cards = "".join(
+        f'<div class="card"><div class="k">{E(m["name"])}（{sum(1 for a in agents.AGENTS if a["room"] == m["key"])} 个）</div>'
+        f'<div class="roster">{_chips(m["key"])}</div>'
+        f'<div class="ev">{E(m["goal"])}</div></div>' for m in agents.ROOMS)
+    roster_cards += '<div class="card"><div class="k">总结（2 个）</div><div class="roster"><span class="tag">主席</span><span class="tag">白话编辑</span></div><div class="ev">主席汇总各室结论和分歧；白话编辑写手机推送。</div></div>'
+    if not rec:
+        body += f'<h2>团队名单</h2><div class="grid">{roster_cards}</div><p class="note">还没开过会。点"现在开会"，或等明早 6:30 自动开。</p>'
+        return page(req, "/agents", "Agent 讨论室", body, head)
+    if rec.get("degraded_reason"):
+        body += f'<p class="note"><b>{"没开会" if rec["mode"] == "degraded" else "会议中途停止"}：</b>{E(rec["degraded_reason"])}</p>'
+    ch = rec.get("chair")
+    if ch:
+        body += (f'<h2>主席结论 <span class="mut" style="font-size:13px">{E(rec["run_id"])} · {E(rec.get("reason", ""))} · '
+                 f'${rec.get("cost_usd", 0):.2f} · {rec.get("calls", 0)} 次发言</span></h2>'
+                 f'<div class="card"><div class="big">{E(str(ch.get("headline", "")))}</div><div>{E(str(ch.get("plain", "")))}</div>{_conf(ch.get("confidence"))}'
+                 + ("<div class=k>今天/本周注意</div><ul>" + "".join(f"<li>{E(str(t))}</li>" for t in ch.get("today") or []) + "</ul>" if ch.get("today") else "")
+                 + ("<div class=k>各室分歧</div><ul>" + "".join(f"<li>{E(str(t))}</li>" for t in ch.get("disagree") or []) + "</ul>" if ch.get("disagree") else "")
+                 + (f'<div class="note">手机推送：{E(str(rec.get("editor", {}).get("push", "")))}</div>' if rec.get("editor", {}).get("push") else "")
+                 + "</div>")
+    ck = rec.get("checks", {})
+    names = {"clock": "时间", "cite": "引用与数字", "rules": "规则与实盘锁", "plain": "大白话"}
+    body += '<h2>代码审计</h2><div class="grid">' + "".join(
+        f'<div class="card"><div class="k">{names.get(k, k)}</div><div class="v s {"ok" if v.get("ok") else "no"}">{"通过" if v.get("ok") else "有问题"}</div><div class="ev">{E(str(v.get("text", "")))}</div></div>'
+        for k, v in ck.items()) + "</div>"
+    for m in agents.ROOMS:
+        room = rec.get("rooms", {}).get(m["key"])
+        members = [a for a in agents.AGENTS if a["room"] == m["key"]]
+        chips = "".join(f'<span class="tag">{E(a["name"])}</span>' for a in members)
+        if not room:
+            continue
+        sy = room.get("synth", {})
+        dis = "".join(f'<li><b>{E(agents.BY_ID.get(str(d.get("who")), {"name": str(d.get("who"))})["name"])}</b>：{E(str(d.get("view", "")))}</li>'
+                      for d in sy.get("dissent") or [] if isinstance(d, dict))
+        acts = "".join(f"<li>{E(str(a))}</li>" for a in sy.get("actions") or [])
+        prop = ""
+        if sy.get("proposal"):
+            prop = ('<div class="tw"><table><tr><th>合约</th><th>倾向</th><th>仓位</th><th>理由</th></tr>' + "".join(
+                f'<tr><td>{E(str(p.get("name")))}</td><td>{ {"fade": "反向押回撤", "follow": "顺着偏离", "skip": "不做"}.get(str(p.get("lean")), E(str(p.get("lean")))) }</td>'
+                f'<td>{E(str(p.get("size")))}</td><td>{E(str(p.get("why", "")))}</td></tr>' for p in sy["proposal"] if isinstance(p, dict)) + "</table></div>"
+                '<p class="ev">纸面提案，不下单、不改变正式预测规则。</p>')
+        if sy.get("veto"):
+            prop += "<div class=k>否决</div><ul>" + "".join(f'<li class="bad">否决 {E(str(v.get("name")))}：{E(str(v.get("why", "")))}</li>' for v in sy["veto"] if isinstance(v, dict)) + "</ul>"
+        rounds = "".join(f"<h3 style='font-size:14px;margin:12px 0 0'>第 {i + 1} 轮</h3>" + "".join(_say(o) for o in rr)
+                         for i, rr in enumerate(room.get("rounds", [])))
+        body += (f'<div class="card room"><h2>{E(m["name"])}</h2><div class="roster">{chips}</div>'
+                 f'<div class="big">{E(str(sy.get("plain", "")))}</div>{_conf(sy.get("confidence"))}'
+                 f'{"<div class=ev>共识：" + E(str(sy.get("consensus"))) + "</div>" if sy.get("consensus") else ""}'
+                 f'{"<div class=k style=margin-top:8px>不同意见</div><ul>" + dis + "</ul>" if dis else ""}'
+                 f'{"<div class=k>接下来</div><ul>" + acts + "</ul>" if acts else ""}{prop}'
+                 f'<details><summary>看完整讨论（{len(members)} 个成员 × {len(room.get("rounds", []))} 轮）</summary>{rounds}</details></div>')
+    if not rec.get("rooms"):
+        body += f'<h2>团队名单</h2><div class="grid">{roster_cards}</div>'
+    facts = "".join(f'<div class="fact" id="{E(f["id"])}"><b>{E(f["id"])}</b> <span class="tag">{E(f["topic"])}</span>'
+                    f'{"<span class=tag>外部文本</span>" if f.get("untrusted") else ""}{E(f["text"])}</div>' for f in rec.get("facts", []))
+    body += f'<h2>资料包（{len(rec.get("facts", []))} 条，全部由代码生成）</h2><div class="card">{facts}</div>'
+    return page(req, "/agents", "Agent 讨论室", body, head)
+
+
+_last_manual = [0.0]
+
+
+@app.post("/agents/run")
+def agents_run(req: Request):
+    if (r := _guard(req)):
+        return r
+    origin = req.headers.get("origin")
+    if origin and req.headers.get("host") and origin.split("//")[-1] != req.headers["host"]:
+        return Response("bad origin", status_code=403)
+    cool = agents.cfg(S)["manual_cooldown_min"] * 60
+    if agents.get_state(S).get("running"):
+        msg = "已经在开会了"
+    elif time.time() - _last_manual[0] < cool:
+        msg = f"刚开过，{int((cool - (time.time() - _last_manual[0])) / 60) + 1} 分钟后才能再开"
+    else:
+        _last_manual[0] = time.time()
+        agents.set_state(S, running=True, stage="准备中")
+        import threading
+        threading.Thread(target=agents.run_meeting, args=(S, f"{_user(req)} 手动开会"), daemon=True).start()
+        msg = "已开始开会，约 3–5 分钟。页面会自动刷新。"
+    return RedirectResponse("/agents?" + urlencode({"msg": msg}), status_code=303)
 
 
 @app.get("/report.pdf")

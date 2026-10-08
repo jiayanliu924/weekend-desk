@@ -8,7 +8,7 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-from . import jobs, notify, options, rawstore, report
+from . import agents, jobs, notify, options, rawstore, report
 from .clock import current_or_next_weekend, last_completed_weekend
 from .collector import Collector
 from .news import NewsPoller
@@ -97,6 +97,14 @@ def integrity(settings) -> None:
     log.info("integrity: %s", " | ".join(msgs))
 
 
+def _safe_meeting(settings, reason):
+    try:
+        agents.run_meeting(settings, reason)
+    except Exception as e:  # noqa: BLE001
+        log.exception("agent meeting failed: %s", e)
+        notify.push(settings, "Agent 会议出错", str(e)[:300])
+
+
 async def job_loop(settings):
     done = jobs.load_state(settings)
     while True:
@@ -116,6 +124,13 @@ async def job_loop(settings):
             except Exception as e:  # noqa: BLE001
                 log.exception("job %s failed: %s", key, e)
                 notify.push(settings, "任务出错", f"{key}: {e}", priority="high")
+            done.add(key)
+            jobs.save_state(settings, done)
+        # agent meetings take a few minutes: run in the background so collection/locks never wait
+        for key in agents.due(now, settings, done):
+            log.info("start agent meeting %s", key)
+            reason = "周末决策前加开" if key.startswith("agents_wk") else "每日例会"
+            asyncio.get_running_loop().run_in_executor(None, _safe_meeting, settings, reason)
             done.add(key)
             jobs.save_state(settings, done)
         # one combined push per batch instead of one per instrument

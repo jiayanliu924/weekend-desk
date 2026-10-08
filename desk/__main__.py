@@ -109,6 +109,14 @@ def main(argv: list[str]) -> int:
         host = os.environ.get("WEB_HOST", "")
         tok = make_reset_token(s, name)
         print(f"在浏览器打开（30 分钟内有效，只能用一次）：\nhttps://{host or '你的网址'}/setpw?token={tok}")
+    elif cmd == "meet":
+        from . import agents
+        rec = agents.run_meeting(s, "命令行开会", push="--push" in argv)
+        print(f"模式 {rec.get('mode')}，资料 {len(rec.get('facts', []))} 条，发言 {rec.get('calls', 0)} 次，费用 ${rec.get('cost_usd', 0):.2f}")
+        if rec.get("degraded_reason"):
+            print(rec["degraded_reason"])
+        if rec.get("chair"):
+            print("主席：", rec["chair"].get("headline"))
     elif cmd == "deluser":
         from .web import del_user
         print("已删除" if del_user(s, argv[1]) else "没有这个账号")
