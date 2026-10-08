@@ -656,7 +656,7 @@ def agents_page(req: Request, run: str | None = None):
         body += f'<h2>团队名单</h2><div class="grid">{roster_cards}</div><p class="note">还没开过会。点"现在开会"，或等明早 6:30 自动开。</p>'
         return page(req, "/agents", "Agent 讨论室", body, head)
     if rec.get("degraded_reason"):
-        body += f'<p class="note"><b>{"没开会" if rec["mode"] == "degraded" else "会议中途停止"}：</b>{E(rec["degraded_reason"])}</p>'
+        body += f'<p class="note"><b>{"没开会" if rec["mode"] == "degraded" else ("会议失败" if rec["mode"] == "failed" else "会议中途停止")}：</b>{E(rec["degraded_reason"])}</p>'
     ch = rec.get("chair")
     if ch:
         body += (f'<h2>主席结论 <span class="mut" style="font-size:13px">{E(rec["run_id"])} · {E(rec.get("reason", ""))} · '

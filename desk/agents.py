@@ -155,7 +155,7 @@ class AnthropicLLM:
         import anthropic
         m = self.fallback.get(model, model)
         try:
-            r = self.client.messages.create(model=m, max_tokens=1400, temperature=0.4, system=system,
+            r = self.client.messages.create(model=m, max_tokens=1400, system=system,
                                             messages=[{"role": "user", "content": user}])
         except anthropic.NotFoundError:
             self.fallback[model] = "claude-haiku-4-5-20251001"
@@ -409,6 +409,8 @@ class Meeting:
         self.c = cfg(settings)
         self.cost = 0.0
         self.calls = 0
+        self.failed = 0
+        self.last_error = ""
         self.lock = threading.Lock()
 
     def call(self, agent_id: str, model: str, system: str, user: str) -> dict:
@@ -422,6 +424,9 @@ class Meeting:
             raise
         except Exception as e:  # noqa: BLE001
             log.warning("agent %s failed: %s", agent_id, e)
+            with self.lock:
+                self.failed += 1
+                self.last_error = f"{type(e).__name__}: {str(e)[:200]}"
             return {"plain": f"（这次没发言：{type(e).__name__}）", "error": str(e)[:200]}
         with self.lock:
             self.cost += _record_spend(self.s, self.run_id, model, tin, tout)
@@ -571,6 +576,10 @@ def _run(settings, reason, llm, now, push) -> dict:
             rec["degraded_reason"] = str(e)
         rec["cost_usd"] = round(m.cost, 4)
         rec["calls"] = m.calls
+        rec["failed_calls"] = m.failed
+        if m.failed and m.failed >= max(1, (m.calls + m.failed) // 2):
+            rec["mode"] = "failed"
+            rec["degraded_reason"] = f"{m.failed} 次发言调用失败，会议无效。错误：{m.last_error}"
     if "checks" not in rec:
         outputs = [o for r in rec["rooms"].values() for rr in r["rounds"] for o in rr]
         rec["checks"] = audit_checks(settings, facts, outputs, started_ns, rules0)
@@ -586,6 +595,9 @@ def _run(settings, reason, llm, now, push) -> dict:
 def _push(settings, rec):
     from . import notify
     if rec["mode"] == "degraded":
+        return
+    if rec["mode"] == "failed":
+        notify.push(settings, "Agent 会议失败", rec.get("degraded_reason", "")[:300], priority="high")
         return
     host = os.environ.get("WEB_HOST")
     body = (rec.get("editor", {}).get("push") or rec.get("chair", {}).get("headline") or "").strip()

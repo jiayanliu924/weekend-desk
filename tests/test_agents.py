@@ -108,3 +108,27 @@ def test_parse_json():
     assert agents.parse_json('```json\n{"a": 1}\n```') == {"a": 1}
     assert agents.parse_json('好的：{"a": 2} 完') == {"a": 2}
     assert agents.parse_json("nonsense")["parse_error"]
+
+
+def test_failed_calls_mark_meeting_failed(env):  # noqa: F811
+    s, _ = env
+
+    def broken(model, system, user):
+        raise TypeError("unexpected keyword argument")
+    rec = agents.run_meeting(s, "test", llm=broken, push=False)
+    assert rec["mode"] == "failed" and "调用失败" in rec["degraded_reason"]
+    assert agents.last_full_run(s) is None
+
+
+def test_sdk_call_signature_matches():
+    """我们传给 SDK 的参数必须都是当前 anthropic 版本支持的（temperature 已被新版去掉）。"""
+    import inspect
+    import re as _re
+    from pathlib import Path
+    import anthropic
+    ok = set(inspect.signature(anthropic.Anthropic(api_key="x").messages.create).parameters)
+    root = Path(__file__).resolve().parent.parent / "desk"
+    for f in ("agents.py", "extract.py"):
+        for call in _re.findall(r"messages\.create\((.*?)\)\n", (root / f).read_text(), flags=_re.S):
+            for kw in _re.findall(r"(\w+)=", call):
+                assert kw in ok, (f, kw)

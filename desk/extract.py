@@ -99,7 +99,7 @@ class AnthropicExtractor:
         self.model = model
 
     def __call__(self, system: str, user: str) -> str:
-        r = self.client.messages.create(model=self.model, max_tokens=1500, temperature=0,
+        r = self.client.messages.create(model=self.model, max_tokens=1500,
                                         system=system, messages=[{"role": "user", "content": user}])
         return "".join(b.text for b in r.content if getattr(b, "type", "") == "text")
 
