@@ -26,6 +26,12 @@ def fake_llm_factory(calls):
         calls.append((model, system[:40]))
         ids = re.findall(r"^(F\d+) ", user, flags=re.M)
         c = ids[1] if len(ids) > 1 else "F1"
+        if "给普通人写会议纪要" in system:
+            out = {"overview": ["这周末只做纸上练习，不花真钱。", "原油价格偏得最多，打算押它弹回来。"],
+                   "weekend": "周日下午锁定预测。", "money": "没有花真钱。",
+                   "rooms": {"trading": {"conclusion": "只押原油。", "why_care": "看周日结果。", "disagree": ""}},
+                   "terms": [{"term": "纸面练习", "plain": "只记账不下单"}]}
+            return json.dumps(out, ensure_ascii=False), 500, 300
         if "主席" in system and "白话编辑" not in system and "记录员" not in system and "成员" not in system:
             out = {"headline": "数据正常，继续模拟", "plain": "七个合约都在收数据，样本还太少。", "today": ["周日看锁定"], "confidence": 60}
         elif "白话编辑" in system:
@@ -74,7 +80,7 @@ def test_full_meeting_and_audit(env):  # noqa: F811
     assert rec["mode"] == "full", rec.get("degraded_reason")
     members = [a for a in agents.AGENTS if a["room"] not in ("chair", "editor")]
     # members × 2 rounds + 7 room syntheses + chair + editor
-    assert rec["calls"] == len(members) * 2 + 7 + 2 == len(calls)
+    assert rec["calls"] == len(members) * 2 + 7 + 2 == len(calls) - 1   # +1 大白话总结
     algo = rec["rooms"]["algo"]
     bts = [b for o in algo["rounds"][0] for b in o["out"].get("backtest", [])]
     assert len(bts) == 9 and sum(1 for b in bts if b.get("error")) == 3       # bogus spec rejected
@@ -103,6 +109,7 @@ def test_full_meeting_and_audit(env):  # noqa: F811
     assert c.get("/agents/nope.pdf").status_code == 404
     assert c.get("/agents/state").json()["running"] is False
     assert "导出这次会议 PDF" in r.text and "localStorage" in r.text
+    assert rec["plain_summary"]["overview"][0].startswith("这周末")
     # PDF includes the meeting
     pdf = pdfreport.build(s)
     assert pdf[:4] == b"%PDF"

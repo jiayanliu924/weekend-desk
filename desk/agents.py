@@ -707,6 +707,9 @@ def _run(settings, reason, llm, now, push) -> dict:
             arena.save_playbooks(settings, rec)
         except Exception as e:  # noqa: BLE001
             log.warning("arena scoring: %s", e)
+        if rec["mode"] == "full":
+            rec["standings"] = arena.standings(settings, AGENTS)
+            rec["plain_summary"] = plain_summary(settings, {**rec, "run_id": rid}, m.llm)
     rec["standings"] = arena.standings(settings, AGENTS)
     rec["finished"] = datetime.now(UTC).isoformat()
     rec["spend"] = spend(settings)
@@ -773,4 +776,53 @@ def due(now: datetime, settings, done: set) -> list[str]:
     a = first - timedelta(minutes=c["weekend_lead_min"])
     if a <= now < first - timedelta(minutes=30) and f"agents_wk:{first.date()}" not in done:
         out.append(f"agents_wk:{first.date()}")
+    return out
+
+
+PLAIN_PROMPT = """你是给普通人写会议纪要的编辑。读者没学过金融，看不懂任何术语。
+下面是一场 AI 交易研究会议的各室结论（这是模拟研究，不下真钱）。请改写成大白话：
+- 不出现资料编号（F12 这种）、英文缩写、"万分点/隐含波动/回撤/样本外"等术语；必须用的话，当场用一句话解释并举例。
+- 句子短，每句只说一件事；数字保留，但说清楚是什么意思（例如"偏了 0.7%"）。
+- 不添加会议里没有的事实。
+只输出 JSON：
+{"overview": ["5 条以内，每条一句话，最重要的放前面"],
+ "weekend": "这个周末会发生什么（两三句）",
+ "money": "和钱有关的：有没有花真钱、模拟账打算怎么做、最坏会怎样（两三句）",
+ "rooms": {"室的key": {"conclusion": "这个室的结论（两三句大白话）", "why_care": "这对读者意味着什么（一句）", "disagree": "谁不同意、为什么（一两句，没有就空）"}},
+ "terms": [{"term": "本次会议里出现、读者可能不懂的词", "plain": "一句话解释+例子"}]}"""
+
+
+def plain_summary(settings, rec: dict, llm=None) -> dict:
+    """把一场会议改写成大白话总结（导出 PDF 时用）；结果存回会议记录，之后不再花钱。"""
+    if rec.get("plain_summary"):
+        return rec["plain_summary"]
+    ch = rec.get("chair") or {}
+    fallback = {"overview": [x for x in [ch.get("headline"), ch.get("plain")] if x] or ["本次会议没有主席总结。"],
+                "rooms": {}, "terms": []}
+    if rec.get("mode") not in ("full", "partial"):
+        return fallback
+    if llm is None:
+        if not os.environ.get("ANTHROPIC_API_KEY"):
+            return fallback
+        llm = AnthropicLLM()
+    sp = spend(settings)
+    if sp["day"] >= sp["cap_day"] or sp["month"] >= sp["cap_month"]:
+        return fallback
+    rooms = {k: _strip(v.get("synth", {})) for k, v in rec.get("rooms", {}).items()}
+    user = (f"主席结论：{json.dumps(_strip(ch), ensure_ascii=False)}\n各室结论（key 是室的代号）："
+            f"{json.dumps(rooms, ensure_ascii=False)}\n室的代号：" + "，".join(f"{r['key']}={r['name']}" for r in ROOMS))
+    model = cfg(settings)["lead_model"]
+    try:
+        text, tin, tout = llm(model, PLAIN_PROMPT, user)
+        _record_spend(settings, rec.get("run_id", ""), model, tin, tout)
+        out = parse_json(text)
+    except Exception as e:  # noqa: BLE001
+        log.warning("plain summary: %s", e)
+        return fallback
+    if not out.get("overview"):
+        return fallback
+    rec["plain_summary"] = out
+    p = _dir(settings) / "runs" / f"{rec['run_id']}.json"
+    if p.exists():
+        p.write_text(json.dumps(rec, ensure_ascii=False, indent=1))
     return out

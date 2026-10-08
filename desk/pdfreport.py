@@ -136,85 +136,164 @@ def agents_section(settings) -> list:
     return out
 
 
+ROOM_PLAIN = {
+    "options": "比特币期权可以理解成给价格涨跌买的「保险」。保险费里藏着市场对未来波动的预期。这个室比的是：保险卖贵了还是卖便宜了。三个成员每天各猜一个数，第二天对答案，猜得准的加分。",
+    "js": "Jane Street 是全球最会赚钱的交易公司之一。这个室拿它的做事方法当尺子，检查我们有没有偷看答案、有没有自己骗自己。",
+    "niche": "我们盯着 7 个周末还能交易的合约（美股指数、英伟达、特斯拉、英特尔、三星、原油）。这个室决定哪个最值得做、哪个该放弃。",
+    "trading": "三个交易员各管一本模拟账，比谁赚得多：反向派押「周末被推偏的价格会弹回来」，顺势派押「偏了是有原因的」，仓位派只挑最有把握的做。周日开盘后自动算盈亏，赢的当冠军。",
+    "algo": "三个算法师各自设计交易规则，交给电脑用过去的数据考试：前三分之二的数据给他们看，后三分之一当考题。考得比现在的规则好才算数，试得越多及格线越高。",
+    "risk": "风控就是踩刹车的人：专找会亏大钱的情况，可以一票否决交易室的提案。",
+    "audit": "审计员检查这场会本身靠不靠谱：有没有用到开会之后才知道的信息、有没有编数字。",
+}
+
+GLOSSARY = [
+    ("万分点", "百分之一的百分之一。100 万分点 = 1%。例：价格偏了 70 万分点 = 偏了 0.7%。"),
+    ("链上价格 / 外部价格", "链上价格是区块链交易所里这个合约的价格；外部价格是真实市场（比如纳斯达克）的价格。周末真市场关门，链上照样能买卖，两边就会差开。"),
+    ("偏离", "链上价格比外部价格高或低了多少。"),
+    ("回撤 / 弹回来", "周日开盘后，链上价格被拉回真实价格的现象。"),
+    ("反向（fade）/ 顺势（follow）/ 不做（skip）", "反向 = 押价格会弹回来；顺势 = 押它继续往那边走；不做 = 这次不碰。"),
+    ("仓位", "这次放多少钱，0 到 1：1 = 用满这个合约分到的钱，0.35 = 用三成五。"),
+    ("隐含波动 / 实际波动", "隐含波动 = 期权价格里写着的「市场预计会晃多大」；实际波动 = 事后真的晃了多大。实际÷隐含小于 1，说明期权卖贵了。"),
+    ("回测 / 考试段", "回测 = 拿历史数据假装当时交易，看能赚多少；考试段 = 专门留出来、设计规则时不许看的那部分历史。"),
+    ("显著 / 门槛", "确认不是运气的标准。试的方案越多，越容易碰巧撞上好结果，所以门槛会自动抬高。"),
+    ("冠军 / 积分", "每个岗位三个 agent 比赛，电脑按结果打分，30 天积分第一的是冠军：它的决定会进正式模拟账。"),
+    ("模拟账 / 实盘", "模拟账是纸上记账，不花真钱；实盘是真下单。实盘现在锁着。"),
+]
+
+
+def _plain(t) -> str:
+    """去掉资料编号（F12、F14–F20 之类），让正文好读。"""
+    import re as _re
+    t = str(t or "")
+    t = _re.sub(r"[（(][^（）()]*F\d+[^（）()]*[）)]", "", t)
+    t = _re.sub(r"\bF\d+(?:\s*[–\-至到~]\s*F?\d+)?", "", t)
+    t = _re.sub(r"[，、]\s*(?=[。；）])", "", t)
+    return t.strip()
+
+
+def _box(text, style=None):
+    t = Table([[Paragraph(text, style or P)]], colWidths=[178 * mm])
+    t.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#f1e9df")),
+                           ("LEFTPADDING", (0, 0), (-1, -1), 10), ("RIGHTPADDING", (0, 0), (-1, -1), 10),
+                           ("TOPPADDING", (0, 0), (-1, -1), 8), ("BOTTOMPADDING", (0, 0), (-1, -1), 8)]))
+    return t
+
+
 def meeting_pdf(settings, rec: dict) -> bytes:
-    """一次 Agent 会议的完整记录。"""
-    from . import arena
+    """一次 Agent 会议的大白话纪要：前面是看得懂的总结，最后附原始记录。"""
+    from reportlab.platypus import PageBreak
+    from . import agents, arena
+    ps = rec.get("plain_summary") or agents.plain_summary(settings, rec)
     buf = io.BytesIO()
     doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=16 * mm, rightMargin=16 * mm, topMargin=14 * mm, bottomMargin=14 * mm,
-                            title=f"Agent 会议 {rec.get('run_id')}")
-    cell = ParagraphStyle("c", parent=SMALL, textColor=colors.black)
+                            title=f"Agent 会议纪要 {rec.get('run_id')}")
+    BIG = ParagraphStyle("big", parent=P, fontSize=12, leading=19)
+    H3 = ParagraphStyle("h3", parent=P, fontSize=11, leading=16, spaceBefore=9, spaceAfter=3, textColor=colors.HexColor("#7a2a1e"))
     names = {a["id"]: a["name"] for a in rec.get("roster", [])}
-    s = [Paragraph(f"Agent 团队会议记录 {rec.get('run_id', '')}", H1),
-         Paragraph(f"原因：{_x(rec.get('reason'))} · 模式：{_x(rec.get('mode'))} · 费用 ${rec.get('cost_usd', 0):.2f} · "
-                   f"{rec.get('calls', 0)} 次发言 · 全部为模拟研究，不构成投资建议", SMALL)]
+    rid = rec.get("run_id", "")
+    s = [Paragraph("Agent 团队会议纪要（大白话版）", H1),
+         Paragraph(f"开会时间 {rid[:10]} {rid[11:13]}:{rid[13:15]}（加州时间）· 全部是模拟研究，没有下任何真钱的单 · 不构成投资建议", SMALL),
+         Spacer(1, 6)]
     if rec.get("degraded_reason"):
-        s.append(Paragraph("说明：" + _x(rec["degraded_reason"]), P))
-    ch = rec.get("chair") or {}
-    if ch:
-        s.append(Paragraph("主席结论", H2))
-        s.append(Paragraph(f"<b>{_x(ch.get('headline'))}</b>", P))
-        s.append(Paragraph(_x(ch.get("plain")), P))
-        for t in ch.get("today") or []:
-            s.append(Paragraph("· " + _x(t), SMALL))
-        for t in ch.get("disagree") or []:
-            s.append(Paragraph("分歧：" + _x(t), SMALL))
-        if rec.get("editor", {}).get("push"):
-            s.append(Paragraph("手机推送：" + _x(rec["editor"]["push"]).replace("\n", " / "), SMALL))
+        s.append(_box("说明：" + _x(rec["degraded_reason"])))
+    # —— 第 1 页：一页看懂
+    s.append(Paragraph("一页看懂", H2))
+    s.append(_box("<br/>".join("· " + _x(x) for x in ps.get("overview", [])) or "（本次没有总结）", BIG))
+    if ps.get("weekend"):
+        s.append(Paragraph("这个周末会发生什么", H2))
+        s.append(Paragraph(_x(ps["weekend"]), P))
+    if ps.get("money"):
+        s.append(Paragraph("和钱有关的", H2))
+        s.append(Paragraph(_x(ps["money"]), P))
     st = rec.get("standings") or {}
     if st.get("table"):
-        s.append(Paragraph("赛马积分（30 天）", H2))
-        rows = [["岗位", "agent", "积分", "已结算", "状态"]]
+        s.append(Paragraph("谁表现好、谁表现差（赛马积分）", H2))
+        s.append(Paragraph("每个岗位 3 个 agent 比赛，电脑按结果自动加减分：编数字、引用错资料当场扣分；猜对、赚钱加分。"
+                           "积分最高的是冠军，它的决定算数、还能用更强的模型；连续垫底的会被换掉。", SMALL))
+        rows = [["岗位", "agent", "积分", "状态"]]
         for race, label in arena.RACES.items():
             for k, t in sorted([(k, t) for k, t in st["table"].items() if t["room"] == race], key=lambda x: -x[1]["score30"]):
-                rows.append([label, f"{t['name']}（第 {t.get('gen', 1)} 代）", f"{t['score30']:+.1f}", str(t["n_outcome"]),
-                             ("冠军" if t.get("champion") else "") + (" 暂停" if t.get("paused") else "")])
-        s.append(_table(rows, [20 * mm, 60 * mm, 24 * mm, 24 * mm, 44 * mm]))
-    ck = rec.get("checks", {})
-    if ck:
-        s.append(Paragraph("代码审计", H2))
-        for v in ck.values():
-            s.append(Paragraph(f"{'[通过]' if v.get('ok') else '[有问题]'} {_x(v.get('text'))}", SMALL))
+                rows.append([label, t["name"], f"{t['score30']:+.1f}", ("冠军" if t.get("champion") else "") + (" 暂停" if t.get("paused") else "")])
+        s.append(_table(rows, [24 * mm, 70 * mm, 30 * mm, 54 * mm]))
+    s.append(Paragraph("看不懂的词", H2))
+    for term, exp in GLOSSARY + [(t.get("term", ""), t.get("plain", "")) for t in ps.get("terms", []) if isinstance(t, dict)]:
+        if term:
+            s.append(Paragraph(f"<b>{_x(term)}</b>：{_x(exp)}", P))
+    # —— 每个讨论室一页
     for meta in rec.get("rooms_meta", []):
         room = rec.get("rooms", {}).get(meta["key"])
         if not room:
             continue
         sy = room.get("synth", {})
+        rp = (ps.get("rooms") or {}).get(meta["key"], {})
+        s.append(PageBreak())
+        s.append(Paragraph(meta["name"], H1))
+        s.append(_box("<b>这个室是干嘛的：</b>" + _x(ROOM_PLAIN.get(meta["key"], meta.get("goal", "")))))
+        s.append(Spacer(1, 6))
+        s.append(Paragraph("结论（大白话）", H3))
+        s.append(Paragraph(_x(rp.get("conclusion") or _plain(sy.get("plain"))), BIG))
+        if rp.get("why_care"):
+            s.append(Paragraph("<b>这对你意味着什么：</b>" + _x(rp["why_care"]), P))
+        conf = sy.get("confidence")
+        if conf is not None:
+            s.append(Paragraph(f"大家对这个结论有多大把握：{_x(conf)}%（100% = 完全确定）", SMALL))
+        dis = [d for d in sy.get("dissent") or [] if isinstance(d, dict)]
+        if rp.get("disagree") or dis:
+            s.append(Paragraph("谁不同意、为什么", H3))
+            if rp.get("disagree"):
+                s.append(Paragraph(_x(rp["disagree"]), P))
+            else:
+                for d in dis[:4]:
+                    s.append(Paragraph(f"· {_x(names.get(str(d.get('who')), d.get('who')))}：{_x(_plain(d.get('view')))}", P))
+        props = [p for p in sy.get("proposal") or [] if isinstance(p, dict)]
+        if props:
+            s.append(Paragraph("这个周末每个合约怎么做（纸面练习，不下真钱）", H3))
+            lean = {"fade": "押它弹回来", "follow": "押它继续走", "skip": "不做"}
+            rows = [["合约", "做法", "放多少", "为什么"]]
+            for p in props:
+                rows.append([_x(p.get("name")), lean.get(str(p.get("lean")), _x(p.get("lean"))),
+                             "不放" if not p.get("size") else f"{float(p.get('size') or 0) * 100:.0f}%",
+                             Paragraph(_x(_plain(p.get("why"))), SMALL)])
+            s.append(_table(rows, [24 * mm, 30 * mm, 18 * mm, 106 * mm]))
+        vetoes = [v for v in sy.get("veto") or [] if isinstance(v, dict)]
+        for v in vetoes:
+            s.append(Paragraph(f"否决：{_x(v.get('name'))}——{_x(_plain(v.get('why')))}", P))
+        acts = sy.get("actions") or []
+        if acts:
+            s.append(Paragraph("接下来要做的", H3))
+            for a_ in acts[:5]:
+                s.append(Paragraph("· " + _x(_plain(a_)), P))
+    # —— 附录：原始记录
+    s.append(PageBreak())
+    s.append(Paragraph("附录：原始发言记录（给想深究的人看，可以跳过）", H1))
+    s.append(Paragraph("下面是每个 agent 的原话。方括号里的 F 编号指它引用的资料条目，资料原文在最后。", SMALL))
+    ck = rec.get("checks", {})
+    for v in ck.values():
+        s.append(Paragraph(f"代码核对：{'[通过]' if v.get('ok') else '[有问题]'} {_x(v.get('text'))}", SMALL))
+    cell = ParagraphStyle("c", parent=SMALL, textColor=colors.black)
+    for meta in rec.get("rooms_meta", []):
+        room = rec.get("rooms", {}).get(meta["key"])
+        if not room:
+            continue
         s.append(Paragraph(meta["name"], H2))
-        s.append(Paragraph(f"<b>结论：</b>{_x(sy.get('plain'))}（把握 {sy.get('confidence', '—')}%）", P))
-        if sy.get("consensus"):
-            s.append(Paragraph("共识：" + _x(sy["consensus"]), SMALL))
-        for d in sy.get("dissent") or []:
-            if isinstance(d, dict):
-                s.append(Paragraph(f"不同意见 · {_x(names.get(str(d.get('who')), d.get('who')))}：{_x(d.get('view'))}", SMALL))
-        for a in sy.get("actions") or []:
-            s.append(Paragraph("接下来：" + _x(a), SMALL))
-        for p in sy.get("proposal") or []:
-            if isinstance(p, dict):
-                s.append(Paragraph(f"提案：{_x(p.get('name'))} {_x(p.get('lean'))} 仓位 {_x(p.get('size'))} — {_x(p.get('why'))}", SMALL))
-        for v in sy.get("veto") or []:
-            if isinstance(v, dict):
-                s.append(Paragraph(f"否决：{_x(v.get('name'))} — {_x(v.get('why'))}", SMALL))
         for i, rr in enumerate(room.get("rounds", [])):
-            s.append(Paragraph(f"第 {i + 1} 轮发言", SMALL))
+            s.append(Paragraph(f"第 {i + 1} 轮", SMALL))
             for o in rr:
                 out = o.get("out", {})
-                txt = f"<b>{_x(names.get(o['agent'], o['agent']))}</b>：{_x(out.get('plain'))}"
-                if out.get("stance"):
-                    txt += f"（立场：{_x(out['stance'])}）"
-                s.append(Paragraph(txt, cell))
+                s.append(Paragraph(f"<b>{_x(names.get(o['agent'], o['agent']))}</b>：{_x(out.get('plain'))}", cell))
                 for pt in out.get("points") or []:
                     if isinstance(pt, dict):
                         s.append(Paragraph(f"　· {_x(pt.get('claim'))} [{_x(','.join(map(str, pt.get('cite') or [])))}]", SMALL))
                 if out.get("rebut"):
                     s.append(Paragraph("　回应：" + _x(out["rebut"]), SMALL))
-                for b in out.get("backtest") or []:
-                    if isinstance(b, dict):
-                        s.append(Paragraph("　代码回测：" + _x(b.get("text")), SMALL))
+                for b_ in out.get("backtest") or []:
+                    if isinstance(b_, dict):
+                        s.append(Paragraph("　电脑回测：" + _x(b_.get("text")), SMALL))
                 if out.get("forecast_ratio") is not None:
-                    s.append(Paragraph(f"　期权预测：实际/隐含 = {_x(out['forecast_ratio'])}", SMALL))
-    s.append(Paragraph(f"资料包（{len(rec.get('facts', []))} 条，全部由代码生成）", H2))
+                    s.append(Paragraph(f"　期权预测：实际÷隐含 = {_x(out['forecast_ratio'])}", SMALL))
+    s.append(Paragraph(f"资料原文（{len(rec.get('facts', []))} 条，全部由程序生成）", H2))
     for f in rec.get("facts", []):
-        s.append(Paragraph(f"{f['id']} [{_x(f['topic'])}] {'（外部文本）' if f.get('untrusted') else ''}{_x(f['text'])}", SMALL))
+        s.append(Paragraph(f"{f['id']} [{_x(f['topic'])}] {'（外部新闻标题）' if f.get('untrusted') else ''}{_x(f['text'])}", SMALL))
     doc.build(s)
     return buf.getvalue()
 
