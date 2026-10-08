@@ -107,3 +107,24 @@ def test_reset_link(env):
     assert c.post("/setpw", data={"token": tok, "p1": "abcdefghij1", "p2": "abcdefghij1"}).status_code == 400  # single use
     assert c.post("/login", data={"username": "newbie", "password": "abcdefghij1"}, follow_redirects=False).status_code == 303
     assert c.get("/setpw?token=bogus").status_code == 400
+
+
+def test_settings_key(env, monkeypatch):
+    s, web = env
+    import subprocess
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)   # restored (removed) after the test
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: None)
+    (s.root / ".env").write_text("NTFY_TOPIC=abc\nANTHROPIC_API_KEY=\n")
+    c = TestClient(web.app)
+    c.post("/login", data={"username": "kea", "password": "correct horse battery"})
+    assert "设置" in c.get("/settings").text
+    r = c.post("/settings/key", data={"key": "weekend-desk"})
+    assert "没保存" in r.text and "sk-ant-" in r.text
+    monkeypatch.setattr(web, "check_anthropic_key", lambda k: (False, "这个 key 不对"))
+    assert "没保存" in c.post("/settings/key", data={"key": "sk-ant-bad"}).text
+    monkeypatch.setattr(web, "check_anthropic_key", lambda k: (True, "测试通过"))
+    r = c.post("/settings/key", data={"key": "sk-ant-api03-goodgoodgood1234"})
+    assert "已保存" in r.text and "sk-ant-…1234" in r.text
+    env_txt = (s.root / ".env").read_text()
+    assert "ANTHROPIC_API_KEY=sk-ant-api03-goodgoodgood1234" in env_txt and "NTFY_TOPIC=abc" in env_txt
+    assert "goodgoodgood" not in c.get("/settings").text      # page shows masked key only

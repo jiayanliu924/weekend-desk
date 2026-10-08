@@ -163,7 +163,7 @@ details{margin-top:10px}summary{cursor:pointer;color:var(--acc);font-size:14px}
 """
 
 TABS = [("/", "概览"), ("/agents", "Agent 讨论室"), ("/day", "每日记录"), ("/weekends", "周末预测"), ("/options", "期权研究"),
-        ("/money", "放真钱会怎样"), ("/history", "历史回测"), ("/guide", "这是什么")]
+        ("/money", "放真钱会怎样"), ("/history", "历史回测"), ("/guide", "这是什么"), ("/settings", "设置")]
 
 
 def page(req: Request, active: str, title: str, body: str, head: str = "") -> HTMLResponse:
@@ -347,7 +347,7 @@ def overview(req: Request):
 <div class="grid">
 <div class="card"><div class="k">系统状态</div><div class="v s {'good' if fresh else 'bad'}">{'正常采集中' if fresh else '数据可能中断'}</div>
 <div class="k">{len(st['all'])}/{len(S.instruments)} 个合约在收数据 · 最新 {_pt(xyz and xyz['at'])}</div></div>
-<div class="card"><div class="k">今天读了多少新闻</div><div class="v">{st['news_today']}</div><div class="k">{'大模型抽取：已开启' if st['llm_key'] else '<span class=bad>大模型抽取：未填 API Key</span>'}</div></div>
+<div class="card"><div class="k">今天读了多少新闻</div><div class="v">{st['news_today']}</div><div class="k">{'大模型抽取：已开启' if st['llm_key'] else '<a class=bad href=/settings>大模型抽取：未填 API Key（点这里填）</a>'}</div></div>
 <div class="card"><div class="k">下一次周末预测锁定</div><div class="v s">{w.decision.astimezone(PT):%m-%d（%a）%H:%M}</div><div class="k">加州时间，7 个合约分 2 批锁定</div></div>
 <div class="card"><div class="k">下一个期权研究事件</div><div class="v s">{E(nxt[0].event_type) + ' ' + nxt[0].event_at.astimezone(PT).strftime('%m-%d %H:%M') if nxt else '—'}</div><div class="k">{' · '.join(e.event_type + ' ' + e.event_at.astimezone(PT).strftime('%m-%d') for e in nxt[1:])}</div></div>
 </div>
@@ -646,7 +646,7 @@ def agents_page(req: Request, run: str | None = None):
 <div class="grid">
 <div class="card"><div class="k">状态</div><div class="v s">{status}</div></div>
 <div class="card"><div class="k">今天 / 本月费用（上限）</div><div class="v s">${sp['day']:.2f} / ${sp['month']:.2f}</div><div class="k">上限 ${sp['cap_day']:.2f}/天，${sp['cap_month']:.0f}/月</div></div>
-<div class="card"><div class="k">API key</div><div class="v s {'good' if key_ok else 'bad'}">{'已填' if key_ok else '未填：只能做代码审计'}</div></div>
+<div class="card"><div class="k">API key</div><div class="v s {'good' if key_ok else 'bad'}">{'已填' if key_ok else '未填：只能做代码审计'}</div><div class="k"><a href="/settings">去设置</a></div></div>
 <div class="card"><div class="k">手动开会</div><form method="post" action="/agents/run"><button {'disabled' if st.get('running') else ''}>现在开会</button></form><div class="k">约 4–6 分钟，约 $0.8</div></div>
 </div>
 {('<p class="note">' + E(req.query_params.get('msg', '')) + '</p>') if req.query_params.get('msg') else ''}
@@ -734,6 +734,91 @@ def agents_run(req: Request):
         threading.Thread(target=agents.run_meeting, args=(S, f"{_user(req)} 手动开会"), daemon=True).start()
         msg = "已开始开会，约 3–5 分钟。页面会自动刷新。"
     return RedirectResponse("/agents?" + urlencode({"msg": msg}), status_code=303)
+
+
+# ------------------------------------------------------------------ settings: paste the Anthropic key in the browser
+def _mask(k: str) -> str:
+    return f"{k[:7]}…{k[-4:]}" if k and len(k) > 15 else ("（未填）" if not k else "（格式不对）")
+
+
+def check_anthropic_key(key: str) -> tuple[bool, str]:
+    """Try one tiny call. Returns (ok, message in plain Chinese)."""
+    try:
+        import anthropic
+        c = anthropic.Anthropic(api_key=key)
+        c.messages.create(model=S["llm"]["model"], max_tokens=1, messages=[{"role": "user", "content": "hi"}])
+        return True, "测试通过：这个 key 能用"
+    except Exception as e:  # noqa: BLE001
+        name = type(e).__name__
+        if "Authentication" in name or "401" in str(e):
+            return False, "这个 key 不对（Anthropic 不认）。请确认复制的是 sk-ant- 开头的整串，而不是 key 的名字。"
+        if "PermissionDenied" in name or "credit" in str(e).lower() or "billing" in str(e).lower():
+            return False, "key 是对的，但账户里没有余额：去 Billing 充值后再试。"
+        return False, f"测试没通过：{name}: {str(e)[:160]}"
+
+
+def save_env_key(name: str, value: str) -> None:
+    p = Path(S.root) / ".env"
+    lines = p.read_text().splitlines() if p.exists() else []
+    out, done = [], False
+    for ln in lines:
+        if ln.startswith(f"{name}="):
+            out.append(f"{name}={value}")
+            done = True
+        else:
+            out.append(ln)
+    if not done:
+        out.append(f"{name}={value}")
+    tmp = p.with_suffix(".tmp")
+    tmp.write_text("\n".join(out) + "\n")
+    os.chmod(tmp, 0o600)
+    tmp.replace(p)
+    os.environ[name] = value
+
+
+@app.get("/settings", response_class=HTMLResponse)
+def settings_page(req: Request):
+    if (r := _guard(req)):
+        return r
+    cur = os.environ.get("ANTHROPIC_API_KEY", "")
+    msg = req.query_params.get("msg", "")
+    body = f"""<h1>设置</h1>
+{('<p class="note">' + E(msg) + '</p>') if msg else ''}
+<div class="card"><h2 style="margin-top:0">Anthropic API key</h2>
+<p>现在：<b class="{'good' if cur else 'bad'}">{E(_mask(cur))}</b>。新闻自动抽取和 Agent 开会都要用它。</p>
+<ol class="sub" style="color:var(--ink)">
+<li>新开一个网页，打开 <b>platform.claude.com</b>（也就是 console.anthropic.com），登录。</li>
+<li>左边菜单找 <b>API keys</b>，点 <b>Create key</b>，名字随便填（比如 weekend-desk），点创建。</li>
+<li>弹出来一串很长的、<b>sk-ant-</b> 开头的字符，点旁边的复制按钮。<b>它只显示这一次</b>。</li>
+<li>回到这里，粘贴到下面的框里，点"保存并测试"。</li>
+</ol>
+<form method="post" action="/settings/key" style="display:grid;gap:10px;max-width:560px">
+<label>粘贴 key（以 sk-ant- 开头）<input name="key" type="password" autocomplete="off" required placeholder="sk-ant-api03-..."></label>
+<button type="submit">保存并测试</button></form>
+<p class="sub">保存前会先用这个 key 试一次（花费不到 0.01 美分），不对就不保存。key 只存在服务器上，网页上只显示开头和最后 4 位。</p></div>"""
+    return page(req, "/settings", "设置", body)
+
+
+@app.post("/settings/key")
+def settings_key(req: Request, key: str = Form(...)):
+    if (r := _guard(req)):
+        return r
+    origin = req.headers.get("origin")
+    if origin and req.headers.get("host") and origin.split("//")[-1] != req.headers["host"]:
+        return Response("bad origin", status_code=403)
+    key = key.strip()
+    if not key.startswith("sk-ant-"):
+        msg = "没保存：key 必须以 sk-ant- 开头。你贴的可能是 key 的名字，请复制那串很长的字符。"
+    else:
+        ok, msg = check_anthropic_key(key)
+        if ok:
+            save_env_key("ANTHROPIC_API_KEY", key)
+            import subprocess
+            subprocess.Popen(["systemctl", "restart", "weekend-desk"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            msg = f"已保存（{_mask(key)}）。{msg}。后台程序已重启，新闻抽取开始工作；去「Agent 讨论室」点「现在开会」就能开第一场会。"
+        else:
+            msg = "没保存：" + msg
+    return RedirectResponse("/settings?" + urlencode({"msg": msg}), status_code=303)
 
 
 @app.get("/report.pdf")
