@@ -193,7 +193,7 @@ weekend_lead_min = 120
 rounds = 2
 max_parallel = 6
 # 费用封顶（美元）：超了当天/当月不再开会，只做代码审计
-budget_day_usd = 2.5
-budget_month_usd = 50.0
+budget_day_usd = 4.0
+budget_month_usd = 60.0
 # 网页"现在开会"按钮的冷却时间
 manual_cooldown_min = 30

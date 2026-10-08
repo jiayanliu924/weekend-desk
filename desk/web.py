@@ -680,7 +680,7 @@ def agents_page(req: Request, run: str | None = None):
 <div class="card"><div class="k">状态</div><div class="v s">{status}</div></div>
 <div class="card"><div class="k">今天 / 本月费用（上限）</div><div class="v s">${sp['day']:.2f} / ${sp['month']:.2f}</div><div class="k">上限 ${sp['cap_day']:.2f}/天，${sp['cap_month']:.0f}/月</div></div>
 <div class="card"><div class="k">API key</div><div class="v s {'good' if key_ok else 'bad'}">{'已填' if key_ok else '未填：只能做代码审计'}</div><div class="k"><a href="/settings">去设置</a></div></div>
-<div class="card"><div class="k">手动开会</div><form method="post" action="/agents/run"><button {'disabled' if st.get('running') else ''}>现在开会</button></form><div class="k">约 4–6 分钟，约 $0.8</div></div>
+<div class="card"><div class="k">手动开会</div><form method="post" action="/agents/run"><button {'disabled' if st.get('running') else ''}>现在开会</button></form><div class="k">约 5–8 分钟，约 $1.2</div></div>
 </div>
 {('<p class="note">' + E(req.query_params.get('msg', '')) + '</p>') if req.query_params.get('msg') else ''}
 {_arena_html()}

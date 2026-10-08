@@ -582,7 +582,7 @@ def _state_path(settings) -> Path:
 
 def set_state(settings, **kw):
     p = _state_path(settings)
-    p.write_text(json.dumps({**kw, "ts": time.time()}, ensure_ascii=False))
+    p.write_text(json.dumps({**kw, "ts": time.time(), "pid": os.getpid()}, ensure_ascii=False))
 
 
 def get_state(settings) -> dict:
@@ -593,6 +593,13 @@ def get_state(settings) -> dict:
         return {"running": False}
     if st.get("running") and time.time() - st.get("ts", 0) > 1800:   # stale
         st["running"] = False
+    if st.get("running") and st.get("pid"):
+        try:
+            os.kill(st["pid"], 0)                 # 开会的进程已经不在了（例如服务重启）→ 不算在开会
+        except ProcessLookupError:
+            st["running"] = False
+        except PermissionError:
+            pass
     return st
 
 

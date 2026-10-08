@@ -220,3 +220,10 @@ def test_arena_weekly_review_replaces_loser(env):  # noqa: F811
     S = arena.standings(s, agents.AGENTS, now=t0 + 7 * 86400 + 1)
     assert S["table"]["SIZER"]["score30"] == 0                           # 新一代积分清零
     assert "你的成绩" in arena.feedback_line(s, "FADER", S)
+
+
+def test_stale_running_state_from_dead_process(env):  # noqa: F811
+    s, _ = env
+    import json as _j
+    (agents._dir(s) / "state.json").write_text(_j.dumps({"running": True, "ts": __import__("time").time(), "pid": 999999}))
+    assert agents.get_state(s)["running"] is False
