@@ -82,7 +82,7 @@ def validate(spec: dict) -> tuple[dict | None, str]:
         if k == "options":
             side = spec.get("side", "short")
             when = spec.get("when", "all")
-            if side not in ("short", "long") or when not in ("control", "event", "all"):
+            if side not in ("short", "long") or when not in ("control", "event", "all", "friday"):
                 return None, "side/when 取值不对"
             return {"kind": k, "name": name, "side": side, "when": when,
                     "min_implied": float(spec.get("min_implied", 0)), "max_implied": float(spec.get("max_implied", 9))}, ""
@@ -128,7 +128,11 @@ def backtest_options(settings, spec: dict) -> dict:
         edge = STRADDLE_K * iv * math.sqrt(1 / 365) * (1 - ratio) * 100
         base = edge - OPT_COST_PCT                      # 基线：每天都卖
         (base_te if r["date"] >= split else base_tr).append(base)
-        if spec["when"] != "all" and r["grp"] != spec["when"]:
+        if spec["when"] == "friday":
+            from datetime import date as _d
+            if _d.fromisoformat(r["date"][:10]).weekday() != 4:      # Deribit 周度期权周五 08:00 UTC 到期
+                continue
+        elif spec["when"] != "all" and r["grp"] != spec["when"]:
             continue
         if not (spec["min_implied"] <= iv <= spec["max_implied"]):
             continue

@@ -338,7 +338,14 @@ def build_bundle(settings, now: datetime | None = None) -> Facts:
             parts.append(f"{stream} {n[0][0]} 条")
         F.add("数据健康", "过去 24 小时入库：" + "，".join(parts))
 
-    for name, fn in (("行情", prices), ("历史回测", history), ("实时成绩", live), ("期权", opts), ("新闻", news), ("数据健康", health)):
+    def intel():
+        p = Path(settings.root) / "knowledge" / "jane_street.md"
+        if p.exists():
+            for line in p.read_text().splitlines():
+                if line.startswith("- "):
+                    F.add("Jane Street 公开情报", line[2:].strip())
+
+    for name, fn in (("Jane Street 情报", intel), ("行情", prices), ("历史回测", history), ("实时成绩", live), ("期权", opts), ("新闻", news), ("数据健康", health)):
         safe(name, fn)
     return F
 
@@ -487,7 +494,7 @@ class Meeting:
 方案只能是下面两种格式之一（字段名和取值必须照抄）：
 周末：{"kind": "weekend", "name": "简短名字", "instruments": ["NVDA","INTC"] 或 "all", "direction": "fade" 或 "follow",
        "min_abs_dev_bps": 数字, "max_abs_dev_bps": 数字, "size": "flat" 或 "proportional"}
-期权：{"kind": "options", "name": "简短名字", "side": "short" 或 "long", "when": "control" 或 "event" 或 "all",
+期权：{"kind": "options", "name": "简短名字", "side": "short" 或 "long", "when": "control" 或 "event" 或 "all" 或 "friday"（周五=期权到期日）,
        "min_implied": 年化隐含波动下限（0.4 表示 40%%）, "max_implied": 上限}"""
 
     def algo_room(self, facts: Facts, pool=None) -> dict:

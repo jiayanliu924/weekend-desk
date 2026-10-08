@@ -15,6 +15,7 @@ for f in config.toml events.toml; do
   fi
 done
 rm -rf /opt/weekend-desk/tests && cp -r weekend-desk-main/tests /opt/weekend-desk/
+rm -rf /opt/weekend-desk/knowledge && cp -r weekend-desk-main/knowledge /opt/weekend-desk/
 /opt/weekend-desk/venv/bin/pip install -q -r /opt/weekend-desk/requirements.txt
 cd /opt/weekend-desk && env -u NTFY_TOPIC -u ANTHROPIC_API_KEY ./venv/bin/python -m pytest -q tests
 systemctl restart weekend-desk

@@ -158,3 +158,17 @@ def test_algolab_backtest(env):  # noqa: F811
     r2 = algolab.run_spec(s, {"kind": "options", "name": "y", "side": "short", "when": "all"}, "T", "run")
     assert r2["result"]["trials_total"] == 2 and r2["result"]["bar"] == 0.025
     assert algolab.validate({"kind": "weekend", "direction": "sideways"})[0] is None
+
+
+def test_intel_and_friday_spec(env):  # noqa: F811
+    s, _ = env
+    import shutil
+    from pathlib import Path
+    from desk import algolab
+    (Path(s.root) / "knowledge").mkdir(exist_ok=True)
+    shutil.copy(Path(__file__).resolve().parent.parent / "knowledge" / "jane_street.md", Path(s.root) / "knowledge")
+    f = agents.build_bundle(s)
+    assert sum(1 for x in f.items if x["topic"] == "Jane Street 公开情报") >= 8
+    r = algolab.run_spec(s, {"kind": "options", "name": "到期日", "side": "short", "when": "friday"}, "T", "run")
+    assert "result" in r          # 2026-09-01 is a Tuesday, 2026-09-16 Wednesday → zero trades, still valid
+    assert r["result"]["train"]["n"] + r["result"]["test"]["n"] == 0
