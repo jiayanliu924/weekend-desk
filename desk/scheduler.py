@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from datetime import datetime, timedelta, timezone
 
 from . import jobs, notify, options, rawstore
@@ -11,6 +12,7 @@ from .collector import Collector
 from .news import NewsPoller
 
 log = logging.getLogger("scheduler")
+STARTED_AT = time.time()
 
 
 def due_jobs(now: datetime, settings, done: set) -> list[tuple[str, object]]:
@@ -68,7 +70,7 @@ def integrity(settings) -> None:
         mg = max(gaps) if gaps else None
         msgs.append(f"{stream}: {len(rows)} 条, 哈希不符 {bad}, 最长断档 {mg:.0f} 分钟" if mg is not None
                     else f"{stream}: {len(rows)} 条")
-        if stream == "hl_ctx" and (not rows or (mg or 0) > 15 or bad):
+        if stream == "hl_ctx" and time.time() - STARTED_AT > 7200 and (not rows or (mg or 0) > 15 or bad):
             notify.push(settings, "数据检查异常", "\n".join(msgs), priority="high")
     log.info("integrity: %s", " | ".join(msgs))
 

@@ -39,7 +39,7 @@ fi
 TOPIC=$(grep NTFY_TOPIC "$DEST/.env" | cut -d= -f2)
 
 cd "$DEST"
-if [ -d tests ]; then echo "==> 自检（模拟一个完整周末）"; ./venv/bin/python -m pytest -q tests; fi
+if [ -d tests ]; then echo "==> 自检（模拟一个完整周末）"; env -u NTFY_TOPIC -u ANTHROPIC_API_KEY ./venv/bin/python -m pytest -q tests; fi
 
 echo "==> 设置开机自启的后台服务"
 cat > /etc/systemd/system/weekend-desk.service <<EOF
@@ -59,7 +59,8 @@ Environment=PYTHONUNBUFFERED=1
 WantedBy=multi-user.target
 EOF
 systemctl daemon-reload
-systemctl enable --now weekend-desk
+systemctl enable weekend-desk
+systemctl restart weekend-desk
 
 echo "==> 回补历史，生成基线报告和期权历史粗看"
 ./venv/bin/python -m desk backfill > /dev/null || true
