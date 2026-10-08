@@ -23,11 +23,11 @@ from .ledger import Ledger
 
 pdfmetrics.registerFont(UnicodeCIDFont("STSong-Light"))
 F = "STSong-Light"
-H1 = ParagraphStyle("h1", fontName=F, fontSize=17, leading=22, spaceAfter=6)
-H2 = ParagraphStyle("h2", fontName=F, fontSize=12.5, leading=17, spaceBefore=10, spaceAfter=4,
+H1 = ParagraphStyle("h1", wordWrap="CJK", fontName=F, fontSize=17, leading=22, spaceAfter=6)
+H2 = ParagraphStyle("h2", wordWrap="CJK", fontName=F, fontSize=12.5, leading=17, spaceBefore=10, spaceAfter=4,
                     textColor=colors.HexColor("#7a2a1e"))
-P = ParagraphStyle("p", fontName=F, fontSize=9.5, leading=14)
-SMALL = ParagraphStyle("s", fontName=F, fontSize=8, leading=11, textColor=colors.HexColor("#666666"))
+P = ParagraphStyle("p", wordWrap="CJK", fontName=F, fontSize=9.5, leading=14)
+SMALL = ParagraphStyle("s", wordWrap="CJK", fontName=F, fontSize=8, leading=11, textColor=colors.HexColor("#666666"))
 
 
 def _n(x, nd=1, suf=""):
@@ -134,6 +134,89 @@ def agents_section(settings) -> list:
     out.append(Paragraph("代码审计：" + "；".join(f"{'[通过]' if v.get('ok') else '[有问题]'} {_x(v.get('text'))}" for v in ck.values())
                          + f"。本次费用 ${r.get('cost_usd', 0):.2f}，{r.get('calls', 0)} 次调用。", SMALL))
     return out
+
+
+def meeting_pdf(settings, rec: dict) -> bytes:
+    """一次 Agent 会议的完整记录。"""
+    from . import arena
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=16 * mm, rightMargin=16 * mm, topMargin=14 * mm, bottomMargin=14 * mm,
+                            title=f"Agent 会议 {rec.get('run_id')}")
+    cell = ParagraphStyle("c", parent=SMALL, textColor=colors.black)
+    names = {a["id"]: a["name"] for a in rec.get("roster", [])}
+    s = [Paragraph(f"Agent 团队会议记录 {rec.get('run_id', '')}", H1),
+         Paragraph(f"原因：{_x(rec.get('reason'))} · 模式：{_x(rec.get('mode'))} · 费用 ${rec.get('cost_usd', 0):.2f} · "
+                   f"{rec.get('calls', 0)} 次发言 · 全部为模拟研究，不构成投资建议", SMALL)]
+    if rec.get("degraded_reason"):
+        s.append(Paragraph("说明：" + _x(rec["degraded_reason"]), P))
+    ch = rec.get("chair") or {}
+    if ch:
+        s.append(Paragraph("主席结论", H2))
+        s.append(Paragraph(f"<b>{_x(ch.get('headline'))}</b>", P))
+        s.append(Paragraph(_x(ch.get("plain")), P))
+        for t in ch.get("today") or []:
+            s.append(Paragraph("· " + _x(t), SMALL))
+        for t in ch.get("disagree") or []:
+            s.append(Paragraph("分歧：" + _x(t), SMALL))
+        if rec.get("editor", {}).get("push"):
+            s.append(Paragraph("手机推送：" + _x(rec["editor"]["push"]).replace("\n", " / "), SMALL))
+    st = rec.get("standings") or {}
+    if st.get("table"):
+        s.append(Paragraph("赛马积分（30 天）", H2))
+        rows = [["岗位", "agent", "积分", "已结算", "状态"]]
+        for race, label in arena.RACES.items():
+            for k, t in sorted([(k, t) for k, t in st["table"].items() if t["room"] == race], key=lambda x: -x[1]["score30"]):
+                rows.append([label, f"{t['name']}（第 {t.get('gen', 1)} 代）", f"{t['score30']:+.1f}", str(t["n_outcome"]),
+                             ("冠军" if t.get("champion") else "") + (" 暂停" if t.get("paused") else "")])
+        s.append(_table(rows, [20 * mm, 60 * mm, 24 * mm, 24 * mm, 44 * mm]))
+    ck = rec.get("checks", {})
+    if ck:
+        s.append(Paragraph("代码审计", H2))
+        for v in ck.values():
+            s.append(Paragraph(f"{'[通过]' if v.get('ok') else '[有问题]'} {_x(v.get('text'))}", SMALL))
+    for meta in rec.get("rooms_meta", []):
+        room = rec.get("rooms", {}).get(meta["key"])
+        if not room:
+            continue
+        sy = room.get("synth", {})
+        s.append(Paragraph(meta["name"], H2))
+        s.append(Paragraph(f"<b>结论：</b>{_x(sy.get('plain'))}（把握 {sy.get('confidence', '—')}%）", P))
+        if sy.get("consensus"):
+            s.append(Paragraph("共识：" + _x(sy["consensus"]), SMALL))
+        for d in sy.get("dissent") or []:
+            if isinstance(d, dict):
+                s.append(Paragraph(f"不同意见 · {_x(names.get(str(d.get('who')), d.get('who')))}：{_x(d.get('view'))}", SMALL))
+        for a in sy.get("actions") or []:
+            s.append(Paragraph("接下来：" + _x(a), SMALL))
+        for p in sy.get("proposal") or []:
+            if isinstance(p, dict):
+                s.append(Paragraph(f"提案：{_x(p.get('name'))} {_x(p.get('lean'))} 仓位 {_x(p.get('size'))} — {_x(p.get('why'))}", SMALL))
+        for v in sy.get("veto") or []:
+            if isinstance(v, dict):
+                s.append(Paragraph(f"否决：{_x(v.get('name'))} — {_x(v.get('why'))}", SMALL))
+        for i, rr in enumerate(room.get("rounds", [])):
+            s.append(Paragraph(f"第 {i + 1} 轮发言", SMALL))
+            for o in rr:
+                out = o.get("out", {})
+                txt = f"<b>{_x(names.get(o['agent'], o['agent']))}</b>：{_x(out.get('plain'))}"
+                if out.get("stance"):
+                    txt += f"（立场：{_x(out['stance'])}）"
+                s.append(Paragraph(txt, cell))
+                for pt in out.get("points") or []:
+                    if isinstance(pt, dict):
+                        s.append(Paragraph(f"　· {_x(pt.get('claim'))} [{_x(','.join(map(str, pt.get('cite') or [])))}]", SMALL))
+                if out.get("rebut"):
+                    s.append(Paragraph("　回应：" + _x(out["rebut"]), SMALL))
+                for b in out.get("backtest") or []:
+                    if isinstance(b, dict):
+                        s.append(Paragraph("　代码回测：" + _x(b.get("text")), SMALL))
+                if out.get("forecast_ratio") is not None:
+                    s.append(Paragraph(f"　期权预测：实际/隐含 = {_x(out['forecast_ratio'])}", SMALL))
+    s.append(Paragraph(f"资料包（{len(rec.get('facts', []))} 条，全部由代码生成）", H2))
+    for f in rec.get("facts", []):
+        s.append(Paragraph(f"{f['id']} [{_x(f['topic'])}] {'（外部文本）' if f.get('untrusted') else ''}{_x(f['text'])}", SMALL))
+    doc.build(s)
+    return buf.getvalue()
 
 
 def build(settings, capital: float = 2000.0, leverage: float = 2.0, daily_for: date | None = None) -> bytes:

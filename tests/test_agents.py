@@ -98,6 +98,11 @@ def test_full_meeting_and_audit(env):  # noqa: F811
         assert t in r.text, t
     assert c.get(f"/agents?run={rec['run_id']}").status_code == 200
     assert c.get("/agents?run=../../etc").status_code == 200   # bad id → falls back to empty, no traversal
+    pdfm = c.get(f"/agents/{rec['run_id']}.pdf")
+    assert pdfm.status_code == 200 and pdfm.content[:4] == b"%PDF" and len(pdfm.content) > 5000
+    assert c.get("/agents/nope.pdf").status_code == 404
+    assert c.get("/agents/state").json()["running"] is False
+    assert "导出这次会议 PDF" in r.text and "localStorage" in r.text
     # PDF includes the meeting
     pdf = pdfreport.build(s)
     assert pdf[:4] == b"%PDF"

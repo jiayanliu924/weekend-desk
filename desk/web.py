@@ -670,8 +670,8 @@ def agents_page(req: Request, run: str | None = None):
     sp = agents.spend(S)
     rec = agents.load_run(S, run)
     runs = agents.list_runs(S, 12)
-    head = '<meta http-equiv="refresh" content="15">' if st.get("running") else ""
-    status = (f'<span class="good">正在开会：{E(st.get("stage", ""))}</span>（页面每 15 秒自动刷新）' if st.get("running")
+    head = AGENTS_JS
+    status = (f'<span class="good" id="meet-stage">正在开会：{E(st.get("stage", ""))}</span>（开完会页面会自动更新，展开的内容不会被收起）' if st.get("running")
               else f"上次开会：{E(rec['run_id']) if rec else '还没开过'}")
     key_ok = bool(os.environ.get("ANTHROPIC_API_KEY"))
     body = f"""<h1>Agent 讨论室</h1>
@@ -696,6 +696,8 @@ def agents_page(req: Request, run: str | None = None):
     if rec.get("degraded_reason"):
         body += f'<p class="note"><b>{"没开会" if rec["mode"] == "degraded" else ("会议失败" if rec["mode"] == "failed" else "会议中途停止")}：</b>{E(rec["degraded_reason"])}</p>'
     ch = rec.get("chair")
+    body += (f'<p style="margin:14px 0"><a class="btn" href="/agents/{E(rec["run_id"])}.pdf">导出这次会议 PDF</a> '
+             f'<span class="sub">（{E(rec["run_id"])}：主席结论、每个讨论室的结论和完整发言、代码审计、赛马积分、资料包）</span></p>')
     if ch:
         body += (f'<h2>主席结论 <span class="mut" style="font-size:13px">{E(rec["run_id"])} · {E(rec.get("reason", ""))} · '
                  f'${rec.get("cost_usd", 0):.2f} · {rec.get("calls", 0)} 次发言</span></h2>'
@@ -744,6 +746,50 @@ def agents_page(req: Request, run: str | None = None):
                     f'{"<span class=tag>外部文本</span>" if f.get("untrusted") else ""}{E(f["text"])}</div>' for f in rec.get("facts", []))
     body += f'<h2>资料包（{len(rec.get("facts", []))} 条，全部由代码生成）</h2><div class="card">{facts}</div>'
     return page(req, "/agents", "Agent 讨论室", body, head)
+
+
+AGENTS_JS = """<script>
+(function(){
+  // 记住哪些"看完整讨论"是展开的（每次会议单独记）
+  function key(){ return 'open:' + location.pathname + location.search; }
+  document.addEventListener('DOMContentLoaded', function(){
+    var ds = document.querySelectorAll('details'); var saved = [];
+    try { saved = JSON.parse(localStorage.getItem(key()) || '[]'); } catch(e) {}
+    ds.forEach(function(d, i){ if (saved.indexOf(i) >= 0) d.open = true;
+      d.addEventListener('toggle', function(){ var o = [];
+        document.querySelectorAll('details').forEach(function(x, j){ if (x.open) o.push(j); });
+        try { localStorage.setItem(key(), JSON.stringify(o)); } catch(e) {} }); });
+    // 开会时只轮询状态，不整页刷新；开完会再刷新一次
+    var el = document.getElementById('meet-stage'); if (!el) return;
+    var t = setInterval(function(){
+      fetch('/agents/state', {credentials: 'same-origin'}).then(function(r){ return r.json(); }).then(function(s){
+        if (s.running) { el.textContent = '正在开会：' + (s.stage || ''); }
+        else { clearInterval(t); location.href = '/agents'; }
+      }).catch(function(){});
+    }, 15000);
+  });
+})();
+</script>"""
+
+
+@app.get("/agents/state")
+def agents_state(req: Request):
+    if not _user(req):
+        return Response("{}", status_code=401, media_type="application/json")
+    st = agents.get_state(S)
+    return {"running": bool(st.get("running")), "stage": st.get("stage", ""), "run": st.get("run", "")}
+
+
+@app.get("/agents/{rid}.pdf")
+def agents_pdf(req: Request, rid: str):
+    if (r := _guard(req)):
+        return r
+    rec = agents.load_run(S, rid)
+    if not rec:
+        return Response("没有这次会议", status_code=404)
+    data = pdfreport.meeting_pdf(S, rec)
+    return Response(data, media_type="application/pdf",
+                    headers={"Content-Disposition": f'attachment; filename="agent-meeting-{rid}.pdf"'})
 
 
 _last_manual = [0.0]
