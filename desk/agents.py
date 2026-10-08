@@ -160,7 +160,7 @@ class AnthropicLLM:
         import anthropic
         m = self.fallback.get(model, model)
         try:
-            r = self.client.messages.create(model=m, max_tokens=1400, system=system,
+            r = self.client.messages.create(model=m, max_tokens=3200, system=system,
                                             messages=[{"role": "user", "content": user}])
         except anthropic.NotFoundError:
             self.fallback[model] = "claude-haiku-4-5-20251001"
@@ -183,7 +183,17 @@ def parse_json(text: str) -> dict:
             return json.loads(t[a:b + 1])
         except ValueError:
             pass
-    return {"plain": t[:200], "parse_error": True}
+    # 被截断的 JSON：尽量把关键字段捞出来，别把原始 JSON 显示给人看
+    out = {"parse_error": True}
+    for k in ("plain", "stance", "headline", "consensus", "push", "best"):
+        m = re.search(rf'"{k}"\s*:\s*"((?:[^"\\]|\\.)*)"', t)
+        if m:
+            out[k] = m.group(1).replace('\\n', '\n').replace('\\"', '"')
+    m = re.search(r'"confidence"\s*:\s*(\d+)', t)
+    if m:
+        out["confidence"] = int(m.group(1))
+    out.setdefault("plain", "（发言格式不完整，未能读取）")
+    return out
 
 
 # ------------------------------------------------------------------ fact bundle (all numbers come from code)
@@ -641,6 +651,8 @@ def _run(settings, reason, llm, now, push) -> dict:
         rec["cost_usd"] = round(m.cost, 4)
         rec["calls"] = m.calls
         rec["failed_calls"] = m.failed
+        outs = [o for r in rec["rooms"].values() for rr in r["rounds"] for o in rr]
+        rec["truncated"] = sum(1 for o in outs if o["out"].get("parse_error"))
         if m.failed and m.failed >= max(1, (m.calls + m.failed) // 2):
             rec["mode"] = "failed"
             rec["degraded_reason"] = f"{m.failed} 次发言调用失败，会议无效。错误：{m.last_error}"
