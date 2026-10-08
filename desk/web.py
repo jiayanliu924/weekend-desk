@@ -623,6 +623,40 @@ def _say(o: dict) -> str:
             f'{"<ul class=ev>" + pts + "</ul>" if pts else ""}{extra}</div>')
 
 
+def _arena_html() -> str:
+    from . import arena
+    try:
+        st = arena.standings(S, agents.AGENTS)
+        book = arena.governed_book(S)
+        reviews = arena.state(S).get("reviews", [])[-3:]
+        recent = arena.scores(S)[-25:][::-1]
+    except Exception as e:  # noqa: BLE001
+        return f'<p class="note">赛马数据读取失败：{E(str(e))}</p>'
+    names = {k: v["name"] for k, v in st["table"].items()}
+    rows = ""
+    for race, label in arena.RACES.items():
+        mem = sorted([(k, t) for k, t in st["table"].items() if t["room"] == race], key=lambda x: -x[1]["score30"])
+        for i, (k, t) in enumerate(mem):
+            badge = ("🏆 冠军" if t["champion"] else "") + (" ⏸ 暂停" if t["paused"] else "")
+            last = t["last"][0] if t["last"] else None
+            last_txt = f"{last['points']:+g} {last['reason']}" if last else "还没有记录"
+            pnl = book["by_agent"].get(k)
+            pnl_txt = f"{pnl['pnl_bps']:+.1f}（{pnl['n']} 笔）" if pnl else ""
+            rows += (f'<tr><td>{label if i == 0 else ""}</td><td><b>{E(t["name"])}</b> <span class="mut">第 {t["gen"]} 代</span></td>'
+                     f'<td class="{_cls(t["score30"])}">{t["score30"]:+.1f}</td><td>{t["n_outcome"]}</td><td>{badge}</td>'
+                     f'<td>{pnl_txt}</td><td class="ev">{E(last_txt)}</td></tr>')
+    log_rows = "".join(f'<tr><td>{datetime.fromtimestamp(x["ts"], PT):%m-%d %H:%M}</td><td>{E(names.get(x["agent"], x["agent"]))}</td>'
+                       f'<td class="{_cls(x["points"])}">{x["points"]:+g}</td><td class="ev">{E(x["reason"])}</td></tr>' for x in recent)
+    rev = "".join(f'<li>{datetime.fromtimestamp(r["ts"], PT):%m-%d}：{E("；".join(r["events"]) or "无人淘汰")}</li>' for r in reviews)
+    empty = "<tr><td colspan=4>还没有</td></tr>"
+    rev_html = f"<div class=k>周评</div><ul>{rev}</ul>" if rev else ""
+    return f"""<h2>赛马排行榜（30 天积分）</h2>
+<div class="tw"><table><tr><th>岗位</th><th>agent</th><th>积分</th><th>已结算</th><th>状态</th><th>影子模拟账（万分点）</th><th>最近一次奖惩</th></tr>{rows}</table></div>
+<p class="sub">正式模拟账（每次决策时听冠军的）：{book["governed"]:+.1f} 万分点，{book["n"]} 笔。纪律分每场会后立即结算；期权预测约 2 天后结算；交易在周末开盘后结算；每 7 天评一次淘汰。</p>
+<details><summary>最近 25 条奖惩记录</summary><div class="tw"><table><tr><th>时间</th><th>agent</th><th>分</th><th>原因</th></tr>{log_rows or empty}</table></div>
+{rev_html}</details>"""
+
+
 def _chips(room: str) -> str:
     return "".join('<span class="tag" title="' + E(a["stance"]) + '">' + E(a["name"]) + "</span>"
                    for a in agents.AGENTS if a["room"] == room)
@@ -641,8 +675,7 @@ def agents_page(req: Request, run: str | None = None):
               else f"上次开会：{E(rec['run_id']) if rec else '还没开过'}")
     key_ok = bool(os.environ.get("ANTHROPIC_API_KEY"))
     body = f"""<h1>Agent 讨论室</h1>
-<p class="sub">25 个 AI 角色分 7 个讨论室：期权研究、Jane Street 方法、选品种、交易、算法、风控、审计，外加主席和白话编辑。算法室的两个算法师提新算法，代码在历史数据上做样本外回测，过拟合法官判定。每天 6:30（加州时间）开一次会，周末决策前 2 小时再开一次。
-每个室的成员先各自发言，再互相反驳一轮，然后整理出结论和分歧。所有数字只能来自下面的"资料包"，审计室用代码核对。Agent 不碰钱、不改规则。</p>
+<p class="sub">18 个起步、人数会自动变化的 AI 团队。交易、期权、算法三个岗位各有 3 个 agent 赛马：代码按结果自动打分，第一名当冠军（决定进正式模拟账、模型升级、发言优先），连续垫底的被淘汰、由冠军打法改写出的新一代顶替。风控、选品种、方法、审计负责把关。纪律写死在代码里，agent 改不了；奖惩全自动，人不干预。每天 6:30（加州时间）和周末决策前 2 小时开会。</p>
 <div class="grid">
 <div class="card"><div class="k">状态</div><div class="v s">{status}</div></div>
 <div class="card"><div class="k">今天 / 本月费用（上限）</div><div class="v s">${sp['day']:.2f} / ${sp['month']:.2f}</div><div class="k">上限 ${sp['cap_day']:.2f}/天，${sp['cap_month']:.0f}/月</div></div>
@@ -650,6 +683,7 @@ def agents_page(req: Request, run: str | None = None):
 <div class="card"><div class="k">手动开会</div><form method="post" action="/agents/run"><button {'disabled' if st.get('running') else ''}>现在开会</button></form><div class="k">约 4–6 分钟，约 $0.8</div></div>
 </div>
 {('<p class="note">' + E(req.query_params.get('msg', '')) + '</p>') if req.query_params.get('msg') else ''}
+{_arena_html()}
 <div class="daynav" style="margin-top:12px"><span class="k">历次会议：</span>{''.join(f'<a class="tag" href="/agents?run={E(p.stem)}">{E(p.stem[5:10] + " " + p.stem[11:13] + ":" + p.stem[13:15])}</a>' for p in runs)}</div>"""
     roster_cards = "".join(
         f'<div class="card"><div class="k">{E(m["name"])}（{sum(1 for a in agents.AGENTS if a["room"] == m["key"])} 个）</div>'

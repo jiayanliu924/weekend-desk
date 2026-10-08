@@ -179,7 +179,7 @@ server = "https://ntfy.sh"
 daily_pdf_hour_pt = 7
 
 [agents]
-# AI 讨论团队（22 个角色）。不碰真钱、不改规则；只读资料、互相挑错、写大白话结论。
+# AI 团队（18 个起步，赛马岗自动增减）。不碰真钱、不改规则；按结果自动奖惩。
 enabled = true
 member_model = "claude-haiku-4-5-20251001"
 lead_model = "claude-sonnet-5-5"

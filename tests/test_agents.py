@@ -13,10 +13,11 @@ def test_roster_shape():
     rooms = {}
     for a in agents.AGENTS:
         rooms.setdefault(a["room"], []).append(a)
-    assert len(agents.AGENTS) >= 20
-    for r in agents.ROOMS:
-        assert len(rooms[r["key"]]) >= 3, r["key"]
-    assert len(agents.AGENTS) >= 25          # 每个室至少 3 个（要求 ≥2，重要的 3）
+    for r in ("trading", "algo", "options"):
+        assert len(rooms[r]) == 3, r            # 赛马岗 3 个
+    for r in ("risk", "niche", "js"):
+        assert len(rooms[r]) == 2, r
+    assert len(agents.AGENTS) == 18
     assert len({a["id"] for a in agents.AGENTS}) == len(agents.AGENTS)
 
 
@@ -42,6 +43,13 @@ def fake_llm_factory(calls):
                               "min_abs_dev_bps": 30, "max_abs_dev_bps": 1000, "size": "flat"},
                              {"kind": "options", "name": "普通日卖波动", "side": "short", "when": "control", "min_implied": 0, "max_implied": 9},
                              {"kind": "bogus"}]}
+        elif "「交易室」的成员" in system:
+            out = {"stance": "反向", "plain": "偏离大的反向做。", "points": [{"claim": "资料", "cite": [c]}], "confidence": 50,
+                   "proposal": [{"name": n, "lean": "fade", "size": 0.5, "why": "x"} for n in
+                                ("XYZ100", "SP500", "BRENTOIL", "NVDA", "TSLA", "INTC", "SMSN")], "playbook": "大偏离反向"}
+        elif "「期权研究室」的成员" in system:
+            out = {"stance": "偏贵", "plain": "期权平时偏贵。", "points": [{"claim": "资料", "cite": [c]}], "confidence": 50,
+                   "forecast_ratio": 0.8, "playbook": "按历史平均"}
         else:
             out = {"stance": "谨慎", "plain": "样本太少，先别下结论。", "points": [{"claim": "资料显示样本少", "cite": [c]},
                                                                            {"claim": "编一个数 98765", "cite": ["F999"]}],
@@ -65,12 +73,11 @@ def test_full_meeting_and_audit(env):  # noqa: F811
     rec = agents.run_meeting(s, "test", llm=fake_llm_factory(calls), push=False)
     assert rec["mode"] == "full", rec.get("degraded_reason")
     members = [a for a in agents.AGENTS if a["room"] not in ("chair", "editor")]
-    # 20 members × 2 rounds + 6 room syntheses + chair + editor
-    # members × 2 rounds (algo judge only speaks in round 2) + 7 room syntheses + chair + editor
-    assert rec["calls"] == len(members) * 2 - 1 + 7 + 2 == len(calls)
+    # members × 2 rounds + 7 room syntheses + chair + editor
+    assert rec["calls"] == len(members) * 2 + 7 + 2 == len(calls)
     algo = rec["rooms"]["algo"]
     bts = [b for o in algo["rounds"][0] for b in o["out"].get("backtest", [])]
-    assert len(bts) == 6 and sum(1 for b in bts if b.get("error")) == 2       # bogus spec rejected
+    assert len(bts) == 9 and sum(1 for b in bts if b.get("error")) == 3       # bogus spec rejected
     assert all("考试段" in b["text"] for b in bts if not b.get("error"))
     assert any(f["topic"].startswith("算法回测") for f in rec["facts"])
     assert set(rec["rooms"]) == {r["key"] for r in agents.ROOMS}
@@ -87,7 +94,7 @@ def test_full_meeting_and_audit(env):  # noqa: F811
     c.post("/login", data={"username": "kea", "password": "correct horse battery"})
     r = c.get("/agents")
     assert r.status_code == 200
-    for t in ("主席结论", "数据正常，继续模拟", "期权研究室", "风控室", "否决 TSLA", "算法室", "代码回测", "资料包", "引用与数字", "反向押回撤"):
+    for t in ("主席结论", "数据正常，继续模拟", "期权研究室", "风控室", "否决 TSLA", "算法室", "代码回测", "赛马排行榜", "冠军", "资料包", "引用与数字", "反向押回撤"):
         assert t in r.text, t
     assert c.get(f"/agents?run={rec['run_id']}").status_code == 200
     assert c.get("/agents?run=../../etc").status_code == 200   # bad id → falls back to empty, no traversal
@@ -172,3 +179,44 @@ def test_intel_and_friday_spec(env):  # noqa: F811
     r = algolab.run_spec(s, {"kind": "options", "name": "到期日", "side": "short", "when": "friday"}, "T", "run")
     assert "result" in r          # 2026-09-01 is a Tuesday, 2026-09-16 Wednesday → zero trades, still valid
     assert r["result"]["train"]["n"] + r["result"]["test"]["n"] == 0
+
+
+def test_arena_rewards_and_penalties(env):  # noqa: F811
+    s, _ = env
+    from desk import arena
+    rec = agents.run_meeting(s, "test", llm=fake_llm_factory([]), push=False)
+    sc = arena.scores(s)
+    # 立即惩罚：引用了不存在的 F999
+    assert any(x["kind"] == "discipline" and "不存在" in x["reason"] and x["points"] <= -3 for x in sc)
+    # 算法赛马：每个算法师都有结算（无效方案 −1）
+    assert {x["agent"] for x in sc if x["kind"] == "algo"} == {"QUANT_STAT", "QUANT_VOL", "QUANT_ML"}
+    preds = arena._read(arena._d(s) / "predictions.jsonl")
+    assert {p["agent"] for p in preds if p["kind"] == "trade"} == {"FADER", "FOLLOWER", "SIZER"}
+    assert {p["agent"] for p in preds if p["kind"] == "vol"} == {"VOLBULL", "VOLBEAR", "STATS"}
+    st = rec["standings"]
+    assert set(st["champions"]) == {"trading", "options", "algo"}
+    # 交易预测在开盘后结算：给已完成的 2026-10-02 XYZ100 周末补一条预测
+    arena._append(arena._d(s) / "predictions.jsonl", {"ts": 0, "run": "t", "agent": "FADER", "kind": "trade",
+                                                      "target": "2026-10-02", "lean": "fade", "size": 1.0, "champion": True})
+    assert arena.settle(s) >= 1
+    out = [x for x in arena.scores(s) if x["kind"] == "outcome" and x["agent"] == "FADER"]
+    assert out and out[0]["points"] > 0          # 偏离 +60、开盘 +5 → 反向赚钱 → 加分
+    assert arena.settle(s) == 0                 # 不重复结算
+    assert arena.governed_book(s)["n"] >= 1
+
+
+def test_arena_weekly_review_replaces_loser(env):  # noqa: F811
+    s, _ = env
+    from desk import arena
+    for i in range(3):
+        arena.add_score(s, "FADER", "outcome", 8, "赢")
+        arena.add_score(s, "SIZER", "outcome", -6, "输")
+    t0 = __import__("time").time()
+    assert arena.weekly_review(s, agents.AGENTS, now=t0) == []            # 第一次垫底只记下
+    ev = arena.weekly_review(s, agents.AGENTS, now=t0 + 7 * 86400)
+    assert any("淘汰" in e for e in ev)
+    ros = {a["id"]: a for a in arena.roster(s, agents.AGENTS)}
+    assert ros["SIZER"]["gen"] == 2 and ros["SIZER"]["stance"] != agents.BY_ID["SIZER"]["stance"]
+    S = arena.standings(s, agents.AGENTS, now=t0 + 7 * 86400 + 1)
+    assert S["table"]["SIZER"]["score30"] == 0                           # 新一代积分清零
+    assert "你的成绩" in arena.feedback_line(s, "FADER", S)

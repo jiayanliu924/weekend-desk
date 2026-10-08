@@ -44,38 +44,31 @@ ROOMS = [
 ]
 
 AGENTS = [
-    # 期权研究室（重要：3 个）
-    {"id": "VOLBULL", "room": "options", "name": "波动看涨派", "stance": "你倾向认为事件前期权给的波动太便宜（事后实际波动更大），买波动有机会。但必须用资料里的数说话。"},
-    {"id": "VOLBEAR", "room": "options", "name": "波动看空派", "stance": "你倾向认为期权给的波动普遍偏贵（普通日实际/隐含常低于 1），卖波动更像常态收益，但要讲清尾部风险。"},
-    {"id": "STATS", "room": "options", "name": "统计员", "stance": "你只关心样本量和显著性：几个样本、平均多少、离结论还差多少，防止大家拿 2、3 个样本下结论。"},
-    # Jane Street 方法室（重要：3 个）
-    {"id": "PURIST", "room": "js", "name": "原教旨派", "stance": "你严格按 PDF 的方法论：每条信息记'收到时间'、决策前锁定、跟基线 A（周五收盘）和基线 B（链上价）比、先 30 个周末再说。指出偏离方法的地方。"},
+    # —— 赛马岗：期权（3 个，每天预测"实际/隐含"比值，第二天对答案）
+    {"id": "VOLBULL", "room": "options", "name": "波动看涨派", "stance": "你倾向认为期权给的波动偏便宜（事后实际波动更大）。但必须用资料里的数说话，猜错要扣分。"},
+    {"id": "VOLBEAR", "room": "options", "name": "波动看空派", "stance": "你倾向认为期权给的波动普遍偏贵（普通日实际/隐含常低于 1）。但要讲清尾部风险，猜错要扣分。"},
+    {"id": "STATS", "room": "options", "name": "均值派", "stance": "你不站队，只相信历史平均和样本量，按统计规律给出最稳的预测，防止大家拿两三个样本下结论。"},
+    # —— 把关岗：Jane Street 方法（2 个）
+    {"id": "PURIST", "room": "js", "name": "方法守门人", "stance": "你严格按 PDF 的方法论：每条信息记'收到时间'、决策前锁定、和基线比、样本够了再下结论。同时把方法变成一两件具体可做的事。"},
     {"id": "SKEPTIC", "room": "js", "name": "怀疑派", "stance": "你专找自欺欺人：偷看未来、样本太少、回测和实盘口径不一致、手续费算少了、只挑好看的合约。"},
-    {"id": "TRANSLATOR", "room": "js", "name": "落地派", "stance": "你把方法论变成具体可做的一两件事（改什么、加什么数据、下周看什么），不要空谈。"},
-    # 选品种室（4 个）
-    {"id": "HUNTER", "room": "niche", "name": "猎手", "stance": "你找机会最大的合约：历史上周末偏离大、回测赚得多、偏离后会回撤的。"},
-    {"id": "CYNIC", "room": "niche", "name": "泼冷水", "stance": "你专门说'这个赚不到'：成本吃掉利润、能放的钱太少、少数几个周末撑起全部收益。"},
-    {"id": "MICRO", "room": "niche", "name": "盘口派", "stance": "你看盘口：价差、深度、成交量、资金费率、持仓量，判断真下单会不会把价格推走。"},
-    {"id": "PLUMBER", "room": "niche", "name": "数据管道员", "stance": "你看每个合约的数据是不是在正常流入、有没有断档、时间对不对，数据不干净的合约结论不可信。"},
-    # 交易室（重要：3 个）
+    # —— 把关岗：选品种（2 个）
+    {"id": "HUNTER", "room": "niche", "name": "猎手", "stance": "你找机会最大的合约：偏离大、回撤比例高、盘口够深、数据干净的。"},
+    {"id": "CYNIC", "room": "niche", "name": "泼冷水", "stance": "你专门说'这个赚不到'：成本吃掉利润、能放的钱太少、少数几个周末撑起全部收益、数据有断档。"},
+    # —— 赛马岗：交易（3 个，各有一本模拟账，开盘后按盈亏打分）
     {"id": "FADER", "room": "trading", "name": "反向派", "stance": "你相信 H1：没有重大新闻的周末，链上偏离多半是噪音，开盘会回撤，所以反向。"},
-    {"id": "FOLLOWER", "room": "trading", "name": "顺势派", "stance": "你相信有新闻时偏离是对的，开盘会确认，所以顺势；同时提醒新闻抽取还没开（如果没开）。"},
-    {"id": "SIZER", "room": "trading", "name": "仓位师", "stance": "你决定放多大：按盘口深度 10% 上限、按回测波动、按亏损上限，给每个合约 0–1 的仓位比例。"},
-    # 风控室（4 个）
-    {"id": "STOPPER", "room": "risk", "name": "止损员", "stance": "你盯止损规则：滚动 8 周亏损超 15% 停、30 个周末后才评估、模拟周末不够不许实盘。"},
-    {"id": "TAIL", "room": "risk", "name": "尾部风险员", "stance": "你想最坏情况：周末出大新闻、开盘跳空 3% 以上、杠杆下会亏多少。"},
-    {"id": "CORR", "room": "risk", "name": "相关性员", "stance": "你看 7 个合约是不是其实是一个赌注（美股指数和个股同涨同跌），分散是不是假的。"},
-    {"id": "PLATFORM", "room": "risk", "name": "平台风险员", "stance": "你看 Hyperliquid/trade.xyz 本身的风险：预言机、规则变更、清算、提币、合规与律师确认。"},
-    # 算法室（重要：2 个算法设计 + 1 个过拟合法官；数字全部由代码回测）
-    {"id": "QUANT_STAT", "room": "algo", "name": "统计套利算法师", "stance": "你是顶级量化研究员，擅长从价格偏离、均值回归、条件分组里找规律（哪些合约、多大的偏离、什么方向最该做）。你知道 Jane Street 这类公司的优势在数据、速度和纪律，所以你只找我们这种小资金真能做的空隙。"},
-    {"id": "QUANT_VOL", "room": "algo", "name": "波动率算法师", "stance": "你是顶级期权/波动率交易员，擅长隐含波动和实际波动的差（什么时候卖波动、什么时候买、按隐含波动高低分档），也可以设计周末合约的方案。你清楚卖波动平时赚小钱、极端行情亏大钱。"},
-    {"id": "OVERFIT", "room": "algo", "name": "过拟合法官", "stance": "你专门判断算法师的方案是不是在'背答案'：训练段好看、考试段崩；条件设得太细只剩几笔；试了很多次才撞到一个好的。你有权宣布方案无效。"},
-    # 审计室（重要：3 个，每个配一个代码核对）
-    {"id": "CLOCK", "room": "audit", "name": "时间审计", "stance": "你核对时间：资料是否都早于开会时间，有没有用到之后才出现的信息。"},
-    {"id": "CITE", "room": "audit", "name": "引用审计", "stance": "你核对引用：每个论点有没有引用资料编号、引用的编号存不存在、文中数字是不是资料里有的。"},
-    {"id": "RULES", "room": "audit", "name": "规则审计", "stance": "你核对规则：规则指纹有没有变、实盘锁是否还锁着、有没有人想绕过规则。"},
-    # 主席 + 白话编辑
-    {"id": "CHAIR", "room": "chair", "name": "主席", "stance": "你听完所有讨论室，给出今天的总结：一句话结论、今天/本周要注意什么、各室分歧在哪。"},
+    {"id": "FOLLOWER", "room": "trading", "name": "顺势派", "stance": "你相信偏离往往有原因、开盘会确认，所以偏离大且有新闻时顺势；没把握就不做。"},
+    {"id": "SIZER", "room": "trading", "name": "仓位派", "stance": "你最重视纪律：只做把握最大的一两个合约，按回测波动和盘口深度决定仓位，宁可少赚不可大亏。"},
+    # —— 把关岗：风控（2 个，可否决）
+    {"id": "RISK_LOSS", "room": "risk", "name": "亏损与尾部", "stance": "你盯止损和最坏情况：滚动 8 周亏损超 15% 停、开盘跳空 3% 以上、杠杆下会亏多少。"},
+    {"id": "RISK_CORR", "room": "risk", "name": "相关性与平台", "stance": "你看 7 个合约是不是其实是一个赌注，以及 Hyperliquid/trade.xyz 本身的风险：预言机、规则变更、清算、合规。"},
+    # —— 赛马岗：算法（3 个，方案交给代码样本外回测）
+    {"id": "QUANT_STAT", "room": "algo", "name": "统计套利算法师", "stance": "你擅长从价格偏离、均值回归、条件分组里找规律（哪些合约、多大的偏离、什么方向最该做）。只找小资金真能做的空隙。"},
+    {"id": "QUANT_VOL", "room": "algo", "name": "波动率算法师", "stance": "你擅长隐含波动和实际波动的差：什么时候卖波动、什么时候买、按隐含波动高低分档、到期日效应。清楚卖波动平时赚小钱、极端行情亏大钱。"},
+    {"id": "QUANT_ML", "room": "algo", "name": "机器学习算法师", "stance": "你像做机器学习一样思考：先想清楚过拟合风险，只用少数稳健的条件，宁要考试段稳定的小优势，也不要训练段漂亮的大优势。"},
+    # —— 把关岗：审计（1 个，核对主要靠代码）
+    {"id": "AUDITOR", "room": "audit", "name": "审计员", "stance": "你解读代码核对结果：时间、引用、数字出处、规则指纹、实盘锁，指出哪些结论因此要打折。"},
+    # —— 总结
+    {"id": "CHAIR", "room": "chair", "name": "主席", "stance": "你听完所有讨论室，给出今天的总结：一句话结论、今天/本周要注意什么、各室分歧在哪。赛马岗以冠军意见为准，除非被资料否定。"},
     {"id": "EDITOR", "room": "editor", "name": "白话编辑", "stance": "你把主席的结论改写成普通人一眼能看懂的三行手机推送，不用术语。"},
 ]
 BY_ID = {a["id"]: a for a in AGENTS}
@@ -93,7 +86,10 @@ COMMON_RULES = """规则：
 MEMBER_SCHEMA = """输出 JSON：
 {"stance": "一句话立场", "plain": "大白话（≤70字）", "points": [{"claim": "论点", "cite": ["F1"]}], "confidence": 0-100 的整数%s}"""
 
-TRADING_EXTRA = """, "proposal": [{"name": "合约名", "lean": "fade|follow|skip", "size": 0到1, "why": "一句话"}]"""
+TRADING_EXTRA = """, "proposal": [{"name": "合约名（7 个都要给）", "lean": "fade|follow|skip", "size": 0到1, "why": "一句话"}], "playbook": "一句话总结你的打法"
+（你的提案会在开盘后按模拟盈亏自动打分：赚了加分、亏了扣分。skip 不赚不亏。）"""
+OPTIONS_EXTRA = """, "forecast_ratio": 你对"下一个期权对照样本"实际波动÷隐含波动的预测（一个数字，如 0.85）, "playbook": "一句话总结你的打法"
+（答案约 2 天后出来，比"历史平均"猜得准就加分，更差就扣分。）"""
 RISK_EXTRA = """, "veto": [{"name": "合约名", "why": "一句话"}]"""
 
 SYNTH_SCHEMA = """输出 JSON：
@@ -314,6 +310,9 @@ def build_bundle(settings, now: datetime | None = None) -> Facts:
                     f"{k} {len(v)} 次平均 {sum(v) / len(v):.2f}" for k, v in kinds.items()))
             if ct:
                 F.add("期权历史", f"历史普通日 {len(ct)} 天 实际/隐含 平均 {sum(c['ratio'] for c in ct) / len(ct):.2f}（小于 1 说明期权平时偏贵）")
+        tgt = options.daily_sample((now + timedelta(days=1)).date(), settings)
+        F.add("期权预测题", f"期权岗要预测的下一个对照样本是 {tgt.sid}：{tgt.lock.astimezone(PT):%m-%d %H:%M} PT 锁定、"
+                         f"24 小时后出答案，答案是这 24 小时比特币实际波动 ÷ 锁定时期权的隐含波动。")
         up = [e for e in options.event_samples(settings) if e.event_at > now][:4]
         if up:
             F.add("事件日历", "接下来的宏观事件：" + "，".join(f"{e.event_type} {e.event_at.astimezone(PT):%m-%d %H:%M} PT" for e in up))
@@ -434,6 +433,24 @@ class Meeting:
         self.failed = 0
         self.last_error = ""
         self.lock = threading.Lock()
+        from . import arena
+        self.roster = arena.roster(settings, AGENTS)
+        self.by_id = {a["id"]: a for a in self.roster}
+        self.S = arena.standings(settings, AGENTS)
+
+    def model_for(self, a: dict) -> str:
+        """冠军升一级模型（奖励）；其他人用本岗基础模型。"""
+        if a["room"] == "algo":
+            return self.c["algo_model"] if self.S["table"].get(a["id"], {}).get("champion") else self.c["lead_model"]
+        if a["room"] == "audit":
+            return self.c["lead_model"]
+        if self.S["table"].get(a["id"], {}).get("champion"):
+            return self.c["lead_model"]
+        return self.c["member_model"]
+
+    def members(self, room: str) -> list[dict]:
+        return [a for a in self.roster if a["room"] == room]
+        self.lock = threading.Lock()
 
     def call(self, agent_id: str, model: str, system: str, user: str) -> dict:
         sp = spend(self.s)
@@ -461,29 +478,30 @@ class Meeting:
         room = ROOM_BY_KEY.get(a["room"], {"name": a["name"], "goal": ""})
         return (f"你是 Weekend Desk 研究团队「{room['name']}」的成员「{a['name']}」（ID {a['id']}）。\n"
                 f"本室任务：{room['goal']}\n你的立场：{a['stance']}\n"
-                "背景：这是一个只做模拟的研究项目——周末 Hyperliquid 上 7 个合约（美股指数、个股、油、韩股）休市期间链上价格会偏离，"
+                + (arena_feedback(self.s, a["id"], self.S) + "\n")
+                + "背景：这是一个只做模拟的研究项目——周末 Hyperliquid 上 7 个合约（美股指数、个股、油、韩股）休市期间链上价格会偏离，"
                 "周日/周一开盘时再和外部价格对齐；我们预测开盘价，并研究 BTC 期权在宏观事件前后的定价。实盘锁着，不下真单。\n"
                 + COMMON_RULES)
 
     def schema_for(self, room: str) -> str:
-        return MEMBER_SCHEMA % (TRADING_EXTRA if room == "trading" else RISK_EXTRA if room == "risk" else "")
+        return MEMBER_SCHEMA % (TRADING_EXTRA if room == "trading" else RISK_EXTRA if room == "risk"
+                                else OPTIONS_EXTRA if room == "options" else "")
 
     def room(self, room: str, facts: Facts, context: str = "", pool=None) -> dict:
-        members = [a for a in AGENTS if a["room"] == room]
-        model = self.c["lead_model"] if room == "audit" else self.c["member_model"]
+        members = self.members(room)
         base = f"资料包：\n{facts.render()}\n" + (f"\n其他讨论室的结论：\n{context}\n" if context else "")
         rounds = []
         r1_user = base + "\n第一轮：独立给出你的看法。\n" + self.schema_for(room)
-        r1 = list(pool.map(lambda a: {"agent": a["id"], "out": self.call(a["id"], model, self.system_for(a), r1_user)}, members))
+        r1 = list(pool.map(lambda a: {"agent": a["id"], "out": self.call(a["id"], self.model_for(a), self.system_for(a), r1_user)}, members))
         rounds.append(r1)
         prev = r1
         for k in range(2, self.c["rounds"] + 1):
-            others = "\n".join(f"{o['agent']}（{BY_ID[o['agent']]['name']}）：{json.dumps(_strip(o['out']), ensure_ascii=False)}" for o in prev)
+            others = "\n".join(f"{o['agent']}（{self.by_id.get(o['agent'], {'name': o['agent']})['name']}）：{json.dumps(_strip(o['out']), ensure_ascii=False)}" for o in prev)
 
             def r2(a, others=others):
                 u = (base + f"\n第{k}轮：下面是本室各成员上一轮的发言。指出你不同意的地方（点名），或者被说服就改。"
                      f"加一个字段 \"rebut\": \"你回应谁、说什么\"，\"changed\": true/false。\n{others}\n" + self.schema_for(room))
-                return {"agent": a["id"], "out": self.call(a["id"], model, self.system_for(a), u)}
+                return {"agent": a["id"], "out": self.call(a["id"], self.model_for(a), self.system_for(a), u)}
             prev = list(pool.map(r2, members))
             rounds.append(prev)
         # 本室结论：由主席模型整理
@@ -491,8 +509,11 @@ class Meeting:
                  else ', "veto": [{"name": "合约名", "why": "一句话"}]' if room == "risk" else "")
         transcript = "\n".join(f"第{i + 1}轮 {o['agent']}：{json.dumps(_strip(o['out']), ensure_ascii=False)}"
                                for i, rr in enumerate(rounds) for o in rr)
+        champ = self.S["champions"].get(room)
         sys = (f"你是「{ROOM_BY_KEY[room]['name']}」的记录员，把本室讨论整理成结论。保留真实分歧，不要和稀泥；"
-               "结论必须能被资料编号支持。\n" + COMMON_RULES)
+               "结论必须能被资料编号支持。"
+               + (f"本岗是赛马岗，现任冠军是 {champ}（{self.by_id.get(champ, {}).get('name', '')}）：意见冲突时以冠军为准，除非被资料否定。" if champ else "")
+               + "\n" + COMMON_RULES)
         synth = self.call(f"{room}-SYNTH", self.c["lead_model"], sys,
                           base + f"\n本室讨论记录：\n{transcript}\n\n" + (SYNTH_SCHEMA % extra))
         return {"room": room, "rounds": rounds, "synth": synth}
@@ -500,7 +521,8 @@ class Meeting:
 
     ALGO_SCHEMA = """输出 JSON：
 {"stance": "一句话思路", "plain": "大白话（≤70字）", "points": [{"claim": "理由", "cite": ["F1"]}], "confidence": 0-100,
- "specs": [方案, 最多 %d 个]}
+ "specs": [方案, 最多 %d 个], "playbook": "一句话总结你的打法"}
+（三位算法师赛马：代码按考试段赢现行规则多少给你加减分，过了多次尝试门槛 +5，交白卷或格式错 −1。）
 方案只能是下面两种格式之一（字段名和取值必须照抄）：
 周末：{"kind": "weekend", "name": "简短名字", "instruments": ["NVDA","INTC"] 或 "all", "direction": "fade" 或 "follow",
        "min_abs_dev_bps": 数字, "max_abs_dev_bps": 数字, "size": "flat" 或 "proportional"}
@@ -509,9 +531,7 @@ class Meeting:
 
     def algo_room(self, facts: Facts, pool=None) -> dict:
         from . import algolab
-        quants = [BY_ID["QUANT_STAT"], BY_ID["QUANT_VOL"]]
-        judge = BY_ID["OVERFIT"]
-        model = self.c["algo_model"]
+        quants = self.members("algo")
         base = f"资料包：\n{facts.render()}\n\n{algolab.data_summary(self.s)}\n"
         bt_lines: list[str] = []
 
@@ -526,15 +546,12 @@ class Meeting:
             return o
 
         u1 = base + "\n第一轮：提出你认为能赢现行规则的方案（最多 3 个），说清楚为什么这个规律存在、为什么别人没把它抹平。\n" + (self.ALGO_SCHEMA % 3)
-        r1 = list(pool.map(lambda a: test({"agent": a["id"], "out": self.call(a["id"], model, self.system_for(a), u1)}), quants))
+        r1 = list(pool.map(lambda a: test({"agent": a["id"], "out": self.call(a["id"], self.model_for(a), self.system_for(a), u1)}), quants))
         res1 = "\n".join(bt_lines)
         u2q = (base + f"\n第一轮代码回测结果（考试段是样本外）：\n{res1}\n\n第二轮：根据考试段结果改进或放弃。最多 2 个新方案；"
                "如果都不行就老实说不行、specs 留空。加 \"rebut\" 字段回应过拟合风险。\n" + (self.ALGO_SCHEMA % 2))
-        u2j = (base + f"\n算法师第一轮发言：\n" + "\n".join(f"{o['agent']}：{json.dumps(_strip(o['out']), ensure_ascii=False)}" for o in r1)
-               + f"\n\n代码回测结果：\n{res1}\n\n判断每个方案是不是过拟合、值不值得继续。\n" + self.schema_for("algo"))
         n_before = len(bt_lines)
-        r2 = list(pool.map(lambda a: test({"agent": a["id"], "out": self.call(a["id"], model, self.system_for(a), u2q)}), quants))
-        r2.append({"agent": judge["id"], "out": self.call(judge["id"], self.c["lead_model"], self.system_for(judge), u2j)})
+        r2 = list(pool.map(lambda a: test({"agent": a["id"], "out": self.call(a["id"], self.model_for(a), self.system_for(a), u2q)}), quants))
         res2 = "\n".join(bt_lines[n_before:])
         transcript = "\n".join(f"第{i + 1}轮 {o['agent']}：{json.dumps(_strip({k: v for k, v in o['out'].items() if k != 'backtest'}), ensure_ascii=False)}"
                                for i, rr in enumerate([r1, r2]) for o in rr)
@@ -544,6 +561,11 @@ class Meeting:
                           base + f"\n全部回测结果：\n{res1}\n{res2}\n\n讨论记录：\n{transcript}\n\n"
                           + (SYNTH_SCHEMA % ', "best": "最好的方案名或 无", "beats_rule": true/false'))
         return {"room": "algo", "rounds": [r1, r2], "synth": synth, "backtests": bt_lines}
+
+
+def arena_feedback(settings, aid, S) -> str:
+    from . import arena
+    return arena.feedback_line(settings, aid, S)
 
 
 def _strip(o: dict) -> dict:
@@ -594,7 +616,12 @@ def _run(settings, reason, llm, now, push) -> dict:
     rid = _run_id(now)
     c = cfg(settings)
     rules0 = rules_hash(settings.root)
-    set_state(settings, running=True, stage="整理资料包", run=rid)
+    set_state(settings, running=True, stage="结算上次的预测、整理资料包", run=rid)
+    from . import arena
+    try:
+        arena.settle(settings)
+    except Exception as e:  # noqa: BLE001
+        log.warning("arena settle: %s", e)
     facts = build_bundle(settings, now)
     rec = {"run_id": rid, "reason": reason, "started": now.isoformat(), "facts": facts.items,
            "roster": AGENTS, "rooms_meta": ROOMS, "rooms": {}, "mode": "full"}
@@ -612,6 +639,10 @@ def _run(settings, reason, llm, now, push) -> dict:
     if rec["mode"] == "full":
         m = Meeting(settings, llm or AnthropicLLM(), rid, reason)
         try:
+            rec["review"] = arena.weekly_review(settings, AGENTS, m.llm, c["lead_model"], now.timestamp())
+            if rec["review"]:
+                m = Meeting(settings, m.llm, rid, reason)        # 名单变了，重新载入
+            rec["roster"] = m.roster
             with ThreadPoolExecutor(max_workers=c["max_parallel"]) as pool:
                 set_state(settings, running=True, stage="期权 / 方法 / 选品种 / 交易 / 算法 五个室讨论中", run=rid)
                 first = ["options", "js", "niche", "trading", "algo"]
@@ -635,14 +666,14 @@ def _run(settings, reason, llm, now, push) -> dict:
                 rec["rooms"]["audit"] = m.room("audit", facts, ctx + f"\n\n代码核对结果：\n{chk}", pool=pool)
                 ctx += f"\n【审计室】{json.dumps(_strip(rec['rooms']['audit']['synth']), ensure_ascii=False)}"
             set_state(settings, running=True, stage="主席总结", run=rid)
-            chair = BY_ID["CHAIR"]
+            chair = m.by_id["CHAIR"]
             rec["chair"] = m.call("CHAIR", c["lead_model"],
                                   f"你是 Weekend Desk 研究团队的主席。{chair['stance']}\n" + COMMON_RULES,
                                   f"资料包：\n{facts.render()}\n\n各室结论：\n{ctx}\n\n输出 JSON："
                                   '{"headline": "一句话结论（≤40字）", "plain": "大白话总结（≤150字）", "today": ["今天/本周要注意的事"], '
                                   '"disagree": ["各室之间主要分歧"], "confidence": 0-100}')
             rec["editor"] = m.call("EDITOR", c["member_model"],
-                                   f"你是白话编辑。{BY_ID['EDITOR']['stance']}\n" + COMMON_RULES,
+                                   f"你是白话编辑。{m.by_id['EDITOR']['stance']}\n" + COMMON_RULES,
                                    f"主席结论：{json.dumps(_strip(rec['chair']), ensure_ascii=False)}\n"
                                    '输出 JSON：{"push": "三行，每行不超过 30 字，用换行分隔", "plain": "同 push"}')
         except Budget as e:
@@ -659,6 +690,17 @@ def _run(settings, reason, llm, now, push) -> dict:
     if "checks" not in rec:
         outputs = [o for r in rec["rooms"].values() for rr in r["rounds"] for o in rr]
         rec["checks"] = audit_checks(settings, facts, outputs, started_ns, rules0)
+    if rec["mode"] in ("full", "partial") and m is not None:
+        # 及时奖惩：会一结束就结算纪律分和算法分，并登记可对答案的预测
+        try:
+            arena.score_meeting(settings, rec, rec["checks"])
+            arena.score_algo(settings, rec)
+            paused = {k for k, v in m.S["table"].items() if v["paused"]}
+            arena.record_predictions(settings, rec, now, m.S["champions"], paused)
+            arena.save_playbooks(settings, rec)
+        except Exception as e:  # noqa: BLE001
+            log.warning("arena scoring: %s", e)
+    rec["standings"] = arena.standings(settings, AGENTS)
     rec["finished"] = datetime.now(UTC).isoformat()
     rec["spend"] = spend(settings)
     path = _dir(settings) / "runs" / f"{rid}.json"

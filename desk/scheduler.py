@@ -138,6 +138,12 @@ async def job_loop(settings):
             notify.push(settings, f"已锁定 {len(locks)} 个合约的预测", report.locks_summary(locks), priority="high")
         if outs:
             notify.push(settings, f"{len(outs)} 个合约开盘结果", report.outcomes_summary(settings, outs))
+        if todo:
+            try:  # 及时奖惩：开盘结果/期权结果一出来就给赛马 agent 结算
+                from . import arena
+                arena.settle(settings)
+            except Exception as e:  # noqa: BLE001
+                log.warning("arena settle: %s", e)
         await asyncio.sleep(20)
 
 
