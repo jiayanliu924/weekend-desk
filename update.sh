@@ -7,6 +7,13 @@ curl -fsSL https://github.com/jiayanliu924/weekend-desk/archive/refs/heads/main.
 cp -r weekend-desk-main/desk /opt/weekend-desk/
 cp weekend-desk-main/requirements.txt /opt/weekend-desk/
 cp weekend-desk-main/setup_web.sh /opt/weekend-desk/
+# 配置跟代码一起更新（旧配置备份为 .bak；规则只能在周一复核时改，更新也尽量在周一到周四做）
+for f in config.toml events.toml; do
+  if ! cmp -s weekend-desk-main/$f /opt/weekend-desk/$f; then
+    cp /opt/weekend-desk/$f /opt/weekend-desk/$f.bak 2>/dev/null || true
+    cp weekend-desk-main/$f /opt/weekend-desk/$f
+  fi
+done
 rm -rf /opt/weekend-desk/tests && cp -r weekend-desk-main/tests /opt/weekend-desk/
 /opt/weekend-desk/venv/bin/pip install -q -r /opt/weekend-desk/requirements.txt
 cd /opt/weekend-desk && env -u NTFY_TOPIC -u ANTHROPIC_API_KEY ./venv/bin/python -m pytest -q tests
