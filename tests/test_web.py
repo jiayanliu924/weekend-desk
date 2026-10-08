@@ -50,7 +50,7 @@ def test_login_required_and_works(env):
     assert c.post("/login", data={"username": "kea", "password": "wrong-password"}).status_code == 401
     r = c.post("/login", data={"username": "kea", "password": "correct horse battery"}, follow_redirects=False)
     assert r.status_code == 303
-    for path, text in [("/", "累计成绩"), ("/day?d=2026-10-04", "它读了什么"), ("/weekends", "2026-10-02"),
+    for path, text in [("/", "本周末打算"), ("/day?d=2026-10-04", "它读了什么"), ("/weekends", "2026-10-02"),
                        ("/options", "期权研究"), ("/money?source=history&capital=10000&lev=5", "逐笔明细"),
                        ("/money?source=live", "分合约"), ("/history", "2026-09-11"), ("/guide", "怎么赚钱")]:
         resp = c.get(path)

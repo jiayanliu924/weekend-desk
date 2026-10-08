@@ -119,47 +119,80 @@ def _guard(req: Request):
 
 
 CSS = """
-:root{--bg:#f7f3ee;--card:#fffdf9;--ink:#24201c;--mut:#776e64;--line:#e4dbd0;--acc:#8c3a24;--good:#2f7a4a;--bad:#b23b2e;--chip:#efe6dc}
-@media (prefers-color-scheme:dark){:root:not([data-theme=light]){--bg:#171513;--card:#211e1b;--ink:#ece6df;--mut:#a39a90;--line:#36312c;--acc:#e08a6a;--good:#6cc08a;--bad:#ef7d6f;--chip:#2c2824}}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.6 -apple-system,"PingFang SC","Noto Sans SC",sans-serif}
-header{position:sticky;top:0;background:var(--bg);border-bottom:1px solid var(--line);z-index:5}
-.wrap{max-width:1100px;margin:0 auto;padding:0 16px}
-.top{display:flex;align-items:center;gap:16px;padding:12px 0;flex-wrap:wrap}
-.brand{font-weight:700;color:var(--acc);font-size:17px}
-nav{display:flex;gap:4px;flex-wrap:wrap}nav a{padding:6px 10px;border-radius:8px;color:var(--ink);text-decoration:none;font-size:14px}
-nav a.on{background:var(--chip);color:var(--acc);font-weight:600}
+:root{--bg:#f4f6f9;--card:#ffffff;--ink:#14213d;--mut:#64708a;--line:#e2e7ef;--acc:#0e7c7b;--acc2:#e6f3f3;--good:#16834d;--bad:#c93c3c;--chip:#eef1f6;--warn:#b7791f}
+@media (prefers-color-scheme:dark){:root:not([data-theme=light]){--bg:#0e1424;--card:#151d31;--ink:#e6ebf5;--mut:#93a0ba;--line:#26314b;--acc:#3cc3bf;--acc2:#16313a;--good:#4cc38a;--bad:#f07b7b;--chip:#1c2640;--warn:#e3b04b}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.65 -apple-system,BlinkMacSystemFont,"PingFang SC","Noto Sans SC","Microsoft YaHei",sans-serif;font-variant-numeric:tabular-nums;-webkit-font-smoothing:antialiased}
+a{color:var(--acc)}
+header{position:sticky;top:0;background:color-mix(in srgb,var(--bg) 88%,transparent);backdrop-filter:blur(10px);border-bottom:1px solid var(--line);z-index:5}
+.wrap{max-width:1080px;margin:0 auto;padding:0 16px}
+.top{display:flex;align-items:center;gap:18px;flex-wrap:wrap;min-height:56px}
+.brand{font-weight:700;font-size:16px;letter-spacing:.2px;color:var(--ink);display:flex;align-items:center;gap:8px}
+.brand i{width:10px;height:10px;border-radius:50%;background:var(--acc);display:inline-block}
+nav{display:flex;gap:2px;flex-wrap:wrap;overflow-x:auto}
+nav a{padding:17px 10px 15px;color:var(--mut);text-decoration:none;font-size:14px;border-bottom:2px solid transparent;white-space:nowrap}
+nav a:hover{color:var(--ink)}
+nav a.on{color:var(--ink);border-bottom-color:var(--acc);font-weight:600}
 .who{margin-left:auto;color:var(--mut);font-size:13px}.who a{color:var(--mut)}
-h1{font-size:22px;margin:22px 0 4px}h2{font-size:17px;margin:26px 0 8px}
-.sub{color:var(--mut);font-size:13.5px;margin:0 0 14px}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px}
-.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px 16px}
-.k{color:var(--mut);font-size:12.5px}.v{font-size:22px;font-weight:650;margin-top:2px}.v.s{font-size:16px}
+main{padding-bottom:20px}
+h1{font-size:26px;line-height:1.3;margin:28px 0 6px;font-weight:700;letter-spacing:-.2px}
+h2{font-size:17px;margin:34px 0 12px;font-weight:650}
+h3{font-size:15px}
+.sub{color:var(--mut);font-size:14px;margin:0 0 16px;max-width:72ch}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:14px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px 18px}
+.k{color:var(--mut);font-size:13px}.v{font-size:24px;font-weight:700;margin-top:2px;letter-spacing:-.3px}.v.s{font-size:17px;font-weight:650;letter-spacing:0}
 .good{color:var(--good)}.bad{color:var(--bad)}.mut{color:var(--mut)}
-table{width:100%;border-collapse:collapse;font-size:13.5px;background:var(--card);border:1px solid var(--line);border-radius:12px;overflow:hidden}
-th,td{padding:7px 10px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}th{background:var(--chip);font-weight:600;font-size:12.5px}
-.tw{overflow-x:auto}
-.tag{display:inline-block;padding:1px 7px;border-radius:99px;background:var(--chip);font-size:12px;margin-right:4px}
-.note{background:var(--chip);border-radius:10px;padding:10px 14px;font-size:13.5px;margin:10px 0}
+table{width:100%;border-collapse:separate;border-spacing:0;font-size:14px;background:var(--card);border:1px solid var(--line);border-radius:12px;overflow:hidden}
+th,td{padding:10px 12px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}
+tr:last-child td{border-bottom:0}
+th{background:var(--chip);font-weight:600;font-size:13px;color:var(--mut)}
+td.n,th.n{text-align:right}
+.tw{overflow-x:auto;border-radius:12px}
+.tag{display:inline-block;padding:2px 9px;border-radius:99px;background:var(--chip);font-size:12.5px;margin:0 4px 4px 0;color:var(--ink)}
+.note{background:var(--acc2);border-radius:10px;padding:12px 16px;font-size:14px;margin:12px 0;border-left:3px solid var(--acc)}
 form.inline{display:flex;gap:10px;flex-wrap:wrap;align-items:end}
-label{font-size:12.5px;color:var(--mut);display:flex;flex-direction:column;gap:3px}
-input,select{font:inherit;padding:7px 9px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--ink)}
-button,.btn{font:inherit;padding:8px 14px;border-radius:8px;border:0;background:var(--acc);color:#fff;cursor:pointer;text-decoration:none;display:inline-block}
-.btn.ghost{background:var(--chip);color:var(--ink)}
+label{font-size:13px;color:var(--mut);display:flex;flex-direction:column;gap:4px}
+input,select{font:inherit;padding:8px 10px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--ink)}
+input:focus,select:focus,button:focus-visible,a:focus-visible{outline:2px solid var(--acc);outline-offset:2px}
+button,.btn{font:inherit;font-weight:600;padding:9px 16px;border-radius:9px;border:0;background:var(--acc);color:#fff;cursor:pointer;text-decoration:none;display:inline-block}
+button:disabled{opacity:.5;cursor:default}
+.btn.ghost,button.ghost{background:var(--chip);color:var(--ink)}
 .daynav{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
-ul.news{list-style:none;padding:0;margin:0}ul.news li{padding:8px 0;border-bottom:1px solid var(--line)}
-.ev{font-size:12.5px;color:var(--mut);margin-top:2px}
+ul.news{list-style:none;padding:0;margin:0}ul.news li{padding:10px 0;border-bottom:1px solid var(--line)}
+.ev{font-size:13px;color:var(--mut);margin-top:2px}
 canvas{max-width:100%}
-.login{max-width:360px;margin:12vh auto;padding:0 16px}
-.big{font-size:18px;font-weight:650;line-height:1.5;margin:6px 0}
-.bar{height:6px;background:var(--chip);border-radius:9px;overflow:hidden;margin:4px 0 8px}.bar i{display:block;height:100%;background:var(--acc)}
-.room{margin:14px 0}.room h2{margin:0 0 2px}
-details{margin-top:10px}summary{cursor:pointer;color:var(--acc);font-size:14px}
-.say{border-left:3px solid var(--line);padding:6px 0 6px 12px;margin:10px 0}
-.say .who{margin:0;font-weight:600;font-size:13.5px;color:var(--ink)}
-.cite{font-size:11.5px;text-decoration:none;color:var(--acc);margin-left:3px}
-.ok{color:var(--good)}.no{color:var(--bad)}
-.roster{display:flex;flex-wrap:wrap;gap:6px;margin:6px 0}
-.fact{font-size:13px;padding:5px 0;border-bottom:1px solid var(--line)}.fact:target{background:var(--chip)}
+.login{max-width:380px;margin:12vh auto;padding:0 16px}
+/* overview */
+.hero{display:grid;grid-template-columns:1.1fr 1fr;gap:18px;align-items:stretch;margin-top:22px}
+@media (max-width:820px){.hero{grid-template-columns:1fr}}
+.countdown .big{font-size:40px;font-weight:750;letter-spacing:-1px;line-height:1.1;margin:6px 0 4px}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px;vertical-align:1px;background:var(--good)}
+.dot.off{background:var(--bad)}
+.tl{position:relative;margin:26px 4px 6px;height:64px}
+.tl .bar{position:absolute;left:0;right:0;top:22px;height:6px;border-radius:6px;background:var(--chip)}
+.tl .seg{position:absolute;top:22px;height:6px;border-radius:6px;background:var(--acc);opacity:.35}
+.tl .m{position:absolute;top:14px;transform:translateX(-50%);text-align:center;font-size:11.5px;color:var(--mut);white-space:nowrap}
+.tl .m b{display:block;width:2px;height:22px;background:var(--ink);margin:0 auto 4px;opacity:.55}
+.tl .now{position:absolute;top:6px;transform:translateX(-50%);font-size:11.5px;color:var(--acc);font-weight:700}
+.tl .now b{display:block;width:12px;height:12px;border-radius:50%;background:var(--acc);margin:0 auto 2px;box-shadow:0 0 0 4px var(--acc2)}
+.steps{list-style:none;padding:0;margin:22px 0 12px;display:grid;grid-template-columns:repeat(4,1fr);gap:10px;counter-reset:s}
+.steps li{position:relative;padding-top:34px}
+.steps li::before{content:"";position:absolute;top:13px;left:26px;right:-10px;height:2px;background:var(--line)}
+.steps li:last-child::before{display:none}
+.steps .n{position:absolute;top:0;left:0;width:26px;height:26px;border-radius:50%;background:var(--chip);color:var(--mut);font-size:13px;font-weight:700;display:flex;align-items:center;justify-content:center}
+.steps b{display:block;font-size:14px}.steps .t{display:block;font-size:12.5px;color:var(--ink);opacity:.8}.steps .d{display:block;font-size:12px;color:var(--mut);line-height:1.5;margin-top:2px}
+.steps li.done .n{background:var(--acc2);color:var(--acc)}.steps li.done::before{background:var(--acc);opacity:.4}
+.steps li.on .n{background:var(--acc);color:#fff;box-shadow:0 0 0 4px var(--acc2)}
+@media (max-width:600px){.steps{grid-template-columns:1fr 1fr;row-gap:18px}.steps li:nth-child(2)::before{display:none}}
+@media (max-width:720px){.top{gap:0 12px;min-height:0;padding-top:8px}.brand{order:1}.who{order:2}nav{order:3;width:100%;flex-wrap:nowrap;margin:0 -16px;padding:0 6px}nav a{padding:10px 10px 9px}}
+.strip{display:grid;grid-template-columns:repeat(3,1fr);background:var(--card);border:1px solid var(--line);border-radius:12px}
+.strip>div{padding:16px 18px;border-right:1px solid var(--line)}.strip>div:last-child{border-right:0}
+@media (max-width:720px){.strip{grid-template-columns:1fr}.strip>div{border-right:0;border-bottom:1px solid var(--line)}}
+.plan td:first-child{font-weight:600}
+.lean-fade{color:var(--acc);font-weight:600}.lean-skip{color:var(--mut)}.lean-follow{color:var(--warn);font-weight:600}
+.actions{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+@media (prefers-reduced-motion:reduce){*{transition:none!important}}
 """
 
 TABS = [("/", "概览"), ("/agents", "Agent 讨论室"), ("/day", "每日记录"), ("/weekends", "周末预测"), ("/options", "期权研究"),
@@ -170,7 +203,7 @@ def page(req: Request, active: str, title: str, body: str, head: str = "") -> HT
     nav = "".join(f'<a href="{h}" class="{"on" if h == active else ""}">{t}</a>' for h, t in TABS)
     return HTMLResponse(f"""<!doctype html><html lang="zh"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>{E(title)} · Weekend Desk</title>
-<style>{CSS}</style>{head}</head><body><header><div class="wrap top"><span class="brand">Weekend Desk</span><nav>{nav}</nav>
+<style>{CSS}</style>{head}</head><body><header><div class="wrap top"><span class="brand"><i></i>Weekend Desk</span><nav>{nav}</nav>
 <span class="who">{E(_user(req) or '')} · <a href="/logout">退出</a></span></div></header>
 <main class="wrap">{body}<p class="sub" style="margin:30px 0">所有盈亏均为模拟或回测，未下真单，不构成投资建议。</p></main></body></html>""")
 
@@ -332,36 +365,118 @@ def overview(req: Request):
     bc = evaluate.scorecard_by_coin(recs, S)
     hist_by = sim.run(S, 2000, 2, "maker", "history")["by_name"]
     inst_rows = "".join(
-        f"<tr><td><b>{E(i['name'])}</b></td><td>{_n(st['all'].get(i['coin'], {}).get('oracle'), 2)}</td>"
+        f"<tr><td><b>{E(i['name'])}</b></td><td class='n'>{_n(st['all'].get(i['coin'], {}).get('oracle'), 2)}</td>"
         f"<td>{x.decision.astimezone(PT):%a %H:%M}</td>"
-        f"<td>{bc.get(i['name'], {}).get('n_official', 0)}</td>"
-        f"<td class='{_cls(bc.get(i['name'], {}).get('pnl_net_usd_total'))}'>{_n(bc.get(i['name'], {}).get('pnl_net_usd_total'), 2, sign=True)}</td>"
-        f"<td class='{_cls(hist_by.get(i['name'], {}).get('pnl'))}'>{_n(hist_by.get(i['name'], {}).get('pnl'), 2, sign=True)}</td></tr>"
+        f"<td class='n'>{bc.get(i['name'], {}).get('n_official', 0)}</td>"
+        f"<td class='n {_cls(bc.get(i['name'], {}).get('pnl_net_usd_total'))}'>{_n(bc.get(i['name'], {}).get('pnl_net_usd_total'), 2, sign=True)}</td>"
+        f"<td class='n {_cls(hist_by.get(i['name'], {}).get('pnl'))}'>{_n(hist_by.get(i['name'], {}).get('pnl'), 2, sign=True)}</td></tr>"
         for i, x in zip(S.instruments, ws))
     oc = options.scorecard(S)
     hist = sim.run(S, 2000, 2, "maker", "history")
     live = sim.run(S, 2000, 2, "maker", "live")
     xyz = st["xyz"]
     fresh = xyz and (time.time_ns() - xyz["at"]) < 300e9
-    body = f"""<h1>概览</h1><p class="sub">现在是加州时间 {datetime.now(PT):%m-%d %H:%M}。程序 24 小时在服务器上跑；你不用做任何操作，看这里和手机推送就行。</p>
-<div class="grid">
-<div class="card"><div class="k">系统状态</div><div class="v s {'good' if fresh else 'bad'}">{'正常采集中' if fresh else '数据可能中断'}</div>
-<div class="k">{len(st['all'])}/{len(S.instruments)} 个合约在收数据 · 最新 {_pt(xyz and xyz['at'])}</div></div>
-<div class="card"><div class="k">今天读了多少新闻</div><div class="v">{st['news_today']}</div><div class="k">{'大模型抽取：已开启' if st['llm_key'] else '<a class=bad href=/settings>大模型抽取：未填 API Key（点这里填）</a>'}</div></div>
-<div class="card"><div class="k">下一次周末预测锁定</div><div class="v s">{w.decision.astimezone(PT):%m-%d（%a）%H:%M}</div><div class="k">加州时间，7 个合约分 2 批锁定</div></div>
-<div class="card"><div class="k">下一个期权研究事件</div><div class="v s">{E(nxt[0].event_type) + ' ' + nxt[0].event_at.astimezone(PT).strftime('%m-%d %H:%M') if nxt else '—'}</div><div class="k">{' · '.join(e.event_type + ' ' + e.event_at.astimezone(PT).strftime('%m-%d') for e in nxt[1:])}</div></div>
+    now = datetime.now(UTC)
+    # —— 下一个关键时刻（倒计时）
+    groups = {}
+    for i, x in zip(S.instruments, ws):
+        groups.setdefault((x.close, x.decision, x.resume), []).append(i["name"])
+    moments = []
+    for (c, d, rz), names in groups.items():
+        lab = "、".join(names) if len(names) <= 3 else f"{len(names)} 个合约"
+        moments += [(c, f"{lab} 真市场收盘"), (d, f"锁定 {lab} 的预测"), (rz, f"{lab} 开盘、对答案")]
+    moments.sort()
+    nxt_m = next(((t, l) for t, l in moments if t > now), None)
+    if nxt_m:
+        left = nxt_m[0] - now
+        hrs = left.total_seconds() / 3600
+        cd = f"{int(hrs // 24)} 天 {int(hrs % 24)} 小时" if hrs >= 24 else f"{int(hrs)} 小时 {int(left.total_seconds() % 3600 // 60)} 分"
+        cd_label = f"距离 {nxt_m[1]}（{nxt_m[0].astimezone(PT):%a %H:%M}）"
+    else:
+        cd, cd_label = "—", ""
+    # —— 周末流程（按先后顺序的四步，标出现在走到哪一步）
+    non_kr = [x for x in ws if x.name != "SMSN"] or ws
+    c_us = min(x.close for x in non_kr)
+    d1, d2 = min(x.decision for x in ws), max(x.decision for x in ws)
+    r1, r2 = min(x.resume for x in ws), max(x.resume for x in ws)
+    steps = [("周五收盘", f"{c_us.astimezone(PT):%a %H:%M}", "真市场关门，链上照常交易", c_us),
+             ("周末", "周五晚到周日", "链上价格没人管，容易被推偏；程序一直在读价格和新闻", c_us + timedelta(minutes=1)),
+             ("锁定预测", f"{d1.astimezone(PT):%a %H:%M} / {d2.astimezone(PT):%H:%M}", "开盘前 15 分钟写下预测，之后不许改", d1),
+             ("开盘对答案", f"{r1.astimezone(PT):%a %H:%M} / {r2.astimezone(PT):%H:%M}", "价格被拉回真实水平，电脑算盈亏、推送到手机", r1)]
+    cur = max([i for i, st_ in enumerate(steps) if now >= st_[3]] or [-1])
+    if now > r2 + timedelta(hours=1):
+        cur = -1
+    step_html = "".join(
+        f'<li class="{"done" if i < cur else "on" if i == cur else ""}"><span class="n">{i + 1}</span>'
+        f'<b>{t}</b><span class="t">{tm}</span><span class="d">{d}</span></li>'
+        for i, (t, tm, d, _) in enumerate(steps))
+    # —— 最近一次 agent 会议给的本周末打算
+    try:
+        lr = agents.last_full_run(S, within_h=72)
+    except Exception:  # noqa: BLE001
+        lr = None
+    plan_rows, plan_head = "", ""
+    if lr:
+        props = [p for p in (lr.get("rooms", {}).get("trading", {}).get("synth", {}).get("proposal") or []) if isinstance(p, dict)]
+        lean_txt = {"fade": ("押它弹回来", "lean-fade"), "follow": ("顺着走", "lean-follow"), "skip": ("不做", "lean-skip")}
+        for p in props:
+            lt, cls = lean_txt.get(str(p.get("lean")), (str(p.get("lean")), ""))
+            try:
+                sz = float(p.get("size") or 0)
+            except (TypeError, ValueError):
+                sz = 0
+            plan_rows += (f'<tr><td>{E(str(p.get("name")))}</td><td class="{cls}">{lt}</td>'
+                          f'<td class="n">{"—" if not sz else f"{sz * 100:.0f}%"}</td><td class="ev">{E(pdfreport._plain(p.get("why", "")))}</td></tr>')
+        ch = lr.get("chair") or {}
+        plan_head = (f'<p class="sub" style="margin-bottom:10px">{E(str(ch.get("headline", "")))} '
+                     f'<a href="/agents">看完整讨论</a></p>')
+    plan = (f'<div class="tw"><table class="plan"><tr><th>合约</th><th>打算</th><th class="n">仓位</th><th>理由</th></tr>{plan_rows}</table></div>'
+            if plan_rows else '<p class="note">还没有本周末的打算。Agent 团队每天 6:30 开会，周日锁定前 2 小时再开一次。</p>')
+    pushed = req.query_params.get("msg", "")
+    body = f"""
+<section class="hero">
+  <div class="card countdown">
+    <div class="k"><span class="dot {'' if fresh else 'off'}"></span>{'数据正常流入' if fresh else '数据可能中断'} · {len(st['all'])}/{len(S.instruments)} 个合约在线 · 今天读了 {st['news_today']} 条新闻</div>
+    <div class="big">{cd}</div>
+    <div class="mut">{E(cd_label)}</div>
+    <ol class="steps">{step_html}</ol>
+    <div class="ev">时间都是加州时间。三星（SMSN）跟韩国市场：周五凌晨收盘，首尔周一开盘时对答案。</div>
+  </div>
+  <div class="card">
+    <div class="k">下一个期权事件</div>
+    <div class="v s">{E(nxt[0].event_type + ' · ' + nxt[0].event_at.astimezone(PT).strftime('%m-%d %H:%M')) if nxt else '—'}</div>
+    <div class="ev">{' · '.join(E(e.event_type) + ' ' + e.event_at.astimezone(PT).strftime('%m-%d') for e in nxt[1:])}</div>
+    <div class="k" style="margin-top:14px">新闻自动读取</div>
+    <div class="v s {'good' if st['llm_key'] else 'bad'}">{'已开启' if st['llm_key'] else '未开启'}</div>
+    {'' if st['llm_key'] else '<div class="ev"><a href="/settings">去设置里填 API key</a></div>'}
+    <div class="k" style="margin-top:14px">真钱</div>
+    <div class="v s">锁着，只做模拟</div>
+    <div class="ev"><a href="/money">如果放真钱会怎样</a></div>
+  </div>
+</section>
+
+<h2>成绩</h2>
+<div class="strip">
+  <div><div class="k">实时模拟盈亏（$2,000 本金，2 倍）</div><div class="v {_cls(live['total_usd'])}">${_n(live['total_usd'], 2, sign=True)}</div>
+       <div class="ev">{live['n']} 个合约周末，出手 {live['n_traded']} 次</div></div>
+  <div><div class="k">预测准不准（误差越小越准）</div><div class="v s">模型 {_n(card.get('mean_err_model'))} · 猜周五价 {_n(card.get('mean_err_A'))} · 猜链上价 {_n(card.get('mean_err_B'))}</div>
+       <div class="ev">单位万分点；模型要同时赢另外两个才算有用。已有 {card.get('n_official', 0)} 个样本，满 30 个周末下结论</div></div>
+  <div><div class="k">历史回测（过去 {hist['n_weekends']} 个周末，同样本金）</div><div class="v {_cls(hist['total_usd'])}">${_n(hist['total_usd'], 2, sign=True)}</div>
+       <div class="ev">胜率 {_n(hist['win_rate'] and hist['win_rate']*100, 0, '%')} · 只供参考，会偏乐观</div></div>
 </div>
-<h2>累计成绩</h2><div class="grid">
-<div class="card"><div class="k">实时样本（合约×周末）</div><div class="v">{card.get('n_official', 0)}</div><div class="k">每个周末 7 个；30 个周末后下结论</div></div>
-<div class="card"><div class="k">预测误差 模型 / 猜周五价 / 猜链上价</div><div class="v s">{_n(card.get('mean_err_model'))} / {_n(card.get('mean_err_A'))} / {_n(card.get('mean_err_B'))} bps</div><div class="k">越小越准；模型要同时赢另外两个才算有用</div></div>
-<div class="card"><div class="k">实时模拟盈亏（$2,000 · 2 倍）</div><div class="v {_cls(live['total_usd'])}">${_n(live['total_usd'], 2, sign=True)}</div><div class="k">{live['n']} 个周末，出手 {live['n_traded']} 次</div></div>
-<div class="card"><div class="k">历史回测（过去 {hist['n_weekends']} 个周末 × {hist['n_instruments']} 个合约，同样本金）</div><div class="v {_cls(hist['total_usd'])}">${_n(hist['total_usd'], 2, sign=True)}</div><div class="k">胜率 {_n(hist['win_rate'] and hist['win_rate']*100, 0, '%')} · 仅供参考</div></div>
-</div>
-<div class="note">{E(card.get('verdict', '还没有完成的实时周末，第一个周末完成后这里会出现成绩。'))}<br>期权研究：{E(oc['verdict'])}</div>
-<h2>7 个合约</h2><div class="tw"><table><tr><th>合约</th><th>最新价</th><th>本周锁定（加州时间）</th><th>实时正式周末</th><th>实时模拟$</th><th>历史回测$（$2,000·2 倍，平均分）</th></tr>{inst_rows}</table></div>
-<h2>报告</h2><div style="display:flex;gap:10px;flex-wrap:wrap"><a class="btn" href="/report.pdf">下载 PDF 报告</a>
-<form method="post" action="/push-pdf"><button class="btn ghost" type="submit">把 PDF 推送到手机</button></form></div>
-{('<p class="note">' + E(req.query_params.get('msg', '')) + '</p>') if req.query_params.get('msg') else ''}"""
+<p class="sub" style="margin-top:10px">{E(card.get('verdict', '还没有完成的实时周末，第一个周末结束后这里会出现成绩。'))} 期权：{E(oc['verdict'])}</p>
+
+<h2>本周末打算（纸面练习）</h2>
+{plan_head}{plan}
+
+<h2>7 个合约</h2>
+<div class="tw"><table><tr><th>合约</th><th class="n">最新价</th><th>锁定时间</th><th class="n">实时样本</th><th class="n">实时模拟</th><th class="n">历史回测</th></tr>{inst_rows}</table></div>
+
+<h2>报告</h2>
+<div class="actions"><a class="btn" href="/report.pdf">下载 PDF 报告</a>
+<form method="post" action="/push-pdf" style="margin:0"><button class="ghost" type="submit">推送到手机</button></form>
+<span class="ev">每天早上 7 点会自动推一份</span></div>
+{('<p class="note">' + E(pushed) + '</p>') if pushed else ''}"""
     return page(req, "/", "概览", body)
 
 
@@ -517,7 +632,16 @@ def money(req: Request, capital: float = 2000, lev: float = 2, mode: str = "make
             f"<tr><td>{E(o['date'])}</td><td class='{_cls(o['net_bps'])}'>{_n(o['net_bps'] / 100, 1, '%', sign=True)}</td><td class='mut'>{E(o['note'])}</td></tr>" for o in opt) + "</table></div>"
     sel = lambda a, b: "selected" if a == b else ""  # noqa: E731
     q = urlencode({"capital": capital, "lev": lev})
-    body = f"""<h1>如果放真钱，会赚多少或亏多少</h1>
+    manual = """<div class="card" style="margin:16px 0">
+<h2 style="margin-top:0">如果你自己手动跟着做（真钱），一个周末的流程</h2>
+<p class="sub">实盘下单功能还锁着，程序不会替你下单。下面是你自己照着推送手动操作的步骤。先看清楚：现在还没有一个真实周末的成绩，方法有没有用还不知道。</p>
+<ol class="steps" style="grid-template-columns:repeat(4,1fr)">
+<li><span class="n">1</span><b>周五前</b><span class="t">把钱放进交易账户</span><span class="d">在 Hyperliquid（trade.xyz）账户里放入 USDC。只放亏光也不心疼的钱。</span></li>
+<li><span class="n">2</span><b>周末</b><span class="t">什么都不用做</span><span class="d">程序读价格和新闻。周日锁定前 2 小时 agent 开会，手机收到"本周末打算"。</span></li>
+<li><span class="n">3</span><b>周日 14:45 / 16:45</b><span class="t">收到锁定推送后下单</span><span class="d">按推送里每个合约的方向挂限价单，仓位按推送比例；推送写"不做"的不碰。</span></li>
+<li><span class="n">4</span><b>周日 15:05 / 17:05</b><span class="t">开盘 5 分钟后平仓</span><span class="d">全部平掉，盈亏当场到账户，随时可以提走。不是周一才结算。</span></li>
+</ol></div>"""
+    body = manual + f"""<h1>如果放真钱，会赚多少或亏多少</h1>
 <p class="sub">按每个周末的真实结果，换算成你填的本金和杠杆。"历史回测"用上线前的小时 K 线，没有新闻过滤、成交价取得理想，<b>会偏乐观</b>；"实时模拟"是上线后锁定的正式记录。</p>
 <form class="inline card" method="get" action="/money">
 <label>本金（美元）<input type="number" name="capital" value="{capital:g}" min="100" step="100"></label>
@@ -672,7 +796,7 @@ def agents_page(req: Request, run: str | None = None):
     runs = agents.list_runs(S, 12)
     head = AGENTS_JS
     status = (f'<span class="good" id="meet-stage">正在开会：{E(st.get("stage", ""))}</span>（开完会页面会自动更新，展开的内容不会被收起）' if st.get("running")
-              else f"上次开会：{E(rec['run_id']) if rec else '还没开过'}")
+              else f"上次开会：{E(rec['run_id'][5:10] + ' ' + rec['run_id'][11:13] + ':' + rec['run_id'][13:15]) if rec else '还没开过'}")
     key_ok = bool(os.environ.get("ANTHROPIC_API_KEY"))
     body = f"""<h1>Agent 讨论室</h1>
 <p class="sub">18 个起步、人数会自动变化的 AI 团队。交易、期权、算法三个岗位各有 3 个 agent 赛马：代码按结果自动打分，第一名当冠军（决定进正式模拟账、模型升级、发言优先），连续垫底的被淘汰、由冠军打法改写出的新一代顶替。风控、选品种、方法、审计负责把关。纪律写死在代码里，agent 改不了；奖惩全自动，人不干预。每天 6:30（加州时间）和周末决策前 2 小时开会。</p>
