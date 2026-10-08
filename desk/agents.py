@@ -200,6 +200,10 @@ class Facts:
         return "\n".join(lines)
 
 
+def _r(x):
+    return "—（还没有样本）" if x is None else f"{x:.2f}"
+
+
 def _fmt_pt(ns):
     return datetime.fromtimestamp(ns / 1e9, tz=UTC).astimezone(PT).strftime("%m-%d %H:%M PT") if ns else "—"
 
@@ -282,7 +286,7 @@ def build_bundle(settings, now: datetime | None = None) -> Facts:
     def opts():
         sc = options.scorecard(settings)
         F.add("期权实时", f"期权研究：事件样本 {sc['n_event']} 个、无事件对照日 {sc['n_control']} 个；"
-                        f"事件日 实际/隐含 平均 {sc['event_ratio'] or 0:.2f}，对照日 {sc['control_ratio'] or 0:.2f}；{sc['verdict']}")
+                        f"事件日 实际/隐含 平均 {_r(sc['event_ratio'])}，对照日 {_r(sc['control_ratio'])}；{sc['verdict']}")
         p = Path(settings.data) / "reports" / "history_options.json"
         if p.exists():
             h = json.loads(p.read_text())
