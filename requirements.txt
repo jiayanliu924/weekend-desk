@@ -11,3 +11,5 @@ uvicorn>=0.29
 itsdangerous>=2.1
 python-multipart>=0.0.9
 reportlab>=4.0
+hyperliquid-python-sdk>=0.9
+eth-account>=0.10

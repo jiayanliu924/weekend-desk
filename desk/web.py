@@ -433,6 +433,8 @@ def overview(req: Request):
     plan = (f'<div class="tw"><table class="plan"><tr><th>合约</th><th>打算</th><th class="n">仓位</th><th>理由</th></tr>{plan_rows}</table></div>'
             if plan_rows else '<p class="note">还没有本周末的打算。Agent 团队每天 6:30 开会，周日锁定前 2 小时再开一次。</p>')
     pushed = req.query_params.get("msg", "")
+    from . import autotrade
+    at_cfg, at_real = autotrade.get(S), autotrade.realized_total(S)
     body = f"""
 <section class="hero">
   <div class="card countdown">
@@ -449,9 +451,9 @@ def overview(req: Request):
     <div class="k" style="margin-top:14px">新闻自动读取</div>
     <div class="v s {'good' if st['llm_key'] else 'bad'}">{'已开启' if st['llm_key'] else '未开启'}</div>
     {'' if st['llm_key'] else '<div class="ev"><a href="/settings">去设置里填 API key</a></div>'}
-    <div class="k" style="margin-top:14px">真钱</div>
-    <div class="v s">锁着，只做模拟</div>
-    <div class="ev"><a href="/money">如果放真钱会怎样</a></div>
+    <div class="k" style="margin-top:14px">自动下单</div>
+    <div class="v s {'good' if at_cfg['mode'] == 'live' else ''}">{ {'off': '关闭，只做模拟', 'shadow': '演习中（不真下）', 'live': '真下单中'}[at_cfg['mode']] }</div>
+    <div class="ev">{'本金上限 $' + format(at_cfg['capital_usd'], '.0f') + ' · 累计真实盈亏 $' + format(at_real, '+.2f') + ' · ' if at_cfg['mode'] != 'off' else ''}<a href="/settings">设置</a></div>
   </div>
 </section>
 
@@ -1000,7 +1002,111 @@ def settings_page(req: Request):
 <label>粘贴 key（以 sk-ant- 开头）<input name="key" type="password" autocomplete="off" required placeholder="sk-ant-api03-..."></label>
 <button type="submit">保存并测试</button></form>
 <p class="sub">保存前会先用这个 key 试一次（花费不到 0.01 美分），不对就不保存。key 只存在服务器上，网页上只显示开头和最后 4 位。</p></div>"""
+    body += _autotrade_html()
     return page(req, "/settings", "设置", body)
+
+
+def _autotrade_html() -> str:
+    from . import autotrade
+    cfg = autotrade.get(S)
+    addr, key = autotrade.creds()
+    has = autotrade.valid_address(addr) and autotrade.valid_key(key)
+    label = {"off": "关闭", "shadow": "演习（算好单子、推送给你看，但不真下）", "live": "真下单"}[cfg["mode"]]
+    summ = autotrade.summary(S)
+    rows = ""
+    for wid, k in sorted(summ["weekends"].items(), reverse=True)[:20]:
+        e, x = k.get("entry", {}), k.get("exit", {})
+        what = e.get("skipped") or (f'{e.get("side", "")} 约 ${e.get("notional_usd", 0):.0f}' + ("（演习）" if not e.get("sent") else ""))
+        pnl = x.get("pnl_usd")
+        rows += (f'<tr><td>{E(wid)}</td><td>{E(what)}</td><td class="n {_cls(pnl)}">'
+                 f'{"—" if pnl is None else f"${pnl:+.2f}"}</td><td class="ev">{E(x.get("error") or e.get("error") or "")}</td></tr>')
+    sel = lambda m: "checked" if cfg["mode"] == m else ""  # noqa: E731
+    return f"""
+<div class="card" style="margin-top:18px"><h2 style="margin-top:0">自动下单（真钱）</h2>
+<p>现在：<b class="{'good' if cfg['mode'] == 'live' else ''}">{label}</b> · 本金上限 ${cfg['capital_usd']:.0f} · 最多亏 ${cfg['max_loss_usd']:.0f} 自动停 ·
+累计真实盈亏 <b class="{_cls(summ['total_usd'])}">${summ['total_usd']:+.2f}</b></p>
+<p class="sub">打开后，每个周末程序自己完成：锁定预测时挂单（只挂单、不吃单，杠杆 1 倍）→ 开盘前 1 分钟撤掉没成交的 → 开盘 5 分钟后平仓。
+每一步都推送到手机。你不用碰交易所。这个方法还没有真实成绩，只放亏了也不心疼的钱。</p>
+
+<h3>第一步：连接你的 Hyperliquid 账户{' <span class="good">（已连接）</span>' if has else ''}</h3>
+<ol class="sub" style="color:var(--ink)">
+<li>在 app.hyperliquid.xyz 登录你的钱包，确认账户里有 USDC。</li>
+<li>点右上角 <b>More → API</b>，名字填 weekend-desk，点 <b>Generate</b>，再点 <b>Authorize API Wallet</b>（钱包里点确认）。有效期选最长。</li>
+<li>页面会显示一串 <b>私钥</b>（0x 开头、66 位），点复制。这个"API 钱包"只能下单，<b>不能把钱提走</b>。</li>
+<li>把你的<b>主钱包地址</b>（0x 开头、42 位，就是登录用的那个）和刚才的私钥填到下面。</li>
+</ol>
+<form method="post" action="/settings/wallet" style="display:grid;gap:10px;max-width:560px">
+<label>主钱包地址<input name="address" autocomplete="off" placeholder="0x..." value="{E(addr) if autotrade.valid_address(addr) else ''}"></label>
+<label>API 钱包私钥{'（已保存，只在要更换时填）' if has else ''}<input name="key" type="password" autocomplete="off" placeholder="0x..."></label>
+<button type="submit">保存并检查连接</button></form>
+
+<h3>第二步：选择模式</h3>
+<form method="post" action="/settings/live" style="display:grid;gap:10px;max-width:560px">
+<label style="flex-direction:row;gap:8px;color:var(--ink)"><input type="radio" name="mode" value="off" {sel('off')}> 关闭</label>
+<label style="flex-direction:row;gap:8px;color:var(--ink)"><input type="radio" name="mode" value="shadow" {sel('shadow')}> 演习：到点推送"本来会下什么单"，不真下（建议先演习一个周末）</label>
+<label style="flex-direction:row;gap:8px;color:var(--ink)"><input type="radio" name="mode" value="live" {sel('live')}> 真下单</label>
+<div class="grid"><label>本金上限（美元，平均分给 7 个合约）<input name="capital" type="number" min="20" max="5000" step="10" value="{cfg['capital_usd']:.0f}"></label>
+<label>最多亏多少就自动停（美元）<input name="max_loss" type="number" min="5" max="2000" step="5" value="{cfg['max_loss_usd']:.0f}"></label></div>
+<label style="flex-direction:row;gap:8px;color:var(--ink)"><input type="checkbox" name="ack" value="1"> 我知道选"真下单"会用真钱，可能亏损；这个方法还没有真实成绩</label>
+<button type="submit">保存模式</button></form>
+
+<h3>记录</h3>
+<div class="tw"><table><tr><th>周末</th><th>做了什么</th><th class="n">真实盈亏</th><th>备注</th></tr>{rows or '<tr><td colspan=4 class="mut">还没有记录</td></tr>'}</table></div>
+</div>"""
+
+
+@app.post("/settings/wallet")
+def settings_wallet(req: Request, address: str = Form(""), key: str = Form("")):
+    if (r := _guard(req)):
+        return r
+    origin = req.headers.get("origin")
+    if origin and req.headers.get("host") and origin.split("//")[-1] != req.headers["host"]:
+        return Response("bad origin", status_code=403)
+    from . import autotrade
+    address, key = address.strip(), key.strip()
+    if not autotrade.valid_address(address):
+        msg = "没保存：主钱包地址应该是 0x 开头、一共 42 位。"
+    elif key and not autotrade.valid_key(key):
+        msg = "没保存：私钥应该是 0x 开头、后面 64 位（0-9 和 a-f）。注意不要贴成钱包地址。"
+    elif not key and not autotrade.valid_key(autotrade.creds()[1]):
+        msg = "没保存：还没有私钥，请把 API 钱包私钥也填上。"
+    else:
+        save_env_key("HL_ACCOUNT_ADDRESS", address)
+        if key:
+            save_env_key("HL_API_PRIVATE_KEY", key if key.startswith("0x") else "0x" + key)
+        try:
+            b = autotrade.client().balance()
+            msg = (f"已保存并连上。主账户 ${b['main']:.2f}，美股合约账户（xyz）${b['xyz']:.2f}。"
+                   + ("" if b["xyz"] or b["main"] else " 账户里还没有钱。"))
+        except Exception as e:  # noqa: BLE001
+            msg = f"已保存，但检查连接失败：{type(e).__name__}: {str(e)[:160]}"
+        import subprocess
+        subprocess.Popen(["systemctl", "restart", "weekend-desk"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return RedirectResponse("/settings?" + urlencode({"msg": msg}), status_code=303)
+
+
+@app.post("/settings/live")
+def settings_live(req: Request, mode: str = Form("off"), capital: float = Form(200), max_loss: float = Form(50), ack: str = Form("")):
+    if (r := _guard(req)):
+        return r
+    origin = req.headers.get("origin")
+    if origin and req.headers.get("host") and origin.split("//")[-1] != req.headers["host"]:
+        return Response("bad origin", status_code=403)
+    from . import autotrade
+    a, k = autotrade.creds()
+    capital, max_loss = max(20.0, min(5000.0, capital)), max(5.0, min(2000.0, max_loss))
+    if mode not in autotrade.MODES:
+        mode = "off"
+    if mode == "live" and not ack:
+        msg = "没保存：选真下单要先勾选「我知道会用真钱」那一项。"
+    elif mode != "off" and not (autotrade.valid_address(a) and autotrade.valid_key(k)):
+        msg = "没保存：先完成第一步，连接 Hyperliquid 账户。"
+    else:
+        autotrade.put(S, mode=mode, capital_usd=capital, max_loss_usd=max_loss, updated_by=_user(req) or "")
+        msg = {"off": "已关闭自动下单。", "shadow": f"已切到演习：本周末会推送本来会下的单（本金 ${capital:.0f}），不真下。",
+               "live": f"已打开真下单：本金上限 ${capital:.0f}，累计亏 ${max_loss:.0f} 自动停。每一步都会推送。"}[mode]
+        notify.push(S, "自动下单设置已改", f"{_user(req)}：{msg}", priority="high")
+    return RedirectResponse("/settings?" + urlencode({"msg": msg}), status_code=303)
 
 
 @app.post("/settings/key")

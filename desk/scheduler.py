@@ -34,6 +34,13 @@ def due_jobs(now: datetime, settings, done: set) -> list[tuple[str, object]]:
                 out.append((k("lock"), wk))
             if wk.exit + timedelta(minutes=2) <= now < wk.exit + timedelta(hours=6) and k("outcome") not in done:
                 out.append((k("outcome"), wk))
+            # 自动下单（模式 off 时这些任务什么都不做）
+            if k("lock") in done and wk.decision <= now < wk.resume - timedelta(minutes=2) and k("live_entry") not in done:
+                out.append((k("live_entry"), wk))
+            if wk.resume - timedelta(minutes=1) <= now < wk.exit and k("live_cancel") not in done:
+                out.append((k("live_cancel"), wk))
+            if wk.exit <= now < wk.exit + timedelta(hours=6) and k("live_exit") not in done:
+                out.append((k("live_exit"), wk))
     for fri, wks in by_friday.items():
         # news extraction is shared across instruments: window from earliest news start to latest decision
         wks = list({w.wid: w for w in wks}.values())
@@ -71,6 +78,14 @@ def run_job(key: str, wk, settings):
         return jobs.job_lock(settings, wk, push=False)
     if name == "outcome":
         return jobs.job_outcome(settings, wk, push=False)
+    if name.startswith("live_"):
+        from . import autotrade
+        from .ledger import Ledger
+        if name == "live_entry":
+            return autotrade.entry(settings, wk, Ledger(settings.data).weekend(wk.wid).get("lock"))
+        if name == "live_cancel":
+            return autotrade.cancel_unfilled(settings, wk)
+        return autotrade.exit_(settings, wk)
     if name == "report":
         jobs.clear_pending_note(settings)
         return jobs.job_report(settings, wk)

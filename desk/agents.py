@@ -292,6 +292,11 @@ def build_bundle(settings, now: datetime | None = None) -> Facts:
         n_paper = len({r["weekend"][:10] for r in recs})
         missing = execution.gate(settings, n_paper)
         F.add("实盘锁", "实盘仍锁定：" + "；".join(missing) if missing else "实盘条件已全部满足（仍需人工开启下单代码）")
+        from . import autotrade
+        at = autotrade.get(settings)
+        F.add("自动下单", {"off": "自动下单关闭，全部只是模拟。", "shadow": f"自动下单是演习模式：只推送本来会下的单，不真下（本金上限 ${at['capital_usd']:.0f}）。",
+                        "live": f"自动下单已打开（真钱）：本金上限 ${at['capital_usd']:.0f}，累计亏 ${at['max_loss_usd']:.0f} 自动停；"
+                                f"目前累计真实盈亏 ${autotrade.realized_total(settings):+.2f}。风控室的否决会直接让对应合约不下单。"}[at["mode"]])
         F.add("规则指纹", f"当前规则指纹 {rules_hash(settings.root)[:12]}")
 
     def opts():

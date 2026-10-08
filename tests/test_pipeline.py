@@ -61,7 +61,7 @@ def test_scheduler_timeline(tmp_path):
     keys = [k for k, _ in seen]
     for inst in s.instruments:
         w = weekend_for_friday(fri, s, inst)
-        mine = [(k.rsplit(":", 1)[1], tt) for k, tt in seen if k.startswith(w.wid + ":")]
+        mine = [(k.rsplit(":", 1)[1], tt) for k, tt in seen if k.startswith(w.wid + ":") and ":live_" not in k]
         assert [n for n, _ in mine] == ["open", "lock", "outcome"], inst["name"]
         assert dict(mine)["lock"] == w.decision and dict(mine)["outcome"] >= w.exit
     # 3 distinct decision times: 18:00 ET group, 20:00 ET group, SMSN 09:01 KST (= 20:01 ET, decision 19:46 ET)
