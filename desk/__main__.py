@@ -13,6 +13,7 @@ python -m desk deluser 名字      删除账号
 from __future__ import annotations
 
 import asyncio
+import os
 import json
 import logging
 import sys
@@ -102,6 +103,12 @@ def main(argv: list[str]) -> int:
             return 1
         add_user(s, name, pw)
         print(f"已创建/更新账号 {name}")
+    elif cmd == "link":
+        from .web import make_reset_token
+        name = argv[1]
+        host = os.environ.get("WEB_HOST", "")
+        tok = make_reset_token(s, name)
+        print(f"在浏览器打开（30 分钟内有效，只能用一次）：\nhttps://{host or '你的网址'}/setpw?token={tok}")
     elif cmd == "deluser":
         from .web import del_user
         print("已删除" if del_user(s, argv[1]) else "没有这个账号")

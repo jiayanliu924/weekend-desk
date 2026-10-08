@@ -61,6 +61,34 @@ def del_user(settings, name: str) -> bool:
     return ok
 
 
+def make_reset_token(settings, name: str, minutes: int = 30) -> str:
+    """One-time link to set a password in the browser (avoids typing blind in the console)."""
+    p = Path(settings.data) / "state" / "reset_tokens.json"
+    toks = json.loads(p.read_text()) if p.exists() else {}
+    now = time.time()
+    toks = {k: v for k, v in toks.items() if v["exp"] > now}
+    tok = secrets.token_urlsafe(24)
+    toks[hashlib.sha256(tok.encode()).hexdigest()] = {"user": name, "exp": now + minutes * 60}
+    p.write_text(json.dumps(toks))
+    os.chmod(p, 0o600)
+    return tok
+
+
+def use_reset_token(settings, tok: str, consume: bool) -> str | None:
+    p = Path(settings.data) / "state" / "reset_tokens.json"
+    if not p.exists():
+        return None
+    toks = json.loads(p.read_text())
+    key = hashlib.sha256(tok.encode()).hexdigest()
+    v = toks.get(key)
+    if not v or v["exp"] < time.time():
+        return None
+    if consume:
+        toks.pop(key)
+        p.write_text(json.dumps(toks))
+    return v["user"]
+
+
 def check_user(settings, name: str, password: str) -> bool:
     p = _users_path(settings)
     users = json.loads(p.read_text()) if p.exists() else {}
@@ -240,6 +268,38 @@ def login(req: Request, username: str = Form(...), password: str = Form(...)):
         return RedirectResponse("/", status_code=303)
     _fails[ip] = recent + [now]
     return HTMLResponse(LOGIN.format(css=CSS, msg='<p class="bad">用户名或密码不对。</p>'), status_code=401)
+
+
+SETPW = """<!doctype html><html lang="zh"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>设置密码 · Weekend Desk</title><style>{css}</style></head><body><div class="login"><h1>设置密码</h1>
+<p class="sub">账号：<b>{user}</b>。这个链接只能用一次，30 分钟内有效。</p>{msg}
+<form method="post" action="/setpw" class="card" style="display:grid;gap:10px"><input type="hidden" name="token" value="{tok}">
+<label>新密码（至少 10 位）<input name="p1" type="password" autocomplete="new-password" required minlength="10"></label>
+<label>再输一次<input name="p2" type="password" autocomplete="new-password" required minlength="10"></label>
+<label style="flex-direction:row;gap:6px;align-items:center"><input type="checkbox" onclick="for(const i of document.querySelectorAll('input[type=password],input.shown')){{i.type=this.checked?'text':'password';i.classList.toggle('shown',this.checked)}}"> 显示密码</label>
+<button type="submit">保存并去登录</button></form></div></body></html>"""
+
+
+@app.get("/setpw", response_class=HTMLResponse)
+def setpw_form(token: str = ""):
+    user = use_reset_token(S, token, consume=False)
+    if not user:
+        return HTMLResponse(LOGIN.format(css=CSS, msg='<p class="bad">链接无效或已过期，请在服务器上重新生成。</p>'), status_code=400)
+    return HTMLResponse(SETPW.format(css=CSS, user=E(user), tok=E(token), msg=""))
+
+
+@app.post("/setpw", response_class=HTMLResponse)
+def setpw(token: str = Form(...), p1: str = Form(...), p2: str = Form(...)):
+    user = use_reset_token(S, token, consume=False)
+    if not user:
+        return HTMLResponse(LOGIN.format(css=CSS, msg='<p class="bad">链接无效或已过期。</p>'), status_code=400)
+    if p1 != p2:
+        return HTMLResponse(SETPW.format(css=CSS, user=E(user), tok=E(token), msg='<p class="bad">两次输入不一致。</p>'), status_code=400)
+    if len(p1) < 10:
+        return HTMLResponse(SETPW.format(css=CSS, user=E(user), tok=E(token), msg='<p class="bad">密码至少 10 位。</p>'), status_code=400)
+    add_user(S, user, p1)
+    use_reset_token(S, token, consume=True)
+    return HTMLResponse(LOGIN.format(css=CSS, msg=f'<p class="good">已为 {E(user)} 设置密码，请登录。</p>'))
 
 
 @app.get("/logout")

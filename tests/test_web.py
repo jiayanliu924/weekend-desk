@@ -95,3 +95,15 @@ def test_sim_math(env):
     assert r["stress_usd"] == pytest.approx(-1500)
     live = sim.run(s, 2000, 2, "maker", "live")
     assert live["n"] == 1 and live["n_traded"] == 1 and live["total_usd"] > 0
+
+
+def test_reset_link(env):
+    s, web = env
+    c = TestClient(web.app)
+    tok = web.make_reset_token(s, "newbie")
+    assert c.get(f"/setpw?token={tok}").status_code == 200
+    assert c.post("/setpw", data={"token": tok, "p1": "abcdefghij1", "p2": "different-1"}).status_code == 400
+    assert c.post("/setpw", data={"token": tok, "p1": "abcdefghij1", "p2": "abcdefghij1"}).status_code == 200
+    assert c.post("/setpw", data={"token": tok, "p1": "abcdefghij1", "p2": "abcdefghij1"}).status_code == 400  # single use
+    assert c.post("/login", data={"username": "newbie", "password": "abcdefghij1"}, follow_redirects=False).status_code == 303
+    assert c.get("/setpw?token=bogus").status_code == 400

@@ -5,6 +5,7 @@ DEST=/opt/weekend-desk
 IP=$(curl -fsS -m 5 http://169.254.169.254/metadata/v1/interfaces/public/0/ipv4/address || curl -fsS -m 5 https://api.ipify.org)
 HOST="$(echo "$IP" | tr . -).sslip.io"
 
+sed -i '/^WEB_HOST=/d' "$DEST/.env"; echo "WEB_HOST=$HOST" >> "$DEST/.env"
 grep -q '^WEB_SECRET=' "$DEST/.env" || echo "WEB_SECRET=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')" >> "$DEST/.env"
 
 cat > /etc/systemd/system/weekend-desk-web.service <<UNIT
