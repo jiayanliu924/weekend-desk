@@ -44,9 +44,9 @@ def book_before(settings, coin: str, t_ns: int) -> dict | None:
     }
 
 
-def trade_notional(settings, a_ns: int, b_ns: int) -> tuple[float, int]:
-    rows = rawstore.query(settings.data, "hl_trades", select="payload",
-                          sql_where=f"received_at >= {a_ns} AND received_at < {b_ns}")
+def trade_notional(settings, a_ns: int, b_ns: int, coin: str | None = None) -> tuple[float, int]:
+    where = f"received_at >= {a_ns} AND received_at < {b_ns}" + (f" AND key = '{coin}'" if coin else "")
+    rows = rawstore.query(settings.data, "hl_trades", select="payload", sql_where=where)
     seen, total = set(), 0.0
     for (p,) in rows:
         for t in json.loads(p).get("data", []):
@@ -58,9 +58,9 @@ def trade_notional(settings, a_ns: int, b_ns: int) -> tuple[float, int]:
 
 
 def build(settings, w: Weekend) -> dict:
-    coin = settings.instrument
+    coin = w.coin or settings.instrument
     close_ns, dec_ns, start_ns = to_ns(w.close), to_ns(w.decision), to_ns(w.news_start)
-    f: dict = {"weekend": w.wid, "feature_version": settings["model"]["feature_version"],
+    f: dict = {"weekend": w.wid, "coin": coin, "name": w.name or coin.split(":")[-1], "feature_version": settings["model"]["feature_version"],
                "decision_utc": w.decision.isoformat(), "ok": False, "problems": []}
 
     fri = last_ctx_before(settings, coin, close_ns)
@@ -92,7 +92,7 @@ def build(settings, w: Weekend) -> dict:
         f["max_gap_min"] = max(gaps) if gaps else 0.0
         if f["max_gap_min"] > 15:
             f["problems"].append(f"周末数据最长断档 {f['max_gap_min']:.0f} 分钟")
-    vol, ntr = trade_notional(settings, close_ns, dec_ns)
+    vol, ntr = trade_notional(settings, close_ns, dec_ns, coin)
     f["wknd_volume_usd"], f["wknd_trades"] = vol, ntr
 
     btc0 = last_ctx_before(settings, "BTC", close_ns)

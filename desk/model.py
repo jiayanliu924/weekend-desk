@@ -33,12 +33,13 @@ def predict(features: dict, history: list[dict], cfg) -> dict:
             "model_note": "线性模型，只用过去的周末拟合", "coef": {"quiet": a, "news": a + b}}
 
 
-def fee_bps(settings, before_ns: int) -> dict:
+def fee_bps(settings, before_ns: int, coin: str | None = None) -> dict:
     """Read growthMode from the latest parameter snapshot before `before_ns` (第八章参数快照)."""
     c = settings["costs"]
     growth = None
+    where = f"received_at < {before_ns}" + (f" AND key = '{coin}'" if coin else "")
     rows = rawstore.query(settings.data, "hl_params", select="payload",
-                          sql_where=f"received_at < {before_ns}") if rawstore.has_stream(settings.data, "hl_params") else []
+                          sql_where=where) if rawstore.has_stream(settings.data, "hl_params") else []
     if rows:
         meta = json.loads(rows[-1][0]).get("asset_meta", {})
         growth = meta.get("growthMode") == "enabled"

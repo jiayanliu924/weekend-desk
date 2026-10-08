@@ -50,21 +50,30 @@ def test_throttle(tmp_path):
 
 def test_scheduler_timeline(tmp_path):
     s = settings(tmp_path)
-    w = weekend_for_friday(date(2026, 10, 9), s)
-    done = set()
-    seen = []
-    t = w.close - timedelta(hours=2)
-    while t < w.resume + timedelta(days=1):
+    fri = date(2026, 10, 9)
+    done, seen = set(), []
+    t = datetime(2026, 10, 9, 18, 0, tzinfo=timezone.utc)
+    while t < datetime(2026, 10, 13, 6, 0, tzinfo=timezone.utc):
         for key, _ in scheduler.due_jobs(t, s, done):
             done.add(key)
             seen.append((key, t))
         t += timedelta(minutes=1)
-    names = [k.split(":", 1)[1] for k, _ in seen if k.startswith(w.wid)]
-    order = [n for n in names if not n.startswith("extract")]
-    assert order == ["open", "lock", "outcome", "report"]
-    assert "extract_final" in names and sum(1 for n in names if n.startswith("extract")) > 150
-    when = dict((k.split(":", 1)[1], tt) for k, tt in seen if k.startswith(w.wid))
-    assert when["lock"] == w.decision and when["outcome"] >= w.exit
+    keys = [k for k, _ in seen]
+    for inst in s.instruments:
+        w = weekend_for_friday(fri, s, inst)
+        mine = [(k.rsplit(":", 1)[1], tt) for k, tt in seen if k.startswith(w.wid + ":")]
+        assert [n for n, _ in mine] == ["open", "lock", "outcome"], inst["name"]
+        assert dict(mine)["lock"] == w.decision and dict(mine)["outcome"] >= w.exit
+    # 3 distinct decision times: 18:00 ET group, 20:00 ET group, SMSN 09:01 KST (= 20:01 ET, decision 19:46 ET)
+    finals = [k for k in keys if k.startswith("2026-10-09:extract_final_")]
+    assert len(finals) == 3
+    assert "2026-10-09:report" in keys
+    assert sum(1 for k in keys if k.startswith("dailypdf:")) >= 3
+    # US single stocks: decision Sunday 19:45 ET; SMSN: Sunday 19:46 ET (Monday 08:46 KST)
+    nv = weekend_for_friday(fri, s, s.inst("NVDA"))
+    sm = weekend_for_friday(fri, s, s.inst("SMSN"))
+    assert nv.decision.hour == 23 and nv.decision.minute == 45
+    assert (sm.decision - nv.decision).total_seconds() == 60
 
 
 def test_backfill_weekend_table(tmp_path):

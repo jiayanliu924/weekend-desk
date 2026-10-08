@@ -30,12 +30,16 @@ def job_open(settings, w: Weekend) -> dict:
     note_p = _pending_note_path(settings)
     note = note_p.read_text().strip() if note_p.exists() else "其余不变"
     rec = led.append("open", w.wid, {
-        "exp_id": f"EXP-{w.wid}", "hypothesis_change": note, "rules_hash": rules_hash(settings.root),
+        "exp_id": f"EXP-{w.wid}", "coin": w.coin, "name": w.name, "hypothesis_change": note, "rules_hash": rules_hash(settings.root),
         "window": {"close": w.close.isoformat(), "decision": w.decision.isoformat(), "resume": w.resume.isoformat()},
     })
-    if note_p.exists():
-        note_p.unlink()
     return rec
+
+
+def clear_pending_note(settings) -> None:
+    p = _pending_note_path(settings)
+    if p.exists():
+        p.unlink()
 
 
 def job_extract(settings, w: Weekend, extractor=None, until: datetime | None = None, clock=None) -> int:
@@ -44,7 +48,7 @@ def job_extract(settings, w: Weekend, extractor=None, until: datetime | None = N
     return extract.run_extraction(settings, to_ns(w.news_start), to_ns(end), extractor=extractor, **kw)
 
 
-def job_lock(settings, w: Weekend) -> dict:
+def job_lock(settings, w: Weekend, push: bool = True) -> dict:
     led = Ledger(settings.data)
     wk = led.weekend(w.wid)
     if "lock" in wk:
@@ -65,21 +69,22 @@ def job_lock(settings, w: Weekend) -> dict:
                             "y_bps": r["outcome"]["y_bps"]})
     if feats["ok"]:
         pred = model.predict(feats, history, settings)
-        fees = model.fee_bps(settings, to_ns(w.decision))
+        fees = model.fee_bps(settings, to_ns(w.decision), w.coin or None)
         action = model.decide_action(feats, pred, fees, settings)
     else:
         void_reasons += feats["problems"]
         pred, fees, action = {"pred_bps": None}, {}, {"side": 0, "notional_usd": 0, "reason": "数据不全，不出手"}
-    body = {"features": feats, "prediction": pred, "fees": fees, "action": action,
+    body = {"coin": w.coin or settings.instrument, "name": w.name, "features": feats, "prediction": pred, "fees": fees, "action": action,
             "prompt_version": settings["llm"]["prompt_version"], "llm_model": settings["llm"]["model"],
             "rules_hash": now_hash, "void": bool(void_reasons), "void_reasons": void_reasons,
             "mode": "live" if settings["live"]["enabled"] else "paper"}
     rec = led.append("lock", w.wid, body)
-    notify.push(settings, f"已锁定预测 {w.wid}", report.lock_text(rec), priority="high")
+    if push:
+        notify.push(settings, f"已锁定预测 {w.wid}", report.lock_text(rec), priority="high")
     return rec
 
 
-def job_outcome(settings, w: Weekend) -> dict:
+def job_outcome(settings, w: Weekend, push: bool = True) -> dict:
     led = Ledger(settings.data)
     wk = led.weekend(w.wid)
     if "outcome" in wk:
@@ -91,24 +96,32 @@ def job_outcome(settings, w: Weekend) -> dict:
     out = evaluate.outcome(settings, w, lock)
     out["detected_switch"] = detect_switch(settings, w)
     rec = led.append("outcome", w.wid, out)
-    notify.push(settings, f"重开结果 {w.wid}", report.outcome_text(lock, rec))
+    if push:
+        notify.push(settings, f"重开结果 {w.wid}", report.outcome_text(lock, rec))
     return rec
 
 
 def job_report(settings, w: Weekend) -> Path:
+    """周报：覆盖这个周五的全部合约。"""
     path = report.weekly(settings, w)
     led = Ledger(settings.data)
     card = evaluate.scorecard(led.completed(), settings)
     body = report.card_text(card)
     if settings["options"]["enabled"]:
         body += "\n\n期权研究：\n" + options.card_text(options.scorecard(settings))
-    notify.push(settings, f"周报 {w.wid}", body + f"\n\n完整周报：{path.name}")
+    notify.push(settings, f"周报 {w.friday.isoformat()}", body)
+    try:
+        from . import pdfreport
+        fri = w.friday.isoformat()
+        notify.push_file(settings, f"周报 PDF {fri}", "完整周报见附件", pdfreport.build(settings), f"weekend-desk-week-{fri}.pdf")
+    except Exception as e:  # noqa: BLE001
+        log.warning("weekly pdf failed: %s", e)
     return path
 
 
 def detect_switch(settings, w: Weekend) -> dict | None:
     """元数据作业（7.1）：恢复前后 30 分钟内，预言机最大跳动发生在什么时候。"""
-    rows = features._ctx(settings, settings.instrument, to_ns(w.resume) - int(1800e9), to_ns(w.resume) + int(1800e9))
+    rows = features._ctx(settings, w.coin or settings.instrument, to_ns(w.resume) - int(1800e9), to_ns(w.resume) + int(1800e9))
     if len(rows) < 2:
         return None
     best = max(zip(rows, rows[1:]), key=lambda p: abs(float(p[1][1]["oraclePx"]) - float(p[0][1]["oraclePx"])))
@@ -127,3 +140,14 @@ def save_state(settings, done: set) -> None:
 def load_state(settings) -> set:
     p = Path(settings.data) / "state" / "jobs_done.json"
     return set(json.loads(p.read_text())) if p.exists() else set()
+
+
+def job_daily_pdf(settings, day=None) -> bool:
+    """每天推一份 PDF：昨天读了什么、预测/结果、累计成绩、模拟实盘。"""
+    from . import pdfreport
+    from zoneinfo import ZoneInfo
+    pt = ZoneInfo("America/Los_Angeles")
+    day = day or (datetime.now(timezone.utc).astimezone(pt).date())
+    data = pdfreport.build(settings, daily_for=day)
+    return notify.push_file(settings, f"每日报告 {day:%m-%d}", "昨天读了什么、预测了什么、结果和模拟实盘，见附件",
+                            data, f"weekend-desk-daily-{day.isoformat()}.pdf")

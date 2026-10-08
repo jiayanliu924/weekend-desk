@@ -7,6 +7,8 @@ python -m desk report           立刻生成最近一个周末的周报
 python -m desk note "..."       写下本周"假设与改动"（周五收盘前）
 python -m desk review 2026-10-09 "..."   周一人工复核，写入复盘
 python -m desk check-llm        抽检：随机取最近新闻跑一次抽取，打印结果
+python -m desk adduser 名字      创建网页登录账号（在服务器上输入密码）
+python -m desk deluser 名字      删除账号
 """
 from __future__ import annotations
 
@@ -56,16 +58,23 @@ def main(argv: list[str]) -> int:
             print("期权研究：下几个事件 " + "，".join(f"{e.event_type} {e.event_at:%m-%d %H:%M} UTC" for e in nxt))
             print(options.card_text(options.scorecard(s)))
     elif cmd == "backfill":
-        coin = s.instrument
-        cs = backfill.fetch_candles(coin)
-        backfill.save(s, coin, cs)
-        for p in s["market"]["peripheral"]:
-            backfill.save(s, p, backfill.fetch_candles(p))
-        md = backfill.baseline_report(s, backfill.weekend_table(s, cs))
-        out = Path(s.data) / "reports" / "baseline_history.md"
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(md)
-        print(md)
+        all_rows, mds = [], []
+        for inst in s.instruments:
+            try:
+                cs = backfill.fetch_candles(inst["coin"])
+                backfill.save(s, inst["coin"], cs)
+                rows = backfill.weekend_table(s, cs, inst)
+                all_rows += rows
+                mds.append(backfill.baseline_report(s, rows, inst["name"]))
+            except Exception as e:  # noqa: BLE001
+                print("backfill failed", inst["name"], e)
+        for p_ in s["market"]["peripheral"]:
+            backfill.save(s, p_, backfill.fetch_candles(p_))
+        (Path(s.data) / "reports").mkdir(parents=True, exist_ok=True)
+        (Path(s.data) / "reports" / "history_weekends.json").write_text(json.dumps(all_rows))
+        md = "\n\n".join(mds)
+        (Path(s.data) / "reports" / "baseline_history.md").write_text(md)
+        print(md[:3000])
         if s["options"]["enabled"]:
             cur = s["options"]["currency"]
             omd = backfill.options_history(s, backfill.fetch_dvol(cur), backfill.fetch_perp(cur))
@@ -83,6 +92,19 @@ def main(argv: list[str]) -> int:
         wid, note = argv[1], " ".join(argv[2:])
         Ledger(s.data).append("review", wid, {"note": note})
         print("复盘已写入", wid)
+    elif cmd == "adduser":
+        import getpass
+        from .web import add_user
+        name = argv[1] if len(argv) > 1 else input("用户名：").strip()
+        pw = getpass.getpass("设置密码（至少 10 位，输入时不显示）：")
+        if pw != getpass.getpass("再输一次："):
+            print("两次不一致，没有保存。")
+            return 1
+        add_user(s, name, pw)
+        print(f"已创建/更新账号 {name}")
+    elif cmd == "deluser":
+        from .web import del_user
+        print("已删除" if del_user(s, argv[1]) else "没有这个账号")
     elif cmd == "check-llm":
         from . import extract
         rows = rawstore.query(s.data, "news", select="received_at, key, payload", order="received_at DESC")[:5]

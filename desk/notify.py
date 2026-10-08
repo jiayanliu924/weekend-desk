@@ -23,3 +23,22 @@ def push(settings, title: str, body: str, priority: str = "default") -> bool:
     except Exception as e:  # noqa: BLE001
         log.warning("ntfy failed: %s", e)
         return False
+
+
+def _enc(s: str) -> str:
+    return "=?UTF-8?B?" + base64.b64encode(s.encode()).decode() + "?="
+
+
+def push_file(settings, title: str, message: str, data: bytes, filename: str) -> bool:
+    """Send a file (e.g. the PDF report) to the phone as an ntfy attachment."""
+    topic = os.environ.get("NTFY_TOPIC")
+    log.info("NOTIFY FILE %s (%d bytes)", filename, len(data))
+    if not topic:
+        return False
+    try:
+        r = httpx.put(f"{settings['notify']['server'].rstrip('/')}/{topic}", content=data, timeout=60,
+                      headers={"Title": _enc(title), "Message": _enc(message), "Filename": filename})
+        return r.status_code < 300
+    except Exception as e:  # noqa: BLE001
+        log.warning("ntfy file failed: %s", e)
+        return False

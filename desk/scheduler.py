@@ -4,58 +4,80 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
-from . import jobs, notify, options, rawstore
+from . import jobs, notify, options, rawstore, report
 from .clock import current_or_next_weekend, last_completed_weekend
 from .collector import Collector
 from .news import NewsPoller
 
 log = logging.getLogger("scheduler")
+PT = ZoneInfo("America/Los_Angeles")
 STARTED_AT = time.time()
 
 
 def due_jobs(now: datetime, settings, done: set) -> list[tuple[str, object]]:
-    """Return (job_key, weekend) pairs that should run now."""
+    """Return (job_key, weekend) pairs that should run now — per instrument, plus shared per-Friday jobs."""
     out = []
-    w = current_or_next_weekend(now, settings)
-    prev = last_completed_weekend(now, settings)
-    for wk in {w.wid: w, prev.wid: prev}.values():
-        k = lambda name: f"{wk.wid}:{name}"  # noqa: E731
-        if wk.close + timedelta(minutes=2) <= now < wk.decision and k("open") not in done:
-            out.append((k("open"), wk))
-        if wk.news_start <= now < wk.decision - timedelta(minutes=5):
-            slot = int((now - wk.news_start).total_seconds() // 900)
-            if k(f"extract{slot}") not in done:
-                out.append((k(f"extract{slot}"), wk))
-        if wk.decision - timedelta(minutes=5) <= now < wk.decision and k("extract_final") not in done:
-            out.append((k("extract_final"), wk))
-        if wk.decision <= now < wk.resume and k("lock") not in done:
-            out.append((k("lock"), wk))
-        if wk.exit + timedelta(minutes=2) <= now < wk.exit + timedelta(hours=6) and k("outcome") not in done:
-            out.append((k("outcome"), wk))
-        if wk.resume + timedelta(hours=14) <= now < wk.resume + timedelta(days=3) and k("report") not in done:
-            out.append((k("report"), wk))
+    by_friday: dict[str, list] = {}
+    for inst in settings.instruments:
+        w = current_or_next_weekend(now, settings, inst)
+        prev = last_completed_weekend(now, settings, inst)
+        for wk in {w.wid: w, prev.wid: prev}.values():
+            by_friday.setdefault(wk.friday.isoformat(), []).append(wk)
+            k = lambda name: f"{wk.wid}:{name}"  # noqa: E731
+            if wk.close + timedelta(minutes=2) <= now < wk.decision and k("open") not in done:
+                out.append((k("open"), wk))
+            if wk.decision <= now < wk.resume and k("lock") not in done:
+                out.append((k("lock"), wk))
+            if wk.exit + timedelta(minutes=2) <= now < wk.exit + timedelta(hours=6) and k("outcome") not in done:
+                out.append((k("outcome"), wk))
+    for fri, wks in by_friday.items():
+        # news extraction is shared across instruments: window from earliest news start to latest decision
+        wks = list({w.wid: w for w in wks}.values())
+        start = min(w.news_start for w in wks)
+        decisions = sorted({w.decision for w in wks})
+        span = replace(wks[0], news_start=start, decision=decisions[-1])
+        if start <= now < decisions[-1]:
+            slot = int((now - start).total_seconds() // 900)
+            if f"{fri}:extract{slot}" not in done:
+                out.append((f"{fri}:extract{slot}", span))
+        for d in decisions:  # make sure extraction runs right before each decision time
+            key = f"{fri}:extract_final_{d:%H%M}"
+            if d - timedelta(minutes=5) <= now < d and key not in done:
+                out.append((key, replace(span, decision=d)))
+        last_resume = max(w.resume for w in wks)
+        if last_resume + timedelta(hours=14) <= now < last_resume + timedelta(days=3) and f"{fri}:report" not in done:
+            out.append((f"{fri}:report", wks[0]))
     day = now.strftime("%Y-%m-%d")
     if now.hour == 0 and now.minute >= 10 and f"integrity:{day}" not in done:
         out.append((f"integrity:{day}", None))
+    pt = now.astimezone(PT)
+    h = settings["notify"].get("daily_pdf_hour_pt", 7)
+    if h <= pt.hour < h + 4 and f"dailypdf:{pt.date()}" not in done:
+        out.append((f"dailypdf:{pt.date()}", None))
     return out
 
 
-def run_job(key: str, wk, settings) -> None:
-    name = key.split(":", 1)[1]
+def run_job(key: str, wk, settings):
+    name = key.rsplit(":", 1)[1]
     if name == "open":
-        jobs.job_open(settings, wk)
-    elif name.startswith("extract"):
-        jobs.job_extract(settings, wk)
-    elif name == "lock":
-        jobs.job_lock(settings, wk)
-    elif name == "outcome":
-        jobs.job_outcome(settings, wk)
-    elif name == "report":
-        jobs.job_report(settings, wk)
-    elif key.startswith("integrity"):
-        integrity(settings)
+        return jobs.job_open(settings, wk)
+    if name.startswith("extract"):
+        return jobs.job_extract(settings, wk)
+    if name == "lock":
+        return jobs.job_lock(settings, wk, push=False)
+    if name == "outcome":
+        return jobs.job_outcome(settings, wk, push=False)
+    if name == "report":
+        jobs.clear_pending_note(settings)
+        return jobs.job_report(settings, wk)
+    if key.startswith("integrity"):
+        return integrity(settings)
+    if key.startswith("dailypdf"):
+        return jobs.job_daily_pdf(settings)
 
 
 def integrity(settings) -> None:
@@ -80,23 +102,34 @@ async def job_loop(settings):
     while True:
         now = datetime.now(timezone.utc)
         todo = [(k, w, run_job) for k, w in due_jobs(now, settings, done)]
+        # options jobs return records too, but are pushed by the options module itself
         todo += [(k, smp, options.run) for k, smp in options.due(now, settings, done)]
+        locks, outs = [], []
         for key, wk, fn in todo:
             try:
                 log.info("run job %s", key)
-                await asyncio.to_thread(fn, key, wk, settings)
+                rec = await asyncio.to_thread(fn, key, wk, settings)
+                if key.endswith(":lock") and not key.startswith("opt:") and isinstance(rec, dict):
+                    locks.append(rec)
+                elif key.endswith(":outcome") and isinstance(rec, dict) and not key.startswith("opt:"):
+                    outs.append((wk, rec))
             except Exception as e:  # noqa: BLE001
                 log.exception("job %s failed: %s", key, e)
                 notify.push(settings, "任务出错", f"{key}: {e}", priority="high")
             done.add(key)
             jobs.save_state(settings, done)
+        # one combined push per batch instead of one per instrument
+        if locks:
+            notify.push(settings, f"已锁定 {len(locks)} 个合约的预测", report.locks_summary(locks), priority="high")
+        if outs:
+            notify.push(settings, f"{len(outs)} 个合约开盘结果", report.outcomes_summary(settings, outs))
         await asyncio.sleep(20)
 
 
 async def main(settings):
     col = Collector(settings)
     news = NewsPoller(settings)
-    notify.push(settings, "Weekend Desk 已启动", f"品种 {settings.instrument}，模式 {'实盘' if settings['live']['enabled'] else '模拟'}")
+    notify.push(settings, "Weekend Desk 已启动", f"合约 {', '.join(i['name'] for i in settings.instruments)}，模式 {'实盘' if settings['live']['enabled'] else '模拟'}")
     tasks = [col.run_ws(), col.run_params(), col.run_flush(), news.run(), job_loop(settings)]
     if settings["options"]["enabled"]:
         tasks.append(options.OptionsCollector(settings).run())

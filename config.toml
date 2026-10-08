@@ -3,12 +3,76 @@
 # 周五收盘到周日决策之间改动本文件，当周结果会被自动作废。
 
 [market]
-# 7.1 一个品种
-instrument = "xyz:XYZ100"
 # 周边市场（7.2 系统架构：BTC 周末走势）
 peripheral = ["BTC"]
-# XYZ100 前十大权重股（7.3 特征：涉及前十大权重股的事件数）。权重会变，每季度复核一次。
+# 纳指前十大权重股（7.3 特征：涉及前十大权重股的事件数）。权重会变，每季度复核一次。
 top10 = ["NVDA", "MSFT", "AAPL", "AMZN", "GOOGL", "GOOG", "META", "AVGO", "TSLA", "NFLX"]
+
+# 同时跑的合约（2026-10-07 起由 1 个扩到 7 个）。每个合约的"真市场关门 / 重开"时间不同，
+# 来源：trade.xyz 文档（指数与商品 23/5：周日 6pm–周五 5pm 美东；美股单票 24/5：周日 8pm–周五 8pm 美东；
+# 韩股：周五 8pm–周一 9:01am 首尔时间）。决策时刻 = 重开前 15 分钟。
+[[market.instruments]]
+name = "XYZ100"
+coin = "xyz:XYZ100"
+tz = "America/New_York"
+close_day = "FRI"
+close = "17:00"
+resume_day = "SUN"
+resume = "18:00"
+
+[[market.instruments]]
+name = "SP500"
+coin = "xyz:SP500"
+tz = "America/New_York"
+close_day = "FRI"
+close = "17:00"
+resume_day = "SUN"
+resume = "18:00"
+
+[[market.instruments]]
+name = "BRENTOIL"
+coin = "xyz:BRENTOIL"
+tz = "America/New_York"
+close_day = "FRI"
+close = "17:00"
+resume_day = "SUN"
+resume = "18:00"
+
+[[market.instruments]]
+name = "NVDA"
+coin = "xyz:NVDA"
+tz = "America/New_York"
+close_day = "FRI"
+close = "20:00"
+resume_day = "SUN"
+resume = "20:00"
+
+[[market.instruments]]
+name = "TSLA"
+coin = "xyz:TSLA"
+tz = "America/New_York"
+close_day = "FRI"
+close = "20:00"
+resume_day = "SUN"
+resume = "20:00"
+
+[[market.instruments]]
+name = "INTC"
+coin = "xyz:INTC"
+tz = "America/New_York"
+close_day = "FRI"
+close = "20:00"
+resume_day = "SUN"
+resume = "20:00"
+
+[[market.instruments]]
+name = "SMSN"
+coin = "xyz:SMSN"
+tz = "Asia/Seoul"
+close_day = "FRI"
+close = "20:00"
+resume_day = "MON"
+resume = "09:01"
 
 [clock]
 timezone = "America/New_York"
@@ -58,7 +122,7 @@ max_items_per_run = 60
 [model]
 # 7.1 主假设 H1：无实质新闻 → 偏离被抹掉；有实质新闻 → 偏离被确认
 # 积累到 min_train 个周末前用 H1 原样规则；之后用线性模型（7.7 第 7–8 周）
-min_train = 12
+min_train = 24
 materiality_threshold = 2
 feature_version = "f1"
 
@@ -71,7 +135,7 @@ growth_discount = 0.9
 edge_buffer_bps = 2.0
 
 [risk]
-# 第八章
+# 第八章（模拟单每个合约每周末 $1000 名义金额）
 paper_notional_usd = 1000.0
 capital_usd = 2000.0
 max_depth_fraction = 0.10
@@ -111,3 +175,5 @@ eval_after_events = 20
 [notify]
 # 手机推送（ntfy.sh，免费）：在 .env 里填 NTFY_TOPIC
 server = "https://ntfy.sh"
+# 每天几点（加州时间）推送当日 PDF
+daily_pdf_hour_pt = 7

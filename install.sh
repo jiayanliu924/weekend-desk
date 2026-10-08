@@ -62,6 +62,8 @@ systemctl daemon-reload
 systemctl enable weekend-desk
 systemctl restart weekend-desk
 
+cp "$SRC/setup_web.sh" "$DEST/" 2>/dev/null && bash "$DEST/setup_web.sh" || true
+
 echo "==> 回补历史，生成基线报告和期权历史粗看"
 ./venv/bin/python -m desk backfill > /dev/null || true
 head -14 data/reports/baseline_history.md 2>/dev/null || true

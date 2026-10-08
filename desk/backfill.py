@@ -39,37 +39,41 @@ def save(settings, coin: str, candles: list[dict]) -> Path:
     return p
 
 
-def weekend_table(settings, candles: list[dict]) -> list[dict]:
-    """Per weekend: Friday close, price at resume (≈ 链上价 at decision), price 1h after resume."""
+def weekend_table(settings, candles: list[dict], inst: dict | None = None) -> list[dict]:
+    """Per weekend: price at external close, price at resume (≈ 链上价 at decision), price 1h after resume.
+
+    Times not on the hour (e.g. 韩股 09:01) are floored to the hour, since these are hourly candles.
+    """
+    from datetime import datetime, timezone
     by_t = {c["t"]: c for c in candles}
     H = 3600 * 1000
+    floor = lambda dt: int(dt.timestamp() * 1000) // H * H  # noqa: E731
     rows = []
-    from datetime import datetime, timezone
-    first = datetime.fromtimestamp(candles[0]["t"] / 1000, tz=timezone.utc).date()
-    day = first
+    day = datetime.fromtimestamp(candles[0]["t"] / 1000, tz=timezone.utc).date()
     last = datetime.fromtimestamp(candles[-1]["t"] / 1000, tz=timezone.utc).date()
+    name = inst["name"] if inst else settings.instruments[0]["name"]
     while day <= last:
         if day.weekday() == 4:
-            w = weekend_for_friday(day, settings)
-            k_close = int(w.close.timestamp() * 1000) - H        # candle ending at Friday close
-            k_dec = int(w.resume.timestamp() * 1000) - H         # candle ending at resume
-            k_out = int(w.resume.timestamp() * 1000)             # candle ending 1h after resume
+            w = weekend_for_friday(day, settings, inst)
+            k_close = floor(w.close) - H        # candle ending at external close
+            k_dec = floor(w.resume) - H         # candle ending at resume
+            k_out = floor(w.resume)             # candle ending 1h after resume
             if all(k in by_t for k in (k_close, k_dec, k_out)):
                 f, d, o = float(by_t[k_close]["c"]), float(by_t[k_dec]["c"]), float(by_t[k_out]["c"])
-                rows.append({"weekend": day.isoformat(), "dev_bps": (d / f - 1) * 1e4, "y_bps": (o / f - 1) * 1e4,
+                rows.append({"weekend": day.isoformat(), "name": name, "dev_bps": (d / f - 1) * 1e4, "y_bps": (o / f - 1) * 1e4,
                              "err_A": abs(o / f - 1) * 1e4, "err_B": abs(o / d - 1) * 1e4})
         day += timedelta(days=1)
     return rows
 
 
-def baseline_report(settings, rows: list[dict]) -> str:
+def baseline_report(settings, rows: list[dict], title: str = "") -> str:
     if not rows:
         return "没有足够的历史 K 线。"
     n = len(rows)
     absdev = sorted(abs(r["dev_bps"]) for r in rows)
     q = lambda p: absdev[min(n - 1, int(p * n))]  # noqa: E731
     lines = [
-        f"# 基线历史表现（回补 K 线，仅供粗略探索，不计入正式成绩）", "",
+        f"# {title or '基线'}历史表现（回补 K 线，仅供粗略探索，不计入正式成绩）", "",
         f"样本：{n} 个周末（{rows[0]['weekend']} 至 {rows[-1]['weekend']}），小时 K 线近似。", "",
         f"- 基线 A（周五收盘价不变）重开误差中位数：{statistics.median(r['err_A'] for r in rows):.1f} bps",
         f"- 基线 B（周日链上价）重开误差中位数：{statistics.median(r['err_B'] for r in rows):.1f} bps",
@@ -139,13 +143,20 @@ def options_history(settings, dvol: dict[int, float], perp: dict[int, float]) ->
     ev = [(t, sample(t - H)) for t in fomc]
     ev = [(t, r) for t, r in ev if r]
     ev_days = {datetime.fromtimestamp(t / 1000, tz=timezone.utc).date() for t, _ in ev}
-    ctl = []
+    ctl, ctl_rows = [], []
     for t in sorted(dvol):
         d = datetime.fromtimestamp(t / 1000, tz=timezone.utc)
         if d.hour == 8 and d.date() not in ev_days:
             r = sample(t)
             if r:
                 ctl.append(r)
+                ctl_rows.append({"date": d.date().isoformat(), "kind": "普通日", "implied": dvol[t], "ratio": r})
+    import json as _json
+    out_dir = Path(settings.data) / "reports"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    ev_rows = [{"date": datetime.fromtimestamp(t / 1000, tz=tz).date().isoformat(), "kind": "FOMC",
+                "implied": dvol.get(t - H), "ratio": r} for t, r in ev]
+    (out_dir / "history_options.json").write_text(_json.dumps({"events": ev_rows, "control": ctl_rows}))
     gm = lambda xs: math.exp(sum(math.log(x) for x in xs) / len(xs)) if xs else float("nan")  # noqa: E731
     lines = ["# 期权事件波动率：历史粗看（仅供探索，不计入正式成绩）", "",
              "口径：隐含波动用 Deribit DVOL（30 天）近似，实际波动用 BTC 永续小时收盘价算 24 小时窗口。"

@@ -31,8 +31,20 @@ class Settings:
         return self.raw[k]
 
     @property
+    def instruments(self) -> list[dict]:
+        m = self.raw["market"]
+        if m.get("instruments"):
+            return m["instruments"]
+        coin = m["instrument"]
+        return [{"name": coin.split(":")[-1], "coin": coin}]
+
+    @property
     def instrument(self) -> str:
-        return self.raw["market"]["instrument"]
+        """Primary instrument (first in the list)."""
+        return self.instruments[0]["coin"]
+
+    def inst(self, name_or_coin: str) -> dict | None:
+        return next((i for i in self.instruments if name_or_coin in (i["name"], i["coin"])), None)
 
 
 def load(root: Path | None = None) -> Settings:

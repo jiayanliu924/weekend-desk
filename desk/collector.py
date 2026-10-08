@@ -20,14 +20,15 @@ class Collector:
     def __init__(self, settings):
         s = settings
         self.s = s
-        self.coin = s.instrument
-        self.coins = [self.coin] + list(s["market"]["peripheral"])
+        self.insts = [i["coin"] for i in s.instruments]
+        self.coin = self.insts[0]
+        self.coins = self.insts + [c for c in s["market"]["peripheral"] if c not in self.insts]
         c = s["collect"]
         self.l2_every = c["l2_every_sec"]
         self.ctx_every = c["ctx_every_sec"]
         self.w = {name: RawWriter(s.data, name) for name in
                   ("hl_book", "hl_trades", "hl_ctx", "hl_params", "hl_conn")}
-        self._last_l2 = 0.0
+        self._last_l2: dict[str, float] = {}
         self._last_ctx: dict[str, float] = {}
         self.last_msg_at = 0.0
 
@@ -38,7 +39,7 @@ class Collector:
             try:
                 async with websockets.connect(WS_URL, ping_interval=None, max_size=2**23) as ws:
                     self.w["hl_conn"].add("ws", "connect", {"url": WS_URL})
-                    subs = [{"type": "l2Book", "coin": self.coin}, {"type": "trades", "coin": self.coin}]
+                    subs = [{"type": t, "coin": c} for c in self.insts for t in ("l2Book", "trades")]
                     subs += [{"type": "activeAssetCtx", "coin": c} for c in self.coins]
                     for sub in subs:
                         await ws.send(json.dumps({"method": "subscribe", "subscription": sub}))
@@ -70,11 +71,14 @@ class Collector:
         ch = j.get("channel")
         t = time.time()
         if ch == "l2Book":
-            if t - self._last_l2 >= self.l2_every:
-                self._last_l2 = t
-                self.w["hl_book"].add("ws", j["data"].get("coin", ""), msg, r)
+            coin = j["data"].get("coin", "")
+            if t - self._last_l2.get(coin, 0) >= self.l2_every:
+                self._last_l2[coin] = t
+                self.w["hl_book"].add("ws", coin, msg, r)
         elif ch == "trades":
-            self.w["hl_trades"].add("ws", self.coin, msg, r)
+            data = j.get("data") or []
+            coin = data[0].get("coin", self.coin) if data else self.coin
+            self.w["hl_trades"].add("ws", coin, msg, r)
         elif ch == "activeAssetCtx":
             coin = j["data"].get("coin", "")
             if t - self._last_ctx.get(coin, 0) >= self.ctx_every:
@@ -84,23 +88,29 @@ class Collector:
     # ---------- REST parameter snapshots ----------
     async def run_params(self):
         every = self.s["collect"]["params_every_sec"]
-        dex = self.coin.split(":")[0] if ":" in self.coin else ""
         async with httpx.AsyncClient(timeout=30) as cli:
             while True:
                 try:
-                    meta = (await cli.post(INFO_URL, json={"type": "metaAndAssetCtxs", "dex": dex})).json()
-                    uni, ctx = meta[0]["universe"], meta[1]
-                    i = next(k for k, u in enumerate(uni) if u["name"] == self.coin)
                     dexs = (await cli.post(INFO_URL, json={"type": "perpDexs"})).json()
-                    d = next((x for x in dexs if x and x.get("name") == dex), {})
-                    snap = {
-                        "asset_meta": uni[i], "asset_ctx": ctx[i],
-                        "dex": {k: d.get(k) for k in ("name", "deployer", "oracleUpdater", "feeRecipient")},
-                        "funding_multiplier": dict(d.get("assetToFundingMultiplier") or []).get(self.coin),
-                        "funding_rate": dict(d.get("assetToFundingInterestRate") or []).get(self.coin),
-                        "oi_cap": dict(d.get("assetToStreamingOiCap") or []).get(self.coin),
-                    }
-                    self.w["hl_params"].add("rest", self.coin, snap)
+                    metas: dict[str, list] = {}
+                    for coin in self.insts:
+                        dex = coin.split(":")[0] if ":" in coin else ""
+                        if dex not in metas:
+                            metas[dex] = (await cli.post(INFO_URL, json={"type": "metaAndAssetCtxs", "dex": dex})).json()
+                        uni, ctx = metas[dex][0]["universe"], metas[dex][1]
+                        i = next((k for k, u in enumerate(uni) if u["name"] == coin), None)
+                        if i is None:
+                            log.warning("instrument %s not listed", coin)
+                            continue
+                        d = next((x for x in dexs if x and x.get("name") == dex), {})
+                        snap = {
+                            "asset_meta": uni[i], "asset_ctx": ctx[i],
+                            "dex": {k: d.get(k) for k in ("name", "deployer", "oracleUpdater", "feeRecipient")},
+                            "funding_multiplier": dict(d.get("assetToFundingMultiplier") or []).get(coin),
+                            "funding_rate": dict(d.get("assetToFundingInterestRate") or []).get(coin),
+                            "oi_cap": dict(d.get("assetToStreamingOiCap") or []).get(coin),
+                        }
+                        self.w["hl_params"].add("rest", coin, snap)
                 except Exception as e:  # noqa: BLE001
                     log.warning("params error: %s", e)
                 await asyncio.sleep(every)

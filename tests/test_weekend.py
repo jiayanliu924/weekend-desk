@@ -108,7 +108,7 @@ def test_full_weekend_news(s):
     assert out["ok"] and abs(out["y_bps"] - 90) < 0.5
     assert out["err_B_bps"] < out["err_A_bps"]
     path = jobs.job_report(s, w)
-    assert "本周实验日志" in path.read_text()
+    assert "本周各合约" in path.read_text()
 
 
 def test_quiet_weekend_fade(s):
@@ -157,7 +157,7 @@ def test_lock_is_written_once(s):
 def test_linear_model_after_min_train(s):
     hist = [{"dev_bps": d, "news_weekend": n, "y_bps": d * (0.9 if n else 0.3)}
             for d, n in [(50, False), (-40, True), (30, False), (80, True), (-20, False), (60, False),
-                         (-70, True), (25, False), (45, True), (-35, False), (15, False), (90, True)]]
+                         (-70, True), (25, False), (45, True), (-35, False), (15, False), (90, True)] * 2]
     p = model.predict({"dev_bps": 100, "news_weekend": False}, hist, s)
     assert p["model_version"].startswith("ols") and abs(p["pred_bps"] - 30) < 1e-6
 

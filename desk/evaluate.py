@@ -9,7 +9,7 @@ from .features import first_ctx_after
 
 
 def outcome(settings, w: Weekend, lock: dict) -> dict:
-    coin = settings.instrument
+    coin = w.coin or settings.instrument
     grace = settings["clock"]["reopen_grace_sec"]
     first = first_ctx_after(settings, coin, to_ns(w.resume) + int(grace * 1e9))
     if not first:
@@ -49,7 +49,7 @@ def official(rec: dict, cfg) -> bool:
         return False
     if not lock.get("features", {}).get("ok") or not out.get("ok"):
         return False
-    return date.fromisoformat(rec["weekend"]) > date.fromisoformat(cfg["llm"]["knowledge_cutoff"])
+    return date.fromisoformat(rec["weekend"][:10]) > date.fromisoformat(cfg["llm"]["knowledge_cutoff"])
 
 
 def _t_one_sided(diffs: list[float]) -> tuple[float, float]:
@@ -98,3 +98,14 @@ def scorecard(records: list[dict], cfg) -> dict:
     else:
         res["verdict"] = f"还差 {need - n} 个正式周末才有资格判断 H1；之前的任何结果都只算'值得继续看'"
     return res
+
+
+def scorecard_by_coin(records: list[dict], cfg) -> dict[str, dict]:
+    """每个合约一张成绩单。"""
+    from .clock import name_of
+    groups: dict[str, list] = {}
+    default = cfg.instruments[0]["name"]
+    for r in records:
+        groups.setdefault(name_of(r["weekend"], default), []).append(r)
+    order = [i["name"] for i in cfg.instruments]
+    return {k: scorecard(groups[k], cfg) for k in sorted(groups, key=lambda k: order.index(k) if k in order else 99)}
