@@ -152,15 +152,15 @@ class AnthropicLLM:
         self.client = anthropic.Anthropic()
         self.fallback = {}
 
-    def __call__(self, model, system, user):
+    def __call__(self, model, system, user, max_tokens: int = 3200):
         import anthropic
         m = self.fallback.get(model, model)
         try:
-            r = self.client.messages.create(model=m, max_tokens=3200, system=system,
+            r = self.client.messages.create(model=m, max_tokens=max_tokens, system=system,
                                             messages=[{"role": "user", "content": user}])
         except anthropic.NotFoundError:
             self.fallback[model] = "claude-haiku-4-5-20251001"
-            return self(model, system, user)
+            return self(model, system, user, max_tokens)
         text = "".join(b.text for b in r.content if getattr(b, "type", "") == "text")
         return text, r.usage.input_tokens, r.usage.output_tokens
 
@@ -813,13 +813,15 @@ def plain_summary(settings, rec: dict, llm=None) -> dict:
             f"{json.dumps(rooms, ensure_ascii=False)}\n室的代号：" + "，".join(f"{r['key']}={r['name']}" for r in ROOMS))
     model = cfg(settings)["lead_model"]
     try:
-        text, tin, tout = llm(model, PLAIN_PROMPT, user)
+        text, tin, tout = (llm(model, PLAIN_PROMPT, user, max_tokens=8000) if isinstance(llm, AnthropicLLM)
+                           else llm(model, PLAIN_PROMPT, user))
         _record_spend(settings, rec.get("run_id", ""), model, tin, tout)
         out = parse_json(text)
     except Exception as e:  # noqa: BLE001
         log.warning("plain summary: %s", e)
         return fallback
-    if not out.get("overview"):
+    if not out.get("overview") or out.get("parse_error"):
+        log.warning("plain summary unusable (truncated?): %s", text[-200:])
         return fallback
     rec["plain_summary"] = out
     p = _dir(settings) / "runs" / f"{rec['run_id']}.json"
