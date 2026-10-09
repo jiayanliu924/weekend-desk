@@ -196,7 +196,7 @@ canvas{max-width:100%}
 """
 
 TABS = [("/", "概览"), ("/agents", "Agent 讨论室"), ("/day", "每日记录"), ("/weekends", "周末预测"), ("/options", "期权研究"),
-        ("/money", "放真钱会怎样"), ("/history", "历史回测"), ("/guide", "这是什么"), ("/settings", "设置")]
+        ("/money", "放真钱会怎样"), ("/history", "历史回测"), ("/guide", "这是什么"), ("/qa", "测试"), ("/settings", "设置")]
 
 
 def page(req: Request, active: str, title: str, body: str, head: str = "") -> HTMLResponse:
@@ -1129,6 +1129,88 @@ def settings_key(req: Request, key: str = Form(...)):
         else:
             msg = "没保存：" + msg
     return RedirectResponse("/settings?" + urlencode({"msg": msg}), status_code=303)
+
+
+@app.get("/qa", response_class=HTMLResponse)
+def qa_page(req: Request, run: str | None = None):
+    if (r := _guard(req)):
+        return r
+    from . import qa
+    rec = qa.load(S, run)
+    runs = qa.list_runs(S, 12)
+    _last_qa = globals().setdefault("_LAST_QA", [0.0])
+    msg = req.query_params.get("msg", "")
+    head = ""
+    body = f"""<h1>测试与安全自检</h1>
+<p class="sub">四个 AI 测试员定期给整个网站做体检，只测本站自己：界面流程、普通用户走一遍每个功能、红队技术攻击（越权/泄密/注入/暴力破解）、红队社工（文案会不会被钓鱼、会不会教坏习惯）。真正的判断由代码跑真实请求得出，AI 负责解读和补测试点。不碰真钱、不改规则。</p>
+<div class="actions" style="margin:12px 0">
+<form method="post" action="/qa/run" style="margin:0"><button type="submit">现在体检一次</button></form>
+<span class="ev">约 1 分钟{'，带 AI 点评约 $0.1' if os.environ.get('ANTHROPIC_API_KEY') else '（没填 key 时只跑代码测试）'}</span></div>
+{('<p class="note">' + E(msg) + '</p>') if msg else ''}"""
+    if not rec:
+        return page(req, "/qa", "测试", body + '<p class="note">还没体检过。点"现在体检一次"。</p>')
+    n, nf = rec["n"], rec["n_fail"]
+    nhigh = sum(1 for c in rec["checks"] if not c["ok"] and c["severity"] == "高")
+    body += f"""<div class="grid">
+<div class="card"><div class="k">总检查项</div><div class="v">{n}</div><div class="ev">{E(rec['run_id'][5:10] + ' ' + rec['run_id'][11:13] + ':' + rec['run_id'][13:15])} · {rec.get('secs', 0)} 秒</div></div>
+<div class="card"><div class="k">通过</div><div class="v good">{n - nf}</div></div>
+<div class="card"><div class="k">未通过</div><div class="v {'bad' if nf else 'good'}">{nf}</div>{'<div class="ev bad">其中高危 ' + str(nhigh) + ' 个</div>' if nf else ''}</div>
+<div class="card"><div class="k">导出</div><div style="margin-top:6px"><a class="btn ghost" href="/qa/{E(rec['run_id'])}.pdf">体检报告 PDF</a></div></div>
+</div>"""
+    rv = rec.get("review", {})
+    if rv:
+        body += '<h2>AI 测试员结论</h2><div class="grid">'
+        for a in qa.AGENTS:
+            r_ = rv.get(a["id"], {})
+            fnd = r_.get("findings") or []
+            body += (f'<div class="card"><div class="k">{E(a["name"])}</div><div class="v s">{E(str(r_.get("verdict", "")))}</div>'
+                     + ("".join(f'<div class="ev"><b>{E(str(f.get("severity")))}</b> {E(str(f.get("what")))} → {E(str(f.get("fix")))}</div>' for f in fnd[:4]) if fnd else '<div class="ev good">没发现问题</div>')
+                     + '</div>')
+        body += '</div>'
+    # 分区列出
+    areas = {}
+    for c in rec["checks"]:
+        areas.setdefault(c["area"], []).append(c)
+    body += '<h2>逐项结果</h2>'
+    for area, cs in areas.items():
+        rows = "".join(f'<tr><td>{"✅" if c["ok"] else "❌"}</td><td>{E(c["name"])}</td>'
+                       f'<td class="ev">{E(c["detail"])}{(" · <b class=bad>" + E(c["severity"]) + "危</b>") if not c["ok"] and c["severity"] else ""}</td></tr>' for c in cs)
+        body += f'<h3 style="margin:16px 0 6px">{E(area)}（{sum(1 for c in cs if c["ok"])}/{len(cs)}）</h3><div class="tw"><table>{rows}</table></div>'
+    body += f'<div class="daynav" style="margin-top:16px"><span class="k">历次：</span>{"".join(f"<a class=tag href=/qa?run={E(p.stem)}>{E(p.stem[5:10] + chr(32) + p.stem[11:13] + chr(58) + p.stem[13:15])}</a>" for p in runs)}</div>'
+    return page(req, "/qa", "测试", body, head)
+
+
+_last_qa_run = [0.0]
+
+
+@app.post("/qa/run")
+def qa_run(req: Request):
+    if (r := _guard(req)):
+        return r
+    origin = req.headers.get("origin")
+    if origin and req.headers.get("host") and origin.split("//")[-1] != req.headers["host"]:
+        return Response("bad origin", status_code=403)
+    import threading
+    if time.time() - _last_qa_run[0] < 60:
+        msg = "刚体检过，一分钟后再来"
+    else:
+        _last_qa_run[0] = time.time()
+        from . import qa
+        threading.Thread(target=qa.run, args=(S,), daemon=True).start()
+        msg = "已开始体检，约 1 分钟后刷新查看。"
+    return RedirectResponse("/qa?" + urlencode({"msg": msg}), status_code=303)
+
+
+@app.get("/qa/{rid}.pdf")
+def qa_pdf(req: Request, rid: str):
+    if (r := _guard(req)):
+        return r
+    from . import qa
+    rec = qa.load(S, rid)
+    if not rec:
+        return Response("没有这次体检", status_code=404)
+    data = pdfreport.qa_pdf(S, rec)
+    return Response(data, media_type="application/pdf", headers={"Content-Disposition": f'attachment; filename="qa-{rid}.pdf"'})
 
 
 @app.get("/report.pdf")

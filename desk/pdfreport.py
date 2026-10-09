@@ -179,6 +179,37 @@ def _box(text, style=None):
     return t
 
 
+def qa_pdf(settings, rec: dict) -> bytes:
+    """网站体检报告 PDF。"""
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=16 * mm, rightMargin=16 * mm, topMargin=14 * mm, bottomMargin=14 * mm,
+                            title="Weekend Desk 体检报告")
+    cell = ParagraphStyle("c", parent=SMALL, textColor=colors.black)
+    n, nf = rec["n"], rec["n_fail"]
+    s = [Paragraph("Weekend Desk 体检报告", H1),
+         Paragraph(f"{_x(rec['run_id'])} · 共 {n} 项，通过 {n - nf}，未通过 {nf} · 只测本站自己，不碰真钱", SMALL)]
+    rv = rec.get("review", {})
+    if rv:
+        s.append(Paragraph("AI 测试员结论", H2))
+        for a in rec.get("agents_meta", []):
+            r_ = rv.get(a["id"], {})
+            s.append(Paragraph(f"<b>{_x(a['name'])}</b>：{_x(r_.get('verdict'))}", P))
+            for f in r_.get("findings") or []:
+                s.append(Paragraph(f"　· [{_x(f.get('severity'))}] {_x(f.get('what'))} → {_x(f.get('fix'))}", SMALL))
+    areas = {}
+    for c in rec["checks"]:
+        areas.setdefault(c["area"], []).append(c)
+    for area, cs in areas.items():
+        s.append(Paragraph(f"{_x(area)}（{sum(1 for c in cs if c['ok'])}/{len(cs)}）", H2))
+        rows = [["", "检查项", "说明"]]
+        for c in cs:
+            rows.append(["通过" if c["ok"] else "未过", Paragraph(_x(c["name"]), cell),
+                         Paragraph(_x(c["detail"]) + ("" if c["ok"] else f"（{_x(c['severity'])}危）"), cell)])
+        s.append(_table(rows, [14 * mm, 70 * mm, 94 * mm]))
+    doc.build(s)
+    return buf.getvalue()
+
+
 def meeting_pdf(settings, rec: dict) -> bytes:
     """一次 Agent 会议的大白话纪要：前面是看得懂的总结，最后附原始记录。"""
     from reportlab.platypus import PageBreak

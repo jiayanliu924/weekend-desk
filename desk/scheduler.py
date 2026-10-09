@@ -62,6 +62,8 @@ def due_jobs(now: datetime, settings, done: set) -> list[tuple[str, object]]:
     if now.hour == 0 and now.minute >= 10 and f"integrity:{day}" not in done:
         out.append((f"integrity:{day}", None))
     pt = now.astimezone(PT)
+    if pt.weekday() == 0 and pt.hour == 5 and f"qa:{pt.date()}" not in done:   # 周一早 5 点自动体检
+        out.append((f"qa:{pt.date()}", None))
     h = settings["notify"].get("daily_pdf_hour_pt", 7)
     if h <= pt.hour < h + 4 and f"dailypdf:{pt.date()}" not in done:
         out.append((f"dailypdf:{pt.date()}", None))
@@ -93,6 +95,9 @@ def run_job(key: str, wk, settings):
         return integrity(settings)
     if key.startswith("dailypdf"):
         return jobs.job_daily_pdf(settings)
+    if key.startswith("qa:"):
+        from . import qa
+        return qa.run(settings)
 
 
 def integrity(settings) -> None:

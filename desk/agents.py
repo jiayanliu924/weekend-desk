@@ -656,9 +656,9 @@ def _run(settings, reason, llm, now, push) -> dict:
                 m = Meeting(settings, m.llm, rid, reason)        # 名单变了，重新载入
             rec["roster"] = m.roster
             with ThreadPoolExecutor(max_workers=c["max_parallel"]) as pool:
-                set_state(settings, running=True, stage="期权 / 方法 / 选品种 / 交易 / 算法 五个室讨论中", run=rid)
+                set_state(settings, running=True, stage="期权 / 方法 / 选品种 / 交易 / 算法 / 测试 六个室讨论中", run=rid)
                 first = ["options", "js", "niche", "trading", "algo"]
-                with ThreadPoolExecutor(max_workers=5) as outer:
+                with ThreadPoolExecutor(max_workers=6) as outer:
                     res = list(outer.map(lambda r: m.algo_room(facts, pool=pool) if r == "algo" else m.room(r, facts, pool=pool), first))
                 algo = next(r for r in res if r["room"] == "algo")
                 for line in algo.get("backtests", []):
