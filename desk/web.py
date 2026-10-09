@@ -1099,8 +1099,8 @@ def settings_live(req: Request, mode: str = Form("off"), capital: float = Form(2
         mode = "off"
     if mode == "live" and not ack:
         msg = "没保存：选真下单要先勾选「我知道会用真钱」那一项。"
-    elif mode != "off" and not (autotrade.valid_address(a) and autotrade.valid_key(k)):
-        msg = "没保存：先完成第一步，连接 Hyperliquid 账户。"
+    elif mode == "live" and not (autotrade.valid_address(a) and autotrade.valid_key(k)):
+        msg = "没保存：真下单要先完成第一步、连接 Hyperliquid 账户。演习模式不用连也能开。"
     else:
         autotrade.put(S, mode=mode, capital_usd=capital, max_loss_usd=max_loss, updated_by=_user(req) or "")
         msg = {"off": "已关闭自动下单。", "shadow": f"已切到演习：本周末会推送本来会下的单（本金 ${capital:.0f}），不真下。",

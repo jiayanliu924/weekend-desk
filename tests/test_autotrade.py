@@ -119,7 +119,8 @@ def test_settings_pages(env, fake, monkeypatch):  # noqa: F811
     c = TestClient(web.app)
     c.post("/login", data={"username": "kea", "password": "correct horse battery"})
     assert "自动下单（真钱）" in c.get("/settings").text
-    assert "先完成第一步" in c.post("/settings/live", data={"mode": "shadow", "capital": 200, "max_loss": 50}).text
+    r0 = c.post("/settings/live", data={"mode": "shadow", "capital": 200, "max_loss": 50})
+    assert "已切到演习" in r0.text and autotrade.get(s)["mode"] == "shadow"      # 演习不用连钱包
     assert "42 位" in c.post("/settings/wallet", data={"address": "0x123", "key": ""}).text
     r = c.post("/settings/wallet", data={"address": "0x" + "a" * 40, "key": "0x" + "b" * 64})
     assert "已保存并连上" in r.text and "$250.00" in r.text
