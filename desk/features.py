@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import math
 
-from . import rawstore
+from . import mark, rawstore
 from .clock import Weekend, to_ns
 from .extract import load_events
 
@@ -74,9 +74,18 @@ def build(settings, w: Weekend) -> dict:
 
     fri_px = float(fri[1]["oraclePx"])
     dec_mid = float(dec[1].get("midPx") or dec[1]["markPx"])
+    dec_mark = float(dec[1]["markPx"])
     f.update(fri_close=fri_px, fri_close_received_at=fri[0], dec_mid=dec_mid, dec_oracle=float(dec[1]["oraclePx"]),
-             dec_mark=float(dec[1]["markPx"]), dec_received_at=dec[0])
+             dec_mark=dec_mark, dec_received_at=dec[0])
     f["dev_bps"] = (dec_mid / fri_px - 1) * 1e4
+    # 稳健偏离 + 插针检测（借鉴竞品 Meridian Mark 的"去插针"思路；见 desk/mark.py）
+    dislocation = settings["risk"].get("dislocation_bps", 25.0)
+    ds = mark.deviation_set(fri_px, dec_mid, dec_mark, f["dec_oracle"], dislocation)
+    f.update(dev_mid_bps=ds["dev_mid_bps"], dev_mark_bps=ds["dev_mark_bps"],
+             fair_dev_bps=ds["fair_dev_bps"], mid_mark_gap_bps=ds["mid_mark_gap_bps"],
+             dislocated=ds["dislocated"])
+    # 持仓时长（决策 → 重开），资金费率 carry 要用
+    f["hold_hours"] = max(0.0, (to_ns(w.resume) - dec_ns) / 3600e9)
 
     # weekend path: deviation persistence, funding, gaps
     path = _ctx(settings, coin, close_ns, dec_ns)
@@ -85,7 +94,10 @@ def build(settings, w: Weekend) -> dict:
         far = sum(1 for _, d in devs if abs(d) * 1e4 > 10)
         f["dev_persist_frac"] = far / len(devs)
         f["max_abs_dev_bps"] = max(abs(d) for _, d in devs) * 1e4
+        f["wick_ratio"] = mark.wick_ratio([d * 1e4 for _, d in devs])
         f["funding_avg"] = sum(float(c["funding"]) for _, c in path) / len(path)
+        f["funding_annualized_pct"] = mark.annualized_funding_pct(f["funding_avg"])
+        f["funding_abs_max"] = max(abs(float(c["funding"])) for _, c in path)
         oi0, oi1 = float(path[0][1]["openInterest"]), float(path[-1][1]["openInterest"])
         f["oi_change_pct"] = (oi1 / oi0 - 1) * 100 if oi0 else 0.0
         gaps = [(b - a) / 60e9 for (a, _), (b, _) in zip(path, path[1:])]

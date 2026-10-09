@@ -150,6 +150,74 @@ def realized_total(settings) -> float:
     return sum(r.get("pnl_usd", 0) or 0 for r in _led(settings).all() if r["kind"] == "exit")
 
 
+def _live_preflight(settings, cfg, c) -> str | None:
+    """真下单前的安全检查。返回 None 表示通过，否则返回不通过的原因（会被记进账、推送给你）。
+
+    - 交易账户余额不能低于下限（不往没钱/几乎没钱的账户里下单）。
+    - 真实环境额外校验：API 私钥推导出的地址必须 ≠ 主钱包地址——相等说明你把主钱包私钥粘错进来了
+      （主钱包私钥能提币，绝不能交给服务器）。演习/测试用注入的假客户端时跳过这项。
+    """
+    floor = cfg.get("min_balance_usd", 5.0)
+    try:
+        bal = c.balance().get("xyz", 0) or 0
+    except Exception:  # noqa: BLE001
+        bal = None
+    if bal is not None and bal < floor:
+        return f"交易账户余额 ${bal:.2f} 低于下限 ${floor:.2f}，不下单"
+    if not _client_factory:   # 只有真实钱包才校验
+        main, key = creds()
+        try:
+            from eth_account import Account
+            derived = Account.from_key(key).address.lower()
+        except Exception:  # noqa: BLE001
+            return None
+        if main and derived == main.lower():
+            return "你填的私钥是主钱包的（能提币），不是只能交易的 API 钱包。请换成 Hyperliquid 生成的 API 钱包私钥。"
+    return None
+
+
+def kill_check(settings, c=None) -> dict | None:
+    """看门狗：把"已实现 + 当前未实现"的真实盈亏加起来，超过上限就全部市价平掉并切回 off。
+
+    原来的上限只看已平仓的单，且只在下单那一刻检查一次——一个还开着的亏损仓位它看不见。
+    这个函数应在重开后、正式平仓前被调度器定期调用。
+    """
+    cfg = get(settings)
+    if cfg["mode"] != "live":
+        return None
+    led = _led(settings)
+    open_coins = []
+    for r in led.all():
+        if r["kind"] == "entry" and r.get("sent") and not any(
+                x["kind"] == "exit" and x["weekend"] == r["weekend"] for x in led.all()):
+            open_coins.append((r["weekend"], r["coin"], r["name"]))
+    try:
+        c = c or client()
+        unreal = 0.0
+        for _, coin, _ in open_coins:
+            st = c.info.user_state(c.address, dex=DEX) if hasattr(c, "info") else {}
+            for p in st.get("assetPositions", []):
+                pos = p.get("position", {})
+                if pos.get("coin") == coin:
+                    unreal += float(pos.get("unrealizedPnl", 0) or 0)
+    except Exception:  # noqa: BLE001
+        return None
+    total = realized_total(settings) + unreal
+    if total <= -cfg["max_loss_usd"] and open_coins:
+        closed = []
+        for _, coin, nm in open_coins:
+            try:
+                c.close(coin)
+                closed.append(nm)
+            except Exception:  # noqa: BLE001
+                pass
+        put(settings, mode="off")
+        notify.push(settings, "看门狗已紧急平仓并关闭自动下单",
+                    f"已实现+未实现合计 ${total:.2f}，超过上限 ${cfg['max_loss_usd']:.0f}。已平：{'、'.join(closed)}", priority="max")
+        return {"killed": True, "total_usd": total, "closed": closed}
+    return {"killed": False, "total_usd": total}
+
+
 def _vetoed(settings, name: str) -> str | None:
     """风控 agent 最近 24 小时的否决。"""
     try:
@@ -180,6 +248,8 @@ def entry(settings, w, lock: dict | None) -> dict | None:
         return led.append("entry", w.wid, {**base, "skipped": "本周规则作废：" + "；".join(lock.get("void_reasons", []))})
     if not a.get("side"):
         return led.append("entry", w.wid, {**base, "skipped": a.get("reason", "规则说不出手")})
+    if lock.get("features", {}).get("dislocated"):
+        return led.append("entry", w.wid, {**base, "skipped": "中间价和标记价脱节（疑似插针），本周不下单（防被冤枉爆仓）"})
     veto = _vetoed(settings, name)
     if veto:
         return led.append("entry", w.wid, {**base, "skipped": f"风控否决：{veto}"})
@@ -188,12 +258,20 @@ def entry(settings, w, lock: dict | None) -> dict | None:
         put(settings, mode="off")
         notify.push(settings, "自动下单已停止", f"累计真实亏损 ${-lost:.2f}，超过上限 ${cfg['max_loss_usd']:.0f}", priority="high")
         return led.append("entry", w.wid, {**base, "skipped": "累计亏损超过上限，已自动关闭"})
+    risk = settings["risk"]
     n = max(1, len(settings.instruments))
     notional = cfg["capital_usd"] / n
+    # 回撤自动缩仓：累计真实亏损越多，下得越小（竞品"资本减少时自动收缩风险"的小 bot 版）
+    dd_factor = max(0.25, 1.0 + 2.0 * min(0.0, lost) / max(1.0, cfg["capital_usd"]))
+    notional *= dd_factor
     feats = lock.get("features", {})
+    # 联合压测：7 个合约可能被同一个周一宏观事件同时推同向，按完全相关给整组一个首损预算，均摊到每个合约
+    worst = feats.get("max_abs_dev_bps") or risk.get("worst_adverse_bps", 500.0)
+    joint_cap = risk.get("joint_first_loss_frac", 0.25) * cfg["capital_usd"] / n / (worst / 1e4)
+    notional = min(notional, joint_cap)
     depth = min([d for d in (feats.get("bid_depth_usd"), feats.get("ask_depth_usd")) if d] or [0])
     if depth:
-        notional = min(notional, depth * settings["risk"]["max_depth_fraction"])
+        notional = min(notional, depth * risk["max_depth_fraction"])
     is_buy = a["side"] > 0
     px_raw = feats.get("best_bid" if is_buy else "best_ask") or a.get("entry_px") or feats.get("dec_mid")
     plan = {**base, "side": "买" if is_buy else "卖", "notional_usd": round(notional, 2), "px": px_raw,
@@ -204,6 +282,11 @@ def entry(settings, w, lock: dict | None) -> dict | None:
         return rec
     try:
         c = client()
+        # 下单前安全检查
+        pf = _live_preflight(settings, cfg, c)
+        if pf:
+            notify.push(settings, f"自动下单未通过安全检查：{name}", pf, priority="high")
+            return led.append("entry", w.wid, {**plan, "sent": False, "skipped": pf})
         dec = c.sz_decimals(coin)
         px = round_px(float(px_raw), dec)
         sz = round_sz(notional / px, dec)

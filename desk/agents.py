@@ -359,7 +359,14 @@ def build_bundle(settings, now: datetime | None = None) -> Facts:
                 if line.startswith("- "):
                     F.add("Jane Street 公开情报", line[2:].strip())
 
-    for name, fn in (("Jane Street 情报", intel), ("行情", prices), ("历史回测", history), ("实时成绩", live), ("期权", opts), ("新闻", news), ("数据健康", health)):
+    def competitor():
+        p = Path(settings.root) / "knowledge" / "competitor_meridian_keel.md"
+        if p.exists():
+            for line in p.read_text().splitlines():
+                if line.startswith("- "):
+                    F.add("竞品情报（Meridian/Keel）", line[2:].strip())
+
+    for name, fn in (("Jane Street 情报", intel), ("竞品情报", competitor), ("行情", prices), ("历史回测", history), ("实时成绩", live), ("期权", opts), ("新闻", news), ("数据健康", health)):
         safe(name, fn)
     return F
 

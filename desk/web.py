@@ -525,8 +525,15 @@ def day_view(req: Request, d: str | None = None, coin: str | None = None):
         for r in rows:
             if kind == "x" and r["kind"] == "lock":
                 f, pr, ac = r["features"], r["prediction"], r["action"]
+                extra = ""
+                if f.get("dislocated"):
+                    extra += "；⚠ 中间价与标记价脱节（疑似插针），本周不出手"
+                elif f.get("mid_mark_gap_bps") is not None:
+                    extra += f"；中间价对标记价 {_n(f.get('mid_mark_gap_bps'), sign=True)} bps"
+                if f.get("funding_annualized_pct") is not None:
+                    extra += f"；资金费率年化 {_n(f.get('funding_annualized_pct'), 1)}%"
                 txt = (f"锁定 {r.get('name') or name_of(r['weekend'], 'XYZ100')}（周末 {friday_of(r['weekend'])}）：链上偏离 {_n(f.get('dev_bps'))} bps，实质新闻 {f.get('n_mat2', '—')} 条 → "
-                       f"{'信息周末' if f.get('news_weekend') else '噪音周末'}；预测开盘相对周五 {_n(pr.get('pred_bps'))} bps；{ac.get('reason', '')}")
+                       f"{'信息周末' if f.get('news_weekend') else '噪音周末'}；预测开盘相对周五 {_n(pr.get('pred_bps'))} bps；{ac.get('reason', '')}{extra}")
             elif kind == "x":
                 txt = (f"结果 {name_of(r['weekend'], 'XYZ100')}（周末 {friday_of(r['weekend'])}）：实际 {_n(r.get('y_bps'))} bps；误差 模型 {_n(r.get('err_model_bps'))} / "
                        f"猜周五 {_n(r.get('err_A_bps'))} / 猜链上 {_n(r.get('err_B_bps'))}；模拟盈亏 ${_n(r.get('pnl_net_usd'), 2, sign=True)}")
@@ -585,8 +592,14 @@ def weekends(req: Request, coin: str | None = None):
 <td>{ {1: '买', -1: '卖', 0: '不出手'}[a.get('side', 0)] }</td><td class="{_cls(o.get('pnl_net_usd'))}">{_n(o.get('pnl_net_usd'), 2, sign=True)}</td>
 <td>{'作废：' + E('；'.join(x['lock'].get('void_reasons', []))) if x['lock'].get('void') else ''}</td></tr>""")
     card = evaluate.scorecard(led.completed(), S)
+    honest = ""
+    if card.get("n_official"):
+        honest = (f'<div class="note">诚实口径：{card.get("n_weekends", 0)} 个日历周末（{card["n_official"]} 条记录）。'
+                  f'模拟净盈亏 ${_n(card.get("pnl_net_usd_total"), 2, sign=True)}（打折手续费）；'
+                  f'按"不打折"的全额手续费重算是 ${_n(card.get("pnl_net_fullfee_usd_total"), 2, sign=True)}——'
+                  f'growthMode 的约九折是会消失的补贴，要看全额这一栏。</div>')
     body = f"""<h1>周末预测</h1><p class="sub">每行一个周末。bps 是万分之一（100 bps = 1%）。"误差"三列：我们的模型 / 永远猜周五收盘价 / 永远猜周日链上价，越小越准。</p>
-<div class="note">{E(card.get('verdict', '还没有完成的周末。'))}</div>
+<div class="note">{E(card.get('verdict', '还没有完成的周末。'))}</div>{honest}
 <div class="daynav"><a class="btn {'ghost' if coin else ''}" href="/weekends">全部</a>{''.join(f'<a class="btn {"" if coin == i["name"] else "ghost"}" href="/weekends?coin={i["name"]}">{E(i["name"])}</a>' for i in S.instruments)}</div>
 <div class="tw" style="margin-top:10px"><table><tr><th>周末（周五）</th><th>合约</th><th>关门价</th><th>链上偏离</th><th>实质新闻 → 判断</th><th>预测开盘</th><th>实际开盘</th><th>误差 模型/周五/链上</th><th>动作</th><th>模拟盈亏 $</th><th>备注</th></tr>
 {''.join(rows) or '<tr><td colspan=11 class="mut">第一个周末（10/9–10/11）完成后这里会出现 7 行，每个合约一行。上线前的历史见"历史回测"。</td></tr>'}</table></div>"""

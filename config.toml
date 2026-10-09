@@ -142,6 +142,20 @@ max_depth_fraction = 0.10
 rolling_weeks = 8
 rolling_loss_limit = 0.15
 eval_after_weekends = 30
+# ↓ 借鉴竞品 Meridian/Keel 文档后新增（见 desk/mark.py、desk/model.py）
+# 插针检测：中间价相对标记价偏离超过这么多 bps，判为盘口脱节，本周不出手（防 SK 海力士式被冤枉爆仓）
+dislocation_bps = 25.0
+# 插针比阈值：周末"最极端一刻 / 典型值"超过这个倍数，也判为瞬时插针，不出手
+wick_ratio_veto = 6.0
+# 首损上限：一笔最坏不良波动最多亏本金的这个比例（竞品"首损 ≤ 可吸收资本 25%"的小 bot 版，取更保守的 2%）
+first_loss_frac = 0.02
+# 估一笔最坏不良波动的下限（bps）；波动大的合约会用它实际见过的更大值
+worst_adverse_bps = 500.0
+# 信心仓位缩放区间：信号远超门槛时最多放大到 2 倍，勉强过线时缩到 0.5 倍
+conf_min = 0.5
+conf_max = 2.0
+# 7 个合约可能被同一个周一宏观事件同时推同向；联合压测把它们当完全相关，总首损不超过本金这个比例
+joint_first_loss_frac = 0.25
 
 [live]
 # 7.7 第 9–12 周的极小资金实盘。按备忘第八章：实盘前须律师书面确认主体与账户结构。

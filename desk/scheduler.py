@@ -39,6 +39,11 @@ def due_jobs(now: datetime, settings, done: set) -> list[tuple[str, object]]:
                 out.append((k("live_entry"), wk))
             if wk.resume - timedelta(minutes=1) <= now < wk.exit and k("live_cancel") not in done:
                 out.append((k("live_cancel"), wk))
+            # 看门狗：重开到正式平仓之间，每分钟看一次"已实现+未实现"是否破上限（防重开瞬间跳空）
+            if wk.resume <= now < wk.exit:
+                slot = int((now - wk.resume).total_seconds() // 60)
+                if k(f"live_guard{slot}") not in done:
+                    out.append((k(f"live_guard{slot}"), wk))
             if wk.exit <= now < wk.exit + timedelta(hours=6) and k("live_exit") not in done:
                 out.append((k("live_exit"), wk))
     for fri, wks in by_friday.items():
@@ -83,6 +88,8 @@ def run_job(key: str, wk, settings):
     if name.startswith("live_"):
         from . import autotrade
         from .ledger import Ledger
+        if name.startswith("live_guard"):
+            return autotrade.kill_check(settings)
         if name == "live_entry":
             return autotrade.entry(settings, wk, Ledger(settings.data).weekend(wk.wid).get("lock"))
         if name == "live_cancel":

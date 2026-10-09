@@ -33,12 +33,18 @@ def outcome(settings, w: Weekend, lock: dict) -> dict:
         taker_entry = f.get("best_ask" if side > 0 else "best_bid") or f["dec_mid"]
         gross_t = side * (exit_px / taker_entry - 1) * 1e4
         net_taker = gross_t - 2 * fees["taker_bps"]
+        # 诚实口径：按"不打折"的全额手续费再算一遍。growthMode 的约九折是冷启动补贴，会消失；
+        # 只有在全额手续费下也赚钱，才算真有边际（竞品文档也点名 growthMode 是约九折的临时补贴）。
+        full_maker, full_taker = settings["costs"]["maker_bps"], settings["costs"]["taker_bps"]
+        net_full = gross - full_maker - full_taker
         out.update(exit_px=exit_px, pnl_gross_bps=gross, pnl_net_bps=net_maker,
                    pnl_net_usd=net_maker / 1e4 * n, pnl_net_taker_bps=net_taker,
                    pnl_net_taker_usd=net_taker / 1e4 * n,
+                   pnl_net_fullfee_bps=net_full, pnl_net_fullfee_usd=net_full / 1e4 * n,
                    direction_hit=(math.copysign(1, y - dev) == side))
     else:
-        out.update(pnl_net_bps=0.0, pnl_net_usd=0.0, pnl_net_taker_usd=0.0, direction_hit=None)
+        out.update(pnl_net_bps=0.0, pnl_net_usd=0.0, pnl_net_taker_usd=0.0,
+                   pnl_net_fullfee_usd=0.0, direction_hit=None)
     return out
 
 
@@ -80,23 +86,42 @@ def scorecard(records: list[dict], cfg) -> dict:
     tA, pA = _t_one_sided([a - m for a, m in zip(ea, em)])
     tB, pB = _t_one_sided([b - m for b, m in zip(eb, em)])
     res.update(t_vs_A=tA, p_vs_A=pA, t_vs_B=tB, p_vs_B=pB)
+    # 按"日历周末"聚类再检验一次：7 个合约同一个周末高度相关，当成 7 个独立样本会把显著性灌水。
+    # 做法：同一个周末里的差值先取平均，再对"每个周末一个数"做检验，并报告有效样本数（去重后的周末数）。
+    by_wk_A: dict[str, list] = {}
+    by_wk_B: dict[str, list] = {}
+    for r, a, b, m in zip(off, ea, eb, em):
+        wk = r["weekend"][:10]
+        by_wk_A.setdefault(wk, []).append(a - m)
+        by_wk_B.setdefault(wk, []).append(b - m)
+    res["n_weekends"] = len(by_wk_A)
+    meansA = [sum(v) / len(v) for v in by_wk_A.values()]
+    meansB = [sum(v) / len(v) for v in by_wk_B.values()]
+    tAw, pAw = _t_one_sided(meansA)
+    tBw, pBw = _t_one_sided(meansB)
+    res.update(p_vs_A_weekend=pAw, p_vs_B_weekend=pBw)
     traded = [r for r in off if r["lock"]["action"]["side"]]
     res["n_traded"] = len(traded)
     res["hit_rate"] = (sum(1 for r in traded if r["outcome"].get("direction_hit")) / len(traded)) if traded else None
     res["pnl_net_usd_total"] = sum(r["outcome"].get("pnl_net_usd", 0) for r in off)
     res["pnl_net_taker_usd_total"] = sum(r["outcome"].get("pnl_net_taker_usd", 0) for r in off)
+    res["pnl_net_fullfee_usd_total"] = sum(r["outcome"].get("pnl_net_fullfee_usd", 0) for r in off)
     # 第八章止损
     rw = cfg["risk"]["rolling_weeks"]
     rolling = sum(r["outcome"].get("pnl_net_usd", 0) for r in off[-rw:])
     res["rolling_pnl_usd"] = rolling
     res["rolling_stop"] = rolling < -cfg["risk"]["rolling_loss_limit"] * cfg["risk"]["capital_usd"]
     need = cfg["risk"]["eval_after_weekends"]
-    if n >= need:
-        beats = pA < 0.05 and pB < 0.05
-        res["verdict"] = ("H1 通过：模型显著同时优于两条基线，可以考虑扩大" if beats else
-                          "H1 终止：30 个正式周末后未能显著同时优于两条基线。保留数据管道，转向其他假设")
+    nw = res["n_weekends"]
+    if nw >= need:
+        # 要同时过四关才算数：对两条基线都显著（逐条样本），按周末聚类后仍对两条基线都显著，且全额手续费下也赚钱。
+        beats = (pA < 0.05 and pB < 0.05 and pAw < 0.05 and pBw < 0.05
+                 and res["pnl_net_fullfee_usd_total"] > 0)
+        res["verdict"] = ("H1 通过：按日历周末聚类后仍显著优于两条基线，且全额手续费下仍赚钱，可以考虑扩大" if beats else
+                          "H1 终止：满 30 个周末后，按周末聚类的显著性或全额手续费盈利这几关没全过。保留数据管道，转向其他假设")
     else:
-        res["verdict"] = f"还差 {need - n} 个正式周末才有资格判断 H1；之前的任何结果都只算'值得继续看'"
+        res["verdict"] = (f"还差 {need - nw} 个日历周末才有资格判断 H1（已有 {nw} 个；7 个合约同一周末高度相关，"
+                          f"按周末而不是按条数算）。之前的任何结果都只算'值得继续看'")
     return res
 
 

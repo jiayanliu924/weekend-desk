@@ -103,6 +103,16 @@ def test_skips_void_and_loss_limit(env, fake):  # noqa: F811
     assert autotrade.get(s)["mode"] == "off" and not fake.orders
 
 
+def test_skips_dislocation(env, fake):  # noqa: F811
+    s, _ = env
+    autotrade.put(s, mode="live", capital_usd=700, max_loss_usd=50)
+    w = weekend_for_friday(date(2026, 10, 9), s, s.inst("XYZ100"))
+    lock = _lock(side=-1)
+    lock["features"]["dislocated"] = True          # 中间价和标记价脱节（疑似插针）
+    rec = autotrade.entry(s, w, lock)
+    assert "插针" in rec["skipped"] and not fake.orders
+
+
 def test_rounding():
     assert autotrade.round_px(30012.345, 4) == 30012
     assert autotrade.round_px(101.537, 2) == 101.54
