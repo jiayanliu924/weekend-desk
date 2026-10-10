@@ -9,6 +9,7 @@ python -m desk review 2026-10-09 "..."   周一人工复核，写入复盘
 python -m desk check-llm        抽检：随机取最近新闻跑一次抽取，打印结果
 python -m desk adduser 名字      创建网页登录账号（在服务器上输入密码）
 python -m desk deluser 名字      删除账号
+python -m desk refreeze         更新代码后、本周末决策前，用新代码重新冻结本周规则（否则本周会作废被跳过）
 """
 from __future__ import annotations
 
@@ -117,6 +118,17 @@ def main(argv: list[str]) -> int:
             print(rec["degraded_reason"])
         if rec.get("chair"):
             print("主席：", rec["chair"].get("headline"))
+    elif cmd == "refreeze":
+        # 更新代码后、在本周末决策时刻之前，用"现在的代码"重新冻结本周规则，
+        # 这样本周不会因为"周五收盘后改过代码"而作废、被自动跳过。只对还没到决策时刻的周末有效。
+        n = 0
+        for inst in s.instruments:
+            w = current_or_next_weekend(now, s, inst)
+            if now < w.decision:
+                jobs.job_open(s, w)
+                n += 1
+                print(f"已重新冻结 {w.wid}（决策时刻 {w.decision.isoformat()}）")
+        print(f"规则哈希 {config.rules_hash(s.root)}；共重新冻结 {n} 个合约。" if n else "没有可重新冻结的周末（都已过决策时刻）。")
     elif cmd == "deluser":
         from .web import del_user
         print("已删除" if del_user(s, argv[1]) else "没有这个账号")

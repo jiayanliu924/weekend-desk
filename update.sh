@@ -21,5 +21,7 @@ cd /opt/weekend-desk && env -u NTFY_TOPIC -u ANTHROPIC_API_KEY ./venv/bin/python
 systemctl restart weekend-desk
 bash /opt/weekend-desk/setup_web.sh
 (cd /opt/weekend-desk && ./venv/bin/python -m desk backfill > /dev/null 2>&1 || true)
+# 若在周末窗口内更新了代码，用新代码重新冻结本周规则，避免本周被判"作废"而跳过下单
+(cd /opt/weekend-desk && ./venv/bin/python -m desk refreeze || true)
 sleep 30
 ./venv/bin/python -m desk status
