@@ -1089,8 +1089,10 @@ def settings_wallet(req: Request, address: str = Form(""), key: str = Form("")):
             save_env_key("HL_API_PRIVATE_KEY", key if key.startswith("0x") else "0x" + key)
         try:
             b = autotrade.client().balance()
-            msg = (f"已保存并连上。主账户 ${b['main']:.2f}，美股合约账户（xyz）${b['xyz']:.2f}。"
-                   + ("" if b["xyz"] or b["main"] else " 账户里还没有钱。"))
+            avail = b.get("available", b["main"] + b["xyz"])
+            msg = (f"已保存并连上。可用保证金 ${avail:.2f}（其中现货 USDC ${b.get('spot', 0):.2f}、"
+                   f"合约账户 ${b['main'] + b['xyz']:.2f}）。统一账户下现货 USDC 也能直接给合约下单用。"
+                   + ("" if avail else " 账户里还没有钱。"))
         except Exception as e:  # noqa: BLE001
             msg = f"已保存，但检查连接失败：{type(e).__name__}: {str(e)[:160]}"
         import subprocess

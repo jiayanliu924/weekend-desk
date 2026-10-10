@@ -15,8 +15,11 @@ class FakeClient:
         self.open = []
         self.fill_list = []
 
+    def spot_usdc(self):
+        return 0.0
+
     def balance(self):
-        return {"main": 100.0, "xyz": 250.0, "withdrawable_xyz": 250.0}
+        return {"main": 100.0, "xyz": 250.0, "spot": 0.0, "available": 350.0, "withdrawable_xyz": 250.0}
 
     def sz_decimals(self, coin):
         return 4
@@ -133,7 +136,7 @@ def test_settings_pages(env, fake, monkeypatch):  # noqa: F811
     assert "已切到演习" in r0.text and autotrade.get(s)["mode"] == "shadow"      # 演习不用连钱包
     assert "42 位" in c.post("/settings/wallet", data={"address": "0x123", "key": ""}).text
     r = c.post("/settings/wallet", data={"address": "0x" + "a" * 40, "key": "0x" + "b" * 64})
-    assert "已保存并连上" in r.text and "$250.00" in r.text
+    assert "已保存并连上" in r.text and "可用保证金 $350.00" in r.text
     assert "bbbbbbbb" not in c.get("/settings").text
     assert "勾选" in c.post("/settings/live", data={"mode": "live", "capital": 300, "max_loss": 40}).text
     r = c.post("/settings/live", data={"mode": "live", "capital": 300, "max_loss": 40, "ack": "1"})

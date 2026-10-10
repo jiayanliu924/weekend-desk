@@ -79,11 +79,24 @@ class Client:
         self.info = Info(constants.MAINNET_API_URL, skip_ws=True, perp_dexs=["", DEX])
         self.ex = Exchange(Account.from_key(key), constants.MAINNET_API_URL, account_address=address, perp_dexs=["", DEX])
 
+    def spot_usdc(self) -> float:
+        """现货里的 USDC。Unified（统一账户）模式下，这笔现货 USDC 就是合约下单用的保证金
+        （实测：合约账户 accountValue 读到 0，但订单能直接用这笔钱挂住成交）。"""
+        try:
+            st = self.info.spot_user_state(self.address)
+            return sum(float(b.get("total", 0) or 0) for b in st.get("balances", []) if b.get("coin") == "USDC")
+        except Exception:  # noqa: BLE001
+            return 0.0
+
     def balance(self) -> dict:
         main = self.info.user_state(self.address)
         dex = self.info.user_state(self.address, dex=DEX)
         f = lambda s: float(s.get("marginSummary", {}).get("accountValue", 0) or 0)  # noqa: E731
-        return {"main": f(main), "xyz": f(dex), "withdrawable_xyz": float(dex.get("withdrawable", 0) or 0)}
+        spot = self.spot_usdc()
+        # Unified 账户：能用来下单的保证金 = 合约账户 + 现货 USDC
+        return {"main": f(main), "xyz": f(dex), "spot": spot,
+                "available": f(main) + f(dex) + spot,
+                "withdrawable_xyz": float(dex.get("withdrawable", 0) or 0)}
 
     def sz_decimals(self, coin: str) -> int:
         return self.info.asset_to_sz_decimals[self.info.name_to_asset(coin)]
@@ -159,11 +172,12 @@ def _live_preflight(settings, cfg, c) -> str | None:
     """
     floor = cfg.get("min_balance_usd", 5.0)
     try:
-        bal = c.balance().get("xyz", 0) or 0
+        b = c.balance()
+        avail = b.get("available", (b.get("xyz", 0) or 0))  # Unified：合约+现货 USDC 都算可用保证金
     except Exception:  # noqa: BLE001
-        bal = None
-    if bal is not None and bal < floor:
-        return f"交易账户余额 ${bal:.2f} 低于下限 ${floor:.2f}，不下单"
+        avail = None
+    if avail is not None and avail < floor:
+        return f"账户可用保证金 ${avail:.2f} 低于下限 ${floor:.2f}，不下单"
     if not _client_factory:   # 只有真实钱包才校验
         main, key = creds()
         try:
