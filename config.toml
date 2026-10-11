@@ -107,6 +107,10 @@ feeds = [
   "https://feeds.content.dowjones.io/public/rss/mw_topstories",
   "https://news.google.com/rss/search?q=Nasdaq+OR+Nvidia+OR+Apple+OR+Microsoft+OR+tariff+OR+Fed+when:1d&hl=en-US&gl=US&ceid=US:en",
   "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=8-K&count=40&output=atom",
+  # 地缘政治与能源/大宗商品——我们交易原油(BRENTOIL)等品种，必须盯这类供应冲击，否则会对着战争做反向（2026-10 补）
+  "https://news.google.com/rss/search?q=oil+OR+crude+OR+Brent+OR+Saudi+OR+Houthi+OR+Iran+OR+OPEC+OR+%22Middle+East%22+OR+strike+OR+sanctions+when:2d&hl=en-US&gl=US&ceid=US:en",
+  "https://www.aljazeera.com/xml/rss/all.xml",
+  "https://oilprice.com/rss/main",
 ]
 
 [llm]

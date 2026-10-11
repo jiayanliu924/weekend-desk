@@ -33,7 +33,7 @@ def s(tmp_path):
     return st
 
 
-def seed_market(s, w, dev_bps=100.0, reopen_bps=10.0, news_after_decision=False, with_news=True):
+def seed_market(s, w, dev_bps=100.0, reopen_bps=10.0, news_after_decision=False, with_news=True, with_geo=False):
     coin = s.instrument
     fri = 30000.0
     wc, wb, wt, wp, wn = (RawWriter(s.data, n) for n in ("hl_ctx", "hl_book", "hl_trades", "hl_params", "news"))
@@ -65,6 +65,11 @@ def seed_market(s, w, dev_bps=100.0, reopen_bps=10.0, news_after_decision=False,
                               "published_at": None}, t0 + int(3600e9))
         wn.add("feed", "n2", {"feed": "test", "title": "Local weather is sunny", "summary": "", "published_at": None},
                t0 + int(7200e9))
+    if with_geo:
+        # 地缘/能源供应冲击：原文里没有任何纳斯达克成分股，但应被判为重要新闻 → 信息周末
+        wn.add("feed", "geo", {"feed": "test", "title": "Attack on Riyadh airport kills 12, oil supply at risk",
+                               "summary": "Houthi strike on Riyadh airport killed 12 people as the conflict escalates.",
+                               "published_at": None}, t0 + int(3600e9))
     if news_after_decision:
         wn.add("feed", "late", {"feed": "test", "title": "Apple announces huge buyback", "summary": "",
                                 "published_at": None}, dec + int(60e9))
@@ -81,6 +86,10 @@ def fake_llm(system, user):
         return json.dumps([{"entities": ["AAPL"], "materiality": 3, "evidence_span": "Apple announces huge buyback"}])
     if "weather" in user:
         return json.dumps([{"entities": [], "materiality": 0, "evidence_span": "made up sentence not in text"}])
+    if "Riyadh airport" in user:
+        return json.dumps([{"event_id": "geo-1", "entities": ["OIL"], "event_type": "地缘",
+                            "direction_in_text": "负面", "materiality": 3, "is_new_information": True,
+                            "evidence_span": "Houthi strike on Riyadh airport killed 12 people as the conflict escalates."}])
     return "[]"
 
 
@@ -119,6 +128,21 @@ def test_quiet_weekend_fade(s):
     assert lock["prediction"]["pred_bps"] == 0.0               # quiet → deviation erased
     assert lock["action"]["side"] == -1                         # fade: sell
     assert out["pnl_net_bps"] > 0
+
+
+def test_geopolitical_oil_shock_stands_aside(s):
+    # 一条地缘/能源供应冲击新闻（原文没点名任何纳斯达克成分股）应算重要 → 信息周末。
+    # 本策略只做"偏离回弹"的反向套利：信息周末预测偏离被确认(pred=dev) → 没有回弹空间 → 不出手，
+    # 而不是像安静周末那样对着这波真新闻做空。这样就不会"对着战争做反向"。
+    w = weekend_for_friday(FRI, s)
+    seed_market(s, w, dev_bps=60, reopen_bps=50, with_news=False, with_geo=True)
+    lock, _ = run_weekend(s, w)
+    f = lock["features"]
+    assert f["n_mat2"] == 1 and f["news_weekend"]          # 地缘供应冲击被判为重要新闻
+    assert f["n_top10"] == 0                                # 原文没有成分股，仍算信息周末
+    assert abs(lock["prediction"]["pred_bps"] - f["dev_bps"]) < 1e-9   # 偏离被确认
+    assert lock["action"]["side"] == 0                      # 不出手（站在一边），而不是做空
+    # 对照 test_quiet_weekend_fade：同样 +60 偏离、判为安静周末时会做空(side=-1)。
 
 
 def test_point_in_time_and_evidence(s):
