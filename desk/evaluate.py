@@ -23,29 +23,47 @@ def outcome(settings, w: Weekend, lock: dict) -> dict:
            "err_model_bps": abs(pred - y), "err_A_bps": abs(y), "err_B_bps": abs(dev - y),
            "dev_reverted_bps": dev - y}
     act = lock["action"]
-    ex = first_ctx_after(settings, coin, to_ns(w.exit))
-    if act["side"] and ex:
-        exit_px = float(ex[1].get("midPx") or ex[1]["markPx"])
-        fees = lock["fees"]
-        side, n = act["side"], act["notional_usd"]
-        gross = side * (exit_px / act["entry_px"] - 1) * 1e4
-        net_maker = gross - fees["maker_bps"] - fees["taker_bps"]
-        taker_entry = f.get("best_ask" if side > 0 else "best_bid") or f["dec_mid"]
-        gross_t = side * (exit_px / taker_entry - 1) * 1e4
-        net_taker = gross_t - 2 * fees["taker_bps"]
-        # 诚实口径：按"不打折"的全额手续费再算一遍。growthMode 的约九折是冷启动补贴，会消失；
-        # 只有在全额手续费下也赚钱，才算真有边际（竞品文档也点名 growthMode 是约九折的临时补贴）。
-        full_maker, full_taker = settings["costs"]["maker_bps"], settings["costs"]["taker_bps"]
-        net_full = gross - full_maker - full_taker
-        out.update(exit_px=exit_px, pnl_gross_bps=gross, pnl_net_bps=net_maker,
-                   pnl_net_usd=net_maker / 1e4 * n, pnl_net_taker_bps=net_taker,
-                   pnl_net_taker_usd=net_taker / 1e4 * n,
-                   pnl_net_fullfee_bps=net_full, pnl_net_fullfee_usd=net_full / 1e4 * n,
-                   direction_hit=(math.copysign(1, y - dev) == side))
+    shadow = lock.get("shadow") or {}
+    need_exit = bool(act.get("side")) or any(a.get("side") for a in shadow.values())
+    ex = first_ctx_after(settings, coin, to_ns(w.exit)) if need_exit else None
+    exit_px = float(ex[1].get("midPx") or ex[1]["markPx"]) if ex else None
+    fees, costs = lock.get("fees") or {}, settings["costs"]
+    if act["side"] and exit_px is not None:
+        p = _sim_pnl(act["side"], act["notional_usd"], act["entry_px"], exit_px, f, fees, costs, y, dev)
+        out.update(exit_px=exit_px, **p)
     else:
         out.update(pnl_net_bps=0.0, pnl_net_usd=0.0, pnl_net_taker_usd=0.0,
                    pnl_net_fullfee_usd=0.0, direction_hit=None)
+    # 影子策略（顺势等）：同口径算模拟盈亏，但从不下真单
+    sh: dict = {}
+    for sname, a in shadow.items():
+        if a.get("side") and exit_px is not None:
+            p = _sim_pnl(a["side"], a["notional_usd"], a["entry_px"], exit_px, f, fees, costs, y, dev)
+            sh[sname] = {"side": a["side"], "notional_usd": a["notional_usd"], "pnl_net_usd": p["pnl_net_usd"],
+                         "pnl_net_fullfee_usd": p["pnl_net_fullfee_usd"], "direction_hit": p["direction_hit"]}
+        else:
+            sh[sname] = {"side": a.get("side", 0), "notional_usd": a.get("notional_usd", 0.0),
+                         "pnl_net_usd": 0.0, "pnl_net_fullfee_usd": 0.0, "direction_hit": None}
+    if sh:
+        out["shadow"] = sh
     return out
+
+
+def _sim_pnl(side: int, notional: float, entry_px: float, exit_px: float, f: dict, fees: dict, costs: dict,
+             y: float, dev: float) -> dict:
+    """一笔的扣费后模拟盈亏（挂单进场、吃单离场），含诚实的"全额手续费"口径。
+
+    全额手续费口径：growthMode 的约九折是冷启动补贴、会消失；只有全额手续费下也赚钱才算真有边际。
+    """
+    gross = side * (exit_px / entry_px - 1) * 1e4
+    net_maker = gross - fees.get("maker_bps", costs["maker_bps"]) - fees.get("taker_bps", costs["taker_bps"])
+    taker_entry = f.get("best_ask" if side > 0 else "best_bid") or f["dec_mid"]
+    net_taker = side * (exit_px / taker_entry - 1) * 1e4 - 2 * fees.get("taker_bps", costs["taker_bps"])
+    net_full = gross - costs["maker_bps"] - costs["taker_bps"]
+    return {"pnl_gross_bps": gross, "pnl_net_bps": net_maker, "pnl_net_usd": net_maker / 1e4 * notional,
+            "pnl_net_taker_bps": net_taker, "pnl_net_taker_usd": net_taker / 1e4 * notional,
+            "pnl_net_fullfee_bps": net_full, "pnl_net_fullfee_usd": net_full / 1e4 * notional,
+            "direction_hit": (math.copysign(1, y - dev) == side)}
 
 
 def official(rec: dict, cfg) -> bool:
@@ -122,6 +140,35 @@ def scorecard(records: list[dict], cfg) -> dict:
     else:
         res["verdict"] = (f"还差 {need - nw} 个日历周末才有资格判断 H1（已有 {nw} 个；7 个合约同一周末高度相关，"
                           f"按周末而不是按条数算）。之前的任何结果都只算'值得继续看'")
+    return res
+
+
+def shadow_scorecard(records: list[dict], cfg, strat: str = "follow") -> dict:
+    """影子策略成绩（只模拟、不下真单）：累计模拟盈亏、方向命中率、够不够样本下结论。
+
+    判断"该不该上真钱"用的是全额手续费口径：只有全额手续费下也稳定为正，才算真有边际。
+    """
+    off = [r for r in records if official(r, cfg)]
+    traded = [(r, r["outcome"].get("shadow", {}).get(strat)) for r in off]
+    traded = [(r, s) for r, s in traded if s and s.get("side")]
+    n_wk = len({r["weekend"][:10] for r, _ in traded})
+    pnl = sum(s.get("pnl_net_usd", 0) for _, s in traded)
+    pnl_full = sum(s.get("pnl_net_fullfee_usd", 0) for _, s in traded)
+    hits = [s["direction_hit"] for _, s in traded if s.get("direction_hit") is not None]
+    hit_rate = (sum(1 for h in hits if h) / len(hits)) if hits else None
+    need = cfg["risk"]["eval_after_weekends"]
+    res = {"strategy": strat, "n_trades": len(traded), "n_weekends": n_wk,
+           "pnl_net_usd_total": pnl, "pnl_net_fullfee_usd_total": pnl_full, "hit_rate": hit_rate}
+    if n_wk >= need:
+        hit_txt = f"、方向命中 {hit_rate * 100:.0f}%" if hit_rate is not None else ""
+        tail = ("全额手续费下为正，可考虑把顺势策略转真钱（仍建议先小仓）。" if pnl_full > 0
+                else "全额手续费下不赚钱，先别上真钱，继续观察或换假设。")
+        res["verdict"] = (f"影子已有 {n_wk} 个信息周末样本，累计模拟 ${pnl:+.2f}"
+                          f"（全额手续费 ${pnl_full:+.2f}）{hit_txt}。" + tail)
+    else:
+        res["verdict"] = (f"顺势策略影子跑：已有 {n_wk} 个信息周末样本，累计模拟 ${pnl:+.2f}"
+                          f"（全额手续费 ${pnl_full:+.2f}）。还需 {max(0, need - n_wk)} 个信息周末样本才有资格下结论，"
+                          f"现在只算'值得继续看'，不动真钱。")
     return res
 
 

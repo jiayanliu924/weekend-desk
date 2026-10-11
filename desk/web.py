@@ -362,6 +362,7 @@ def overview(req: Request):
     nxt = [e for e in options.event_samples(S) if e.event_at > datetime.now(UTC)][:3]
     recs = Ledger(S.data).completed()
     card = evaluate.scorecard(recs, S)
+    follow = evaluate.shadow_scorecard(recs, S, "follow")
     bc = evaluate.scorecard_by_coin(recs, S)
     hist_by = sim.run(S, 2000, 2, "maker", "history")["by_name"]
     inst_rows = "".join(
@@ -467,6 +468,13 @@ def overview(req: Request):
        <div class="ev">胜率 {_n(hist['win_rate'] and hist['win_rate']*100, 0, '%')} · 只供参考，会偏乐观</div></div>
 </div>
 <p class="sub" style="margin-top:10px">{E(card.get('verdict', '还没有完成的实时周末，第一个周末结束后这里会出现成绩。'))} 期权：{E(oc['verdict'])}</p>
+
+<div class="card" style="margin-top:12px;border-left:3px solid var(--acc)">
+  <div class="k">顺势策略（影子跑 · 不动真钱）</div>
+  <div class="v s {_cls(follow['pnl_net_usd_total'])}" style="font-size:18px">模拟 ${_n(follow['pnl_net_usd_total'], 2, sign=True)}
+    <span class="ev">（全额手续费 ${_n(follow['pnl_net_fullfee_usd_total'], 2, sign=True)}）· {follow['n_weekends']} 个信息周末样本{(' · 方向命中 ' + _n(follow['hit_rate']*100, 0, '%')) if follow.get('hit_rate') is not None else ''}</span></div>
+  <div class="ev">信息周末时顺着偏离做多/做空的"如果"账：真钱此时站一边，这里只记录会赚多少。{E(follow['verdict'])}</div>
+</div>
 
 <h2>本周末打算（纸面练习）</h2>
 {plan_head}{plan}

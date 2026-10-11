@@ -71,10 +71,12 @@ def job_lock(settings, w: Weekend, push: bool = True) -> dict:
         pred = model.predict(feats, history, settings)
         fees = model.fee_bps(settings, to_ns(w.decision), w.coin or None)
         action = model.decide_action(feats, pred, fees, settings)
+        shadow = model.shadow_actions(feats, fees, settings)
     else:
         void_reasons += feats["problems"]
         pred, fees, action = {"pred_bps": None}, {}, {"side": 0, "notional_usd": 0, "reason": "数据不全，不出手"}
-    body = {"coin": w.coin or settings.instrument, "name": w.name, "features": feats, "prediction": pred, "fees": fees, "action": action,
+        shadow = {}
+    body = {"coin": w.coin or settings.instrument, "name": w.name, "features": feats, "prediction": pred, "fees": fees, "action": action, "shadow": shadow,
             "prompt_version": settings["llm"]["prompt_version"], "llm_model": settings["llm"]["model"],
             "rules_hash": now_hash, "void": bool(void_reasons), "void_reasons": void_reasons,
             "mode": "live" if settings["live"]["enabled"] else "paper"}

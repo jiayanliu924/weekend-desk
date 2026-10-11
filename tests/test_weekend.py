@@ -127,6 +127,7 @@ def test_quiet_weekend_fade(s):
     assert not lock["features"]["news_weekend"]
     assert lock["prediction"]["pred_bps"] == 0.0               # quiet → deviation erased
     assert lock["action"]["side"] == -1                         # fade: sell
+    assert not lock.get("shadow")                               # 安静周末没有顺势影子单（顺势只在信息周末跑）
     assert out["pnl_net_bps"] > 0
 
 
@@ -136,13 +137,17 @@ def test_geopolitical_oil_shock_stands_aside(s):
     # 而不是像安静周末那样对着这波真新闻做空。这样就不会"对着战争做反向"。
     w = weekend_for_friday(FRI, s)
     seed_market(s, w, dev_bps=60, reopen_bps=50, with_news=False, with_geo=True)
-    lock, _ = run_weekend(s, w)
+    lock, out = run_weekend(s, w)
     f = lock["features"]
     assert f["n_mat2"] == 1 and f["news_weekend"]          # 地缘供应冲击被判为重要新闻
     assert f["n_top10"] == 0                                # 原文没有成分股，仍算信息周末
     assert abs(lock["prediction"]["pred_bps"] - f["dev_bps"]) < 1e-9   # 偏离被确认
-    assert lock["action"]["side"] == 0                      # 不出手（站在一边），而不是做空
-    # 对照 test_quiet_weekend_fade：同样 +60 偏离、判为安静周末时会做空(side=-1)。
+    assert lock["action"]["side"] == 0                      # 真钱：不出手（站在一边），而不是做空
+    # 同时：顺势影子策略应记录"如果追这波会怎样"（side 顺着 +60 偏离 → 做多），但不下真单
+    assert lock["shadow"]["follow"]["side"] == 1
+    fol = out["shadow"]["follow"]
+    assert fol["side"] == 1 and "pnl_net_usd" in fol and "pnl_net_fullfee_usd" in fol
+    # 对照 test_quiet_weekend_fade：同样 +60 偏离、判为安静周末时真钱会做空(side=-1)，且没有顺势影子单。
 
 
 def test_point_in_time_and_evidence(s):

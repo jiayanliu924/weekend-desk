@@ -57,6 +57,22 @@ def _worst_adverse_bps(features: dict, risk) -> float:
     return max(floor, seen)
 
 
+def shadow_actions(features: dict, fees: dict, cfg) -> dict:
+    """并行影子策略：不下真单，只记录"如果这么做、会赚多少"，用来攒证据。
+
+    follow（顺势/追涨）：只在"信息周末、偏离过线"时顺着偏离方向做（押这波真新闻继续到重开），
+    恰好补上真钱反向套利在信息周末"站一边"的那块。用和反向同等幅度(edge=dev)定仓位，便于同口径对比。
+    插针/脱节照样否决（decide_action 内已处理）。攒够信息周末样本、全额手续费下也稳定为正，才谈上真钱。
+    """
+    out: dict = {}
+    dev = features.get("dev_bps")
+    if dev is not None and features.get("news_weekend"):
+        a = decide_action(features, {"pred_bps": 2.0 * dev}, fees, cfg)  # edge = pred - dev = dev，顺着偏离
+        a["strategy"] = "follow"
+        out["follow"] = a
+    return out
+
+
 def decide_action(features: dict, pred: dict, fees: dict, cfg) -> dict:
     """模拟出手：预期收益（从当前价到重开价）超过成本 + 缓冲才出手；挂单进场、吃单离场。
 
