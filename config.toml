@@ -215,6 +215,21 @@ poll_sec = 30
 # 每多少次读取把原始快照落盘一次（有事件时立刻落盘）
 flush_every_polls = 10
 
+[headline_shadow]
+# 头条动量影子线（只记账、永不下单）：油价相关的重要新闻一出来，按"收到后 delay_sec 秒的链上中间价"记一笔
+# 顺着新闻方向的影子单（袭击/供应冲击 → 多；停火/降温 → 空），在 +1h/+4h/+24h 按全额手续费对账。
+# 工作日也跑。目的：攒证据回答"追头条到底赚不赚钱"，以及"已结束的事件 vs 进行中的事件"哪种会反转。
+enabled = true
+instrument = "BRENTOIL"
+delay_sec = 120
+horizons_h = [1, 4, 24]
+# 同一事件（event_id 相同或原句高度相似）在这么多小时内再出现 → 记为"重复"，不算新信息
+dedupe_hours = 6
+# 回看多久以前的事件（给抽取和链上数据留出延迟）
+lookback_h = 48
+# 每隔多少分钟扫一次
+every_min = 5
+
 [notify]
 # 手机推送（ntfy.sh，免费）：在 .env 里填 NTFY_TOPIC
 server = "https://ntfy.sh"

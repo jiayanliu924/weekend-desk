@@ -72,10 +72,23 @@ def due_jobs(now: datetime, settings, done: set) -> list[tuple[str, object]]:
     h = settings["notify"].get("daily_pdf_hour_pt", 7)
     if h <= pt.hour < h + 4 and f"dailypdf:{pt.date()}" not in done:
         out.append((f"dailypdf:{pt.date()}", None))
+    # 头条动量影子线：工作日也跑，每 every_min 分钟扫一次（只记账，不下单）
+    hs = settings.raw.get("headline_shadow") or {}
+    if hs.get("enabled", True):
+        every = max(1, int(hs.get("every_min", 5)))
+        slot = int(now.timestamp() // (every * 60))
+        if f"headline:{slot}" not in done:
+            out.append((f"headline:{slot}", None))
+        # 状态文件别被每 5 分钟一个的 key 撑爆：只留最近几个
+        for k in [k for k in done if k.startswith("headline:") and int(k[9:]) < slot - 3]:
+            done.discard(k)
     return out
 
 
 def run_job(key: str, wk, settings):
+    if key.startswith("headline:"):
+        from . import headline_shadow
+        return headline_shadow.run(settings)
     name = key.rsplit(":", 1)[1]
     if name == "open":
         return jobs.job_open(settings, wk)

@@ -22,7 +22,7 @@ from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from starlette.middleware.sessions import SessionMiddleware
 
-from . import agents, config, evaluate, notify, options, pdfreport, rawstore, sim
+from . import agents, config, evaluate, headline_shadow, notify, options, pdfreport, rawstore, sim
 from .clock import current_or_next_weekend, friday_of, name_of
 from .ledger import Ledger
 
@@ -351,6 +351,24 @@ def logout(req: Request):
     return RedirectResponse("/login", status_code=303)
 
 
+def _headline_rows(hs: dict) -> str:
+    """头条动量成绩表的行：全部 / 已结束 / 进行中 / 看不出，每格 = 笔数 · 命中率 · 全额手续费平均 bps。"""
+    hz = hs.get("horizons_h", [])
+
+    def cell(s):
+        if not s or not s.get("n"):
+            return "<td class='n mut'>—</td>"
+        hit = f"{s['hit_rate'] * 100:.0f}%" if s.get("hit_rate") is not None else "—"
+        return (f"<td class='n {_cls(s.get('mean_pnl_fullfee_bps'))}'>{s['n']} 笔 · 命中 {hit} · "
+                f"{_n(s.get('mean_pnl_fullfee_bps'), 0, ' bps', sign=True)}</td>")
+
+    rows = [("全部", hs.get("by_horizon", {}))]
+    for st, lab in (("concluded", "已结束"), ("ongoing", "进行中"), ("unknown", "看不出")):
+        grp = hs.get("by_status", {}).get(st) or {}
+        rows.append((f"{lab}（{grp.get('n', 0)}）", grp.get("by_horizon", {})))
+    return "".join(f"<tr><td>{E(lab)}</td>{''.join(cell(bh.get(h)) for h in hz)}</tr>" for lab, bh in rows)
+
+
 # ------------------------------------------------------------------ pages
 @app.get("/", response_class=HTMLResponse)
 def overview(req: Request):
@@ -363,6 +381,10 @@ def overview(req: Request):
     recs = Ledger(S.data).completed()
     card = evaluate.scorecard(recs, S)
     follow = evaluate.shadow_scorecard(recs, S, "follow")
+    try:
+        hs = headline_shadow.headline_scorecard(S)
+    except Exception as e:  # noqa: BLE001
+        hs = {"n_new": 0, "n_repeat": 0, "by_horizon": {}, "by_status": {}, "verdict": f"成绩单暂时算不出来：{e}"}
     bc = evaluate.scorecard_by_coin(recs, S)
     hist_by = sim.run(S, 2000, 2, "maker", "history")["by_name"]
     inst_rows = "".join(
@@ -477,6 +499,14 @@ def overview(req: Request):
 </div>
 
 {_positions_card()}
+
+<div class="card" style="margin-top:12px;border-left:3px solid var(--warn)">
+  <div class="k">头条动量（影子 · 只记账）</div>
+  <div class="v s" style="font-size:18px">{hs.get('n_new', 0)} 条新头条 <span class="ev">· {hs.get('n_repeat', 0)} 条重复 · 多 {hs.get('n_long', 0)} / 空 {hs.get('n_short', 0)} · 周末 {hs.get('n_weekend', 0)}</span></div>
+  <div class="tw" style="margin-top:8px"><table style="font-size:13px"><tr><th></th>{''.join(f'<th class="n">+{h}h</th>' for h in hs.get('horizons_h', []))}</tr>
+  {_headline_rows(hs)}</table></div>
+  <div class="ev">油价相关重要新闻收到 2 分钟后，顺着新闻方向（袭击→多、停火→空）记一笔 $1,000 影子单，按全额手续费在 +1h/+4h/+24h 对账；按"已结束/进行中"分开看哪种会反转。{E(hs.get('verdict', ''))}</div>
+</div>
 
 <h2>本周末打算（纸面练习）</h2>
 {plan_head}{plan}
