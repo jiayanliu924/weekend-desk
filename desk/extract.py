@@ -34,12 +34,19 @@ SYSTEM_PROMPT_V01 = """你是一个信息抽取器。只根据下面提供的原
                                     // 中东战争从局部升级到全面、大国直接下场、对主要产油国制裁、OPEC 重大增减产 → 通常 2-3，
                                     // 即使原文没点名任何纳斯达克成分股也照样算（它通过油价和避险情绪影响大盘与商品）。
   "is_new_information": true/false, // 原文是否声明这是首次披露
+  "event_status": "concluded|ongoing|unknown", // 原文里这件事是已经结束的一次性事件（如一次袭击已发生并结束、
+                                    // 一份决议已通过、一次会议已开完 → concluded），还是仍在进行、可能继续升级或反复的
+                                    // 过程（如战争持续、谈判未定、袭击可能再来、封锁未解除 → ongoing）；原文看不出来填 unknown
   "evidence_span": "原文中支持判断的原句，逐字复制",
   "published_at": "...", "received_at": "...",
   "prompt_version": "v0.1", "model_version": "..."
 }
 
 只输出一个 JSON 数组，不要输出任何其他文字。"""
+
+# event_status 是 2026-10 加的字段（头条动量影子线按"已结束/进行中"分开记账）。
+# 只是多要一个字段、不改抽取逻辑，所以不升 prompt_version；缺省为 unknown。
+EVENT_STATUSES = ("concluded", "ongoing", "unknown")
 
 TAG = re.compile(r"<[^>]+>")
 WS = re.compile(r"\s+")
@@ -92,6 +99,8 @@ def validate(events: list[dict], text: str, top10: list[str]) -> list[dict]:
             e["materiality"] = 0
         ents = [str(x).upper() for x in (e.get("entities") or [])]
         e["entities"] = ents
+        st = str(e.get("event_status") or "").strip().lower()
+        e["event_status"] = st if st in EVENT_STATUSES else "unknown"
         e["touches_top10"] = any(x in top10 for x in ents)
         good.append(e)
     return good
