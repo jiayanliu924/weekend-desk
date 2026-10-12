@@ -21,22 +21,19 @@
 from __future__ import annotations
 
 import argparse
-import math
-import statistics
-import time
 from dataclasses import dataclass
 from datetime import date, datetime, time as dtime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from .backtest_lib import (INTERVAL_MS, INTERVAL_PREF, cache_path, fetch_candles_paged, get_candles,  # noqa: F401
+                           load_cache, ms, price_at_or_after, price_at_or_before, save_cache, trade_stats)
+
 ET = ZoneInfo("America/New_York")
 UTC = timezone.utc
 
-# 只跑美股/美指合约（BRENTOIL 23/5、SMSN 韩股时段不同，不属于这个假设）
+# 只跑美股/美指合约（BRENTOIL 23/5、SMSN 韩股时段不同，不属于这个假设；它们在 windows_backtest 里）
 INSTRUMENTS = ("NVDA", "TSLA", "INTC", "XYZ100", "SP500")
-# Hyperliquid candleSnapshot 支持 1m 3m 5m 15m 30m 1h 2h 4h 8h 12h 1d 3d 1w 1M；每次最多返回 5000 根。
-INTERVAL_MS = {"1m": 60_000, "3m": 180_000, "5m": 300_000, "15m": 900_000, "30m": 1_800_000, "1h": 3_600_000}
-INTERVAL_PREF = ("15m", "5m", "1h")
 
 # NYSE 全天休市（2025 + 2026，手写）
 NYSE_HOLIDAYS = {
@@ -102,32 +99,8 @@ def overnight_windows(first: date, last: date, lead_min: int = 15, exit_delay_mi
     return out
 
 
-# ---------------------------------------------------------------- K 线取价
-def _ms(dt: datetime) -> int:
-    return int(dt.timestamp() * 1000)
-
-
-def price_at_or_before(by_t: dict[int, dict], iv: int, t: datetime, max_back: int = 4) -> float | None:
-    """t 时刻（含）之前最后一根已收盘 K 线的收盘价。K 线 [k, k+iv) 的收盘价代表 k+iv 时刻的价格。
-
-    链上没成交的区间 Hyperliquid 可能不返回 K 线，所以最多往前找 max_back 根。
-    """
-    k = (_ms(t) // iv) * iv - iv
-    for i in range(max_back):
-        c = by_t.get(k - i * iv)
-        if c:
-            return float(c["c"])
-    return None
-
-
-def price_at_or_after(by_t: dict[int, dict], iv: int, t: datetime, max_fwd: int = 4) -> float | None:
-    """收盘时刻 ≥ t 的第一根 K 线的收盘价（重开后第一个可成交价的近似）。"""
-    k = math.ceil(_ms(t) / iv) * iv - iv
-    for i in range(max_fwd):
-        c = by_t.get(k + i * iv)
-        if c:
-            return float(c["c"])
-    return None
+# ---------------------------------------------------------------- K 线取价（公用件在 backtest_lib）
+_ms = ms
 
 
 def window_rows(candles: list[dict], windows: list[Window], interval: str, name: str) -> list[dict]:
@@ -180,120 +153,7 @@ def weekend_rows_from_config(settings, candles: list[dict], interval: str, inst:
 def fade_stats(rows: list[dict], cfg, notional_usd: float = 2000.0, threshold_bps: float | None = None,
                dev_key: str = "dev_bps", move_key: str = "move_from_dec_bps") -> dict:
     """|dev| > 门槛就反向，持到重开。手续费按全额（挂单进 + 吃单出），门槛 = 手续费 + edge_buffer。"""
-    c = cfg["costs"]
-    fee = c["maker_bps"] + c["taker_bps"]
-    thr = threshold_bps if threshold_bps is not None else fee + c["edge_buffer_bps"]
-    n = len(rows)
-    out = {"n": n, "fee_bps": fee, "threshold_bps": thr, "trades": 0}
-    if not n:
-        return out
-    absdev = sorted(abs(r[dev_key]) for r in rows)
-    q = lambda p: absdev[min(n - 1, int(p * n))]  # noqa: E731
-    out.update(p50=q(0.5), p75=q(0.75), p90=q(0.9), frac_over=sum(1 for a in absdev if a > thr) / n)
-    out["revert_rate_all"] = sum(1 for r in rows if r[dev_key] * r[move_key] < 0) / n
-    # 全样本回归系数 beta = y / dev（0 = 偏离全抹掉，1 = 偏离全被确认），最小二乘无截距
-    sxx = sum(r[dev_key] ** 2 for r in rows)
-    out["beta_y_on_dev"] = (sum(r[dev_key] * r["y_bps"] for r in rows) / sxx) if sxx else float("nan")
-    trades = sorted((r for r in rows if abs(r[dev_key]) > thr), key=lambda r: r["t_decision"])
-    pnl = []
-    for r in trades:
-        side = -1 if r[dev_key] > 0 else 1
-        gross = side * r[move_key]
-        pnl.append({"day": r["day"], "name": r["name"], "dev": r[dev_key], "side": side, "gross_bps": gross,
-                    "net_bps": gross - fee, "net_usd": (gross - fee) / 1e4 * notional_usd})
-    out["trades"] = len(pnl)
-    if not pnl:
-        return out
-    out["revert_rate"] = sum(1 for p in pnl if p["gross_bps"] > 0) / len(pnl)
-    out["win_rate"] = sum(1 for p in pnl if p["net_bps"] > 0) / len(pnl)
-    out["avg_net_bps"] = statistics.mean(p["net_bps"] for p in pnl)
-    out["median_net_bps"] = statistics.median(p["net_bps"] for p in pnl)
-    out["total_net_bps"] = sum(p["net_bps"] for p in pnl)
-    out["total_net_usd"] = sum(p["net_usd"] for p in pnl)
-    worst = min(pnl, key=lambda p: p["net_bps"])
-    out["worst"] = worst
-    eq = peak = dd = 0.0
-    for p in pnl:
-        eq += p["net_usd"]
-        peak = max(peak, eq)
-        dd = min(dd, eq - peak)
-    out["max_drawdown_usd"] = dd
-    out["pnl"] = pnl
-    return out
-
-
-# ---------------------------------------------------------------- 数据
-def fetch_candles_paged(coin: str, interval: str, days: int) -> list[dict]:
-    """沿用 backfill.fetch_candles 的接口，但 candleSnapshot 一次最多 5000 根，往前翻页直到够 days 天。"""
-    from . import backfill
-    import httpx
-    end = int(time.time() * 1000)
-    start = end - days * 86400 * 1000
-    out: dict[int, dict] = {}
-    cur_end = end
-    for _ in range(60):
-        r = httpx.post(backfill.INFO_URL, json={"type": "candleSnapshot",
-                                                "req": {"coin": coin, "interval": interval, "startTime": start, "endTime": cur_end}},
-                       timeout=60)
-        r.raise_for_status()
-        cs = r.json()
-        if not cs:
-            break
-        new = [c for c in cs if int(c["t"]) not in out]
-        for c in cs:
-            out[int(c["t"])] = c
-        if not new or int(cs[0]["t"]) <= start:
-            break
-        cur_end = int(cs[0]["t"]) - 1
-    return [out[t] for t in sorted(out)]
-
-
-def cache_path(settings, coin: str, interval: str) -> Path:
-    return Path(settings.data) / "backfill" / f"candles_{coin.replace(':', '_')}_{interval}.parquet"
-
-
-def save_cache(settings, coin: str, interval: str, candles: list[dict]) -> Path:
-    import pyarrow as pa
-    import pyarrow.parquet as pq
-    p = cache_path(settings, coin, interval)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    pq.write_table(pa.table({
-        "t": [int(c["t"]) for c in candles], "o": [float(c["o"]) for c in candles], "h": [float(c["h"]) for c in candles],
-        "l": [float(c["l"]) for c in candles], "c": [float(c["c"]) for c in candles], "v": [float(c["v"]) for c in candles],
-        "fetched_at": [int(time.time() * 1000)] * len(candles)}), p)
-    return p
-
-
-def load_cache(settings, coin: str) -> tuple[list[dict], str] | None:
-    """按偏好顺序找本地缓存（含周末 backfill 存的 1h 文件）。"""
-    import pyarrow.parquet as pq
-    for iv in INTERVAL_PREF:
-        p = cache_path(settings, coin, iv)
-        if p.exists():
-            tb = pq.read_table(p).to_pylist()
-            return [{"t": r["t"], "o": r["o"], "h": r["h"], "l": r["l"], "c": r["c"], "v": r["v"]} for r in tb], iv
-    return None
-
-
-def get_candles(settings, coin: str, days: int) -> tuple[list[dict], str, str]:
-    """返回 (candles, interval, 来源说明)。网络失败 → 本地缓存；都没有 → 抛异常。"""
-    errs = []
-    for iv in INTERVAL_PREF:
-        try:
-            cs = fetch_candles_paged(coin, iv, days)
-            if cs:
-                save_cache(settings, coin, iv, cs)
-                return cs, iv, f"Hyperliquid API（{iv} K 线，{len(cs)} 根）"
-            errs.append(f"{iv}: 空")
-        except Exception as e:  # noqa: BLE001
-            errs.append(f"{iv}: {type(e).__name__} {e}")
-            if "403" in str(e) or "Proxy" in type(e).__name__:
-                break  # 整个主机被拦，换周期也没用
-    cached = load_cache(settings, coin)
-    if cached:
-        cs, iv = cached
-        return cs, iv, f"本地缓存 {cache_path(settings, coin, iv).name}（{len(cs)} 根；网络失败：{'; '.join(errs)}）"
-    raise RuntimeError(f"没有 K 线：网络失败（{'; '.join(errs)}），本地也没有缓存")
+    return trade_stats(rows, cfg, notional_usd, threshold_bps, dev_key, move_key, mode="fade")
 
 
 # ---------------------------------------------------------------- 报告

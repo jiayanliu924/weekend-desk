@@ -7,6 +7,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from desk import config
+from desk import backtest_lib as bl
 from desk import overnight_backtest as ob
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -162,7 +163,7 @@ def test_fetch_failure_falls_back_to_cache(s, monkeypatch):
 
     def boom(coin, interval, days):
         raise RuntimeError("ProxyError 403 Forbidden")
-    monkeypatch.setattr(ob, "fetch_candles_paged", boom)
+    monkeypatch.setattr(bl, "fetch_candles_paged", boom)
     got, iv, src = ob.get_candles(s, "xyz:NVDA", 30)
     assert iv == "5m" and len(got) == len(cs) and "本地缓存" in src and "403" in src
     with pytest.raises(RuntimeError, match="没有 K 线"):
