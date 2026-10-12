@@ -180,7 +180,7 @@ async def main(settings):
     notify.push(settings, "Weekend Desk 已启动", f"合约 {', '.join(i['name'] for i in settings.instruments)}，模式 {'实盘' if settings['live']['enabled'] else '模拟'}")
     tasks = [col.run_ws(), col.run_params(), col.run_flush(), news.run(), job_loop(settings)]
     if settings["options"]["enabled"]:
-        tasks.append(options.OptionsCollector(settings).run())
+        tasks += [c.run() for c in options.collectors(settings)]
     try:
         await asyncio.gather(*tasks)
     finally:

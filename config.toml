@@ -171,6 +171,9 @@ min_paper_weekends = 3
 [options]
 # 第九章 第二阶段：加密期权的事件波动率研究。只做研究，不做市，不卖期权，不下单。
 enabled = true
+# 采集的币种（2026-10-12 起加 ETH）。第一个是主币种：账本/纸面交易只用它，流名沿用 drb_opts/drb_index/drb_dvol；
+# 其余币种各自存到 drb_opts_eth / drb_index_eth / drb_dvol_eth。`currency` 保留做兼容。
+currencies = ["BTC", "ETH"]
 currency = "BTC"
 # Deribit 公开行情（免费，无需账户）
 poll_every_sec = 300
@@ -189,6 +192,22 @@ surprise_hours = 3
 min_history = 5
 # 多少个正式事件后判断假设
 eval_after_events = 20
+
+[options.paper]
+# 纸面期权交易员（11a）：每次锁定同时模拟三种结构 A 卖跨式 / B 买跨式 / C 不动，按历史 实际/隐含 选边。只记账，不下单。
+# 标的等值名义金额（美元）；Deribit BTC 期权 1 张 = 1 BTC，纸面允许小数张
+notional_usd = 1000.0
+# Deribit 期权吃单手续费：每条腿 0.03% 标的，封顶权利金的 12.5%；滑点按权利金的百分比
+fee_pct_underlying = 0.03
+fee_cap_pct_premium = 12.5
+slippage_pct = 0.5
+# 对冲腿（永续）吃单手续费，百分比
+hedge_fee_pct = 0.05
+# 选边规则 v1（写死在代码里）：同组样本 ≥ min_history 个时，均值 实际/隐含 < short_below → A；> long_above → B；否则 C
+short_below = 0.9
+long_above = 1.1
+# 卖跨式"最大亏损"按标的走出多少个隐含标准差来压力测试
+stress_sigmas = 3.0
 
 [notify]
 # 手机推送（ntfy.sh，免费）：在 .env 里填 NTFY_TOPIC

@@ -618,18 +618,41 @@ def weekends(req: Request, coin: str | None = None):
 def options_page(req: Request):
     if (r := _guard(req)):
         return r
+    from . import options_paper
     rows = []
     for x in reversed(options.completed(Ledger(S.data, "options"))):
         lk, o = x["lock"], x["outcome"]
+        pp = o.get("paper") or {}
+        pl = pp.get("pnl") or {}
+        ch = pp.get("chosen") or (lk.get("paper") or {}).get("chosen") or "—"
         rows.append(f"""<tr><td>{E(x['sid'])}</td><td>{E(lk['event_type'])}{' · 窗口有事件' if lk.get('has_event') and lk['sample_kind'] == 'daily' else ''}</td>
 <td>{options._pct(lk.get('implied_vol'))}</td><td>{options._pct(o.get('realized_vol'))}</td>
-<td class="{'bad' if o.get('ok') and o['ratio'] < 1 else 'good' if o.get('ok') else ''}">{_n(o.get('ratio'), 2)}</td><td>{_n(o.get('abs_move_bps'), 0)}</td></tr>""")
+<td class="{'bad' if o.get('ok') and o['ratio'] < 1 else 'good' if o.get('ok') else ''}">{_n(o.get('ratio'), 2)}</td><td>{_n(o.get('abs_move_bps'), 0)}</td>
+<td>{E(ch)} {E(options_paper.NAMES.get(ch, ''))}</td><td class="{_cls(pl.get('A_unhedged'))}">{_n(pl.get('A_unhedged'), 2, sign=True)}</td>
+<td class="{_cls(pl.get('A_hedged'))}">{_n(pl.get('A_hedged'), 2, sign=True)}</td><td class="{_cls(pl.get('B'))}">{_n(pl.get('B'), 2, sign=True)}</td>
+<td class="{_cls(pp.get('chosen_pnl'))}">{_n(pp.get('chosen_pnl'), 2, sign=True) if pp.get('ok') else E('；'.join(pp.get('problems', [])) or '—')}</td></tr>""")
     oc = options.scorecard(S)
+    ps = options_paper.summary(S)
+    t = ps["total"]
+    by_type = "".join(f"<tr><td>{E(k)}</td><td>{v['n']}</td><td class='{_cls(v['A_unhedged'])}'>{_n(v['A_unhedged'], 2, sign=True)}</td>"
+                      f"<td class='{_cls(v['A_hedged'])}'>{_n(v['A_hedged'], 2, sign=True)}</td><td class='{_cls(v['B'])}'>{_n(v['B'], 2, sign=True)}</td>"
+                      f"<td class='{_cls(v['chosen'])}'>{_n(v['chosen'], 2, sign=True)}</td></tr>" for k, v in sorted(ps["by_type"].items()))
+    worst = ps["worst"]
+    paper_card = f"""<h2>纸面期权交易员</h2><p class="sub">每次锁定同时模拟三种结构：A 卖跨式（收权利金，赌实际波动小于隐含）、B 买跨式（付权利金，赌实际波动大于隐含）、C 不动。
+名义 {S['options']['paper']['notional_usd']:.0f} 美元标的等值，Deribit 吃单费 + 滑点全扣。选边规则：同组历史 ≥ {S['options']['min_history']} 个时按均值 实际/隐含 选，否则 C。只记账，不下单。</p>
+<div class="grid"><div class="card"><div class="k">样本数</div><div class="v">{ps['n']}</div><div class="k">实际选边 {ps['n_chosen']} 次</div></div>
+<div class="card"><div class="k">A 卖跨式累计（未对冲）</div><div class="v {_cls(t['A_unhedged'])}">{_n(t['A_unhedged'], 2, sign=True)}</div><div class="k">对冲后 {_n(t['A_hedged'], 2, sign=True)} 美元</div></div>
+<div class="card"><div class="k">B 买跨式累计</div><div class="v {_cls(t['B'])}">{_n(t['B'], 2, sign=True)}</div><div class="k">美元</div></div>
+<div class="card"><div class="k">按规则选边累计</div><div class="v {_cls(t['chosen'])}">{_n(t['chosen'], 2, sign=True)}</div><div class="k">胜率 {_n(ps['hit_rate'] * 100 if ps['hit_rate'] is not None else None, 0, '%')}；卖跨式单次赚钱 {_n(ps['hit_rate_A'] * 100 if ps['hit_rate_A'] is not None else None, 0, '%')}</div></div>
+<div class="card"><div class="k">最差一笔</div><div class="v bad">{_n(worst['pnl'], 2, sign=True) if worst else '—'}</div><div class="k">{E(worst['sid'] + ' ' + options_paper.NAMES[worst['structure'][0]]) if worst else '还没有'}</div></div></div>
+<div class="tw"><table><tr><th>分组</th><th>样本</th><th>A 未对冲</th><th>A 对冲后</th><th>B</th><th>按规则选边</th></tr>{by_type or '<tr><td colspan=6 class="mut">第一个样本结算后出现。</td></tr>'}</table></div>"""
     body = f"""<h1>期权研究</h1><p class="sub">问题：CPI、美联储议息这类事件前，期权价格里预期的波动，和实际走出来的波动谁大？<br>
 实际/隐含 &lt; 1：期权定价偏贵（买期权的人吃亏）；&gt; 1：偏便宜。这部分只研究，不交易。</p>
 <div class="note">{E(options.card_text(oc)).replace(chr(10), '<br>')}</div>
-<div class="tw"><table><tr><th>样本</th><th>类型</th><th>隐含波动（年化）</th><th>实际波动（年化）</th><th>实际/隐含</th><th>24h 实际涨跌 bps</th></tr>
-{''.join(rows) or '<tr><td colspan=6 class="mut">每天凌晨 1 点（加州时间）锁一次对照样本，24 小时后出结果；第一个事件样本是 10/14 CPI。历史粗看见"历史回测"。</td></tr>'}</table></div>"""
+{paper_card}
+<h2>样本</h2>
+<div class="tw"><table><tr><th>样本</th><th>类型</th><th>隐含波动（年化）</th><th>实际波动（年化）</th><th>实际/隐含</th><th>24h 实际涨跌 bps</th><th>纸面选边</th><th>A 未对冲 $</th><th>A 对冲后 $</th><th>B $</th><th>选边结果 $</th></tr>
+{''.join(rows) or '<tr><td colspan=11 class="mut">每天凌晨 1 点（加州时间）锁一次对照样本，24 小时后出结果；第一个事件样本是 10/14 CPI。历史粗看见"历史回测"。</td></tr>'}</table></div>"""
     return page(req, "/options", "期权研究", body)
 
 
