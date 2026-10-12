@@ -80,7 +80,8 @@ def main(argv: list[str]) -> int:
         (Path(s.data) / "reports" / "baseline_history.md").write_text(md)
         print(md[:3000])
         if s["options"]["enabled"]:
-            cur = s["options"]["currency"]
+            from . import options
+            cur = options.currencies(s)[0]
             omd = backfill.options_history(s, backfill.fetch_dvol(cur), backfill.fetch_perp(cur))
             (Path(s.data) / "reports" / "options_history.md").write_text(omd)
             print("\n" + omd)

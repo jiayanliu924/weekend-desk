@@ -76,28 +76,44 @@ def events_in(settings, a: datetime, b: datetime) -> list[Sample]:
 
 
 # ---------------------------------------------------------------- collection
+def currencies(settings) -> list[str]:
+    """采集的币种；第一个是主币种（账本/纸面交易只用它）。老配置只有 `currency` 时沿用。"""
+    o = settings["options"]
+    cs = list(o.get("currencies") or [])
+    if not cs:
+        cs = [o.get("currency", "BTC")]
+    return [c.upper() for c in cs]
+
+
+def stream_names(settings, cur: str) -> dict[str, str]:
+    """主币种沿用 drb_opts / drb_index / drb_dvol；其余币种加后缀（drb_opts_eth…），互不混流。"""
+    suf = "" if cur.upper() == currencies(settings)[0] else f"_{cur.lower()}"
+    return {n: n + suf for n in ("drb_opts", "drb_index", "drb_dvol")}
+
+
 class OptionsCollector:
-    def __init__(self, settings):
+    def __init__(self, settings, currency: str | None = None):
         self.s = settings
         self.o = settings["options"]
-        self.w = {n: RawWriter(settings.data, n) for n in ("drb_opts", "drb_index", "drb_dvol")}
+        self.cur = (currency or currencies(settings)[0]).upper()
+        self.w = {n: RawWriter(settings.data, sn) for n, sn in stream_names(settings, self.cur).items()}
 
     async def run(self):
         async with httpx.AsyncClient(timeout=30) as cli:
             await asyncio.gather(self._index_loop(cli), self._opts_loop(cli))
 
     async def _index_loop(self, cli):
-        cur = self.o["currency"].lower()
+        cur = self.cur.lower()
         while True:
             try:
                 r = (await cli.get(f"{API}/get_index_price", params={"index_name": f"{cur}_usd"})).json()["result"]
                 self.w["drb_index"].add("deribit", cur, r)
             except Exception as e:  # noqa: BLE001
-                log.warning("index: %s", e)
+                log.warning("index %s: %s", cur, e)
             await asyncio.sleep(self.o["index_every_sec"])
 
     async def _opts_loop(self, cli):
-        cur = self.o["currency"]
+        cur = self.cur
         while True:
             try:
                 res = (await cli.get(f"{API}/get_book_summary_by_currency",
@@ -111,10 +127,14 @@ class OptionsCollector:
                 if d.get("data"):
                     self.w["drb_dvol"].add("deribit", cur, {"row": d["data"][-1]})
             except Exception as e:  # noqa: BLE001
-                log.warning("options: %s", e)
+                log.warning("options %s: %s", cur, e)
             for w in self.w.values():
                 w.flush()
             await asyncio.sleep(self.o["poll_every_sec"])
+
+
+def collectors(settings) -> list["OptionsCollector"]:
+    return [OptionsCollector(settings, c) for c in currencies(settings)]
 
 
 def parse_name(name: str):
@@ -138,7 +158,8 @@ def filter_chain(items: list[dict], now: datetime, max_days: float, band: float)
         if abs(k / it["underlying_price"] - 1) > band:
             continue
         out.append({"n": it["instrument_name"], "iv": it["mark_iv"], "u": it["underlying_price"],
-                    "b": it.get("bid_price"), "a": it.get("ask_price"), "oi": it.get("open_interest")})
+                    "b": it.get("bid_price"), "a": it.get("ask_price"), "oi": it.get("open_interest"),
+                    "m": it.get("mark_price")})
     return out
 
 
@@ -279,6 +300,13 @@ def job_lock(settings, smp: Sample, extractor=None, clock=None) -> dict:
         lock["prediction"] = predict(hist, n_macro, rows, settings)
         if iv:
             lock["implied_move_bps"] = iv * math.sqrt(settings["options"]["window_hours"] / (365 * 24)) * 1e4
+        if settings["options"].get("paper"):
+            try:
+                from . import options_paper
+                lock["paper"] = options_paper.plan(settings, led, lock, items, smp.lock)
+            except Exception as e:  # noqa: BLE001
+                log.warning("paper plan failed: %s", e)
+                lock["paper"] = {"chosen": "C", "ok": False, "problems": [f"纸面建仓出错：{e}"]}
     rec = led.append("lock", smp.sid, lock)
     if smp.kind == "event":
         notify.push(settings, f"期权研究：已锁定 {smp.sid}", lock_text(rec), priority="high")
@@ -306,6 +334,15 @@ def job_outcome(settings, smp: Sample) -> dict:
     out = {"ok": True, "realized_vol": rv, "coverage": cov, "log_ratio": lr, "ratio": rv / iv,
            "abs_move_bps": abs(math.log(last / first)) * 1e4,
            "err_model": abs(p["pred"] - lr), "err_A": abs(lr), "err_B": abs(p["baseline_B"] - lr)}
+    if lock.get("paper"):
+        try:
+            from . import options_paper
+            _, end_items = chain_at(settings, b)
+            out["paper"] = options_paper.settle(settings, lock, px, a, b, end_items)
+        except Exception as e:  # noqa: BLE001
+            log.warning("paper settle failed: %s", e)
+            out["paper"] = {"chosen": lock["paper"].get("chosen", "C"), "ok": False, "problems": [f"纸面结算出错：{e}"],
+                            "pnl": {"A_unhedged": 0.0, "A_hedged": 0.0, "B": 0.0, "C": 0.0}}
     rec = led.append("outcome", smp.sid, out)
     if smp.kind == "event":
         notify.push(settings, f"期权研究：结果 {smp.sid}", outcome_text(lock, rec))
@@ -411,17 +448,24 @@ def lock_text(rec: dict) -> str:
     if not rec.get("ok"):
         return "数据不全：" + "；".join(rec["problems"])
     p = rec["prediction"]
-    return (f"{rec['event_type']} 事件前锁定：未来 24 小时隐含波动 {_pct(rec['implied_vol'])}（年化），"
-            f"约合 ±{rec.get('implied_move_bps', 0):.0f} bps。\n预测 实际/隐含 = {math.exp(p['pred']):.2f}（{p['model_version']}）。\n"
-            f"锁定哈希 {rec['record_sha256'][:16]}")
+    txt = (f"{rec['event_type']} 事件前锁定：未来 24 小时隐含波动 {_pct(rec['implied_vol'])}（年化），"
+           f"约合 ±{rec.get('implied_move_bps', 0):.0f} bps。\n预测 实际/隐含 = {math.exp(p['pred']):.2f}（{p['model_version']}）。")
+    if rec.get("paper"):
+        from . import options_paper
+        txt += "\n" + options_paper.lock_text(rec)
+    return txt + f"\n锁定哈希 {rec['record_sha256'][:16]}"
 
 
 def outcome_text(lock: dict, rec: dict) -> str:
     if not rec.get("ok"):
         return "；".join(rec["problems"])
     verdict = "期权定价偏贵（实际波动小于隐含）" if rec["ratio"] < 1 else "期权定价偏便宜（实际波动大于隐含）"
-    return (f"实际波动 {_pct(rec['realized_vol'])} vs 隐含 {_pct(lock['implied_vol'])}，比值 {rec['ratio']:.2f}：{verdict}。\n"
-            f"24 小时实际涨跌 {rec['abs_move_bps']:.0f} bps。")
+    txt = (f"实际波动 {_pct(rec['realized_vol'])} vs 隐含 {_pct(lock['implied_vol'])}，比值 {rec['ratio']:.2f}：{verdict}。\n"
+           f"24 小时实际涨跌 {rec['abs_move_bps']:.0f} bps。")
+    if rec.get("paper"):
+        from . import options_paper
+        txt += "\n" + options_paper.outcome_text(lock, rec)
+    return txt
 
 
 def card_text(c: dict) -> str:

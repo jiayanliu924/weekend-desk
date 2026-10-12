@@ -181,7 +181,7 @@ async def main(settings):
     tasks = [col.run_ws(), col.run_params(), col.run_flush(), news.run(), job_loop(settings),
              positions.run(settings)]   # 仓位看守：和看门狗一样常驻；没填钱包地址时空转
     if settings["options"]["enabled"]:
-        tasks.append(options.OptionsCollector(settings).run())
+        tasks += [c.run() for c in options.collectors(settings)]
     try:
         await asyncio.gather(*tasks)
     finally:
