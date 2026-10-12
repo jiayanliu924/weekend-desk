@@ -190,6 +190,12 @@ min_history = 5
 # 多少个正式事件后判断假设
 eval_after_events = 20
 
+[positions]
+# 仓位看守（#12）：每隔多少秒读一次账户里的所有仓位（含手动开的），只读、不下单。规则用 python -m desk.positions set 或设置页填。
+poll_sec = 30
+# 每多少次读取把原始快照落盘一次（有事件时立刻落盘）
+flush_every_polls = 10
+
 [notify]
 # 手机推送（ntfy.sh，免费）：在 .env 里填 NTFY_TOPIC
 server = "https://ntfy.sh"

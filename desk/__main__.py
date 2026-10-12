@@ -10,6 +10,8 @@ python -m desk check-llm        抽检：随机取最近新闻跑一次抽取，
 python -m desk adduser 名字      创建网页登录账号（在服务器上输入密码）
 python -m desk deluser 名字      删除账号
 python -m desk refreeze         更新代码后、本周末决策前，用新代码重新冻结本周规则（否则本周会作废被跳过）
+python -m desk.positions set BRENTOIL --sl 100.12 --soft-low 101.5 ...   给手动仓位设规则（仓位看守，见 desk/positions.py）
+python -m desk.positions list   看登记簿；python -m desk.positions poll 手动读一次账户
 """
 from __future__ import annotations
 

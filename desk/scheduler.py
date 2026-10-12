@@ -8,7 +8,7 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-from . import agents, jobs, notify, options, rawstore, report
+from . import agents, jobs, notify, options, positions, rawstore, report
 from .clock import current_or_next_weekend, last_completed_weekend
 from .collector import Collector
 from .news import NewsPoller
@@ -178,10 +178,12 @@ async def main(settings):
     col = Collector(settings)
     news = NewsPoller(settings)
     notify.push(settings, "Weekend Desk 已启动", f"合约 {', '.join(i['name'] for i in settings.instruments)}，模式 {'实盘' if settings['live']['enabled'] else '模拟'}")
-    tasks = [col.run_ws(), col.run_params(), col.run_flush(), news.run(), job_loop(settings)]
+    tasks = [col.run_ws(), col.run_params(), col.run_flush(), news.run(), job_loop(settings),
+             positions.run(settings)]   # 仓位看守：和看门狗一样常驻；没填钱包地址时空转
     if settings["options"]["enabled"]:
         tasks.append(options.OptionsCollector(settings).run())
     try:
         await asyncio.gather(*tasks)
     finally:
         col.flush()
+        positions.flush()

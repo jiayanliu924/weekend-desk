@@ -476,6 +476,8 @@ def overview(req: Request):
   <div class="ev">信息周末时顺着偏离做多/做空的"如果"账：真钱此时站一边，这里只记录会赚多少。{E(follow['verdict'])}</div>
 </div>
 
+{_positions_card()}
+
 <h2>本周末打算（纸面练习）</h2>
 {plan_head}{plan}
 
@@ -1024,6 +1026,7 @@ def settings_page(req: Request):
 <button type="submit">保存并测试</button></form>
 <p class="sub">保存前会先用这个 key 试一次（花费不到 0.01 美分），不对就不保存。key 只存在服务器上，网页上只显示开头和最后 4 位。</p></div>"""
     body += _autotrade_html()
+    body += _positions_html()
     return page(req, "/settings", "设置", body)
 
 
@@ -1074,6 +1077,105 @@ def _autotrade_html() -> str:
 <h3>记录</h3>
 <div class="tw"><table><tr><th>周末</th><th>做了什么</th><th class="n">真实盈亏</th><th>备注</th></tr>{rows or '<tr><td colspan=4 class="mut">还没有记录</td></tr>'}</table></div>
 </div>"""
+
+
+def _rule_text(rule: dict) -> str:
+    bits = []
+    if rule.get("sl") is not None:
+        bits.append(f"SL {rule['sl']:g}")
+    if rule.get("soft_low") is not None:
+        bits.append(f"软下限 {rule['soft_low']:g}")
+    if rule.get("soft_high") is not None:
+        bits.append(f"软上限 {rule['soft_high']:g}")
+    if rule.get("dwell_min") is not None:
+        bits.append(f"停留 {rule['dwell_min']:g} 分")
+    if rule.get("exit_at"):
+        try:
+            bits.append("退出 " + datetime.fromisoformat(rule["exit_at"]).astimezone(PT).strftime("%m-%d %H:%M"))
+        except ValueError:
+            bits.append("退出 " + rule["exit_at"])
+    if rule.get("event_status"):
+        bits.append({"ongoing": "事件进行中", "concluded": "事件已结束"}[rule["event_status"]])
+    return " · ".join(bits) if bits else "还没设规则"
+
+
+def _positions_rows(reg: dict) -> str:
+    from . import positions
+    rows = ""
+    for coin, e in sorted(reg["positions"].items(), key=lambda kv: (not kv[1].get("open"), kv[0])):
+        ev = e.get("last_event") or {}
+        side = {"long": "多", "short": "空"}.get(e.get("side"), "—")
+        u = e.get("unrealized_usd")
+        status = "开着" if e.get("open") else ("已平" if e.get("closed_at") else "等它出现")
+        rows += (f'<tr><td><b>{E(e.get("name", coin))}</b><div class="ev">{"bot 开的" if e.get("source") == "bot" else "手动"} · {status}</div></td>'
+                 f'<td>{side} {E(str(e.get("size", "")))}<div class="ev">入场 {E(str(e.get("entry_px", "—")))} · 标记 {E(str(e.get("mark_px", "—")))}</div></td>'
+                 f'<td class="n {_cls(u)}">{"—" if u is None else f"${u:+.2f}"}</td>'
+                 f'<td class="ev">{E(_rule_text(e.get("rule", {})))}{("<br>" + E(e["rule"]["open_rule"])) if e.get("rule", {}).get("open_rule") else ""}</td>'
+                 f'<td class="ev">{(E(positions.TITLES.get(ev["kind"], ev["kind"])) + "<br>" + E(_pt(ev["at"]))) if ev else "—"}</td></tr>')
+    return rows
+
+
+def _positions_card() -> str:
+    from . import positions
+    reg = positions.load(S)
+    addr = positions.address()
+    if not addr:
+        return ('<div class="card" style="margin-top:12px;border-left:3px solid var(--warn)"><div class="k">仓位看守</div>'
+                '<div class="ev">还没填钱包地址，看不到仓位。去 <a href="/settings">设置</a> 填主钱包地址（只读，不需要私钥）。</div></div>')
+    rows = _positions_rows(reg)
+    last = reg.get("last_poll")
+    return (f'<div class="card" style="margin-top:12px;border-left:3px solid var(--acc)"><div class="k">仓位看守（包括你手动开的仓）</div>'
+            f'<div class="v s" style="font-size:18px">{reg.get("n_open", 0)} 个仓位开着 <span class="ev">· 最近读取 {E(_pt(last)) if last else "还没读过"} · 每 {positions.cfg(S)["poll_sec"]} 秒看一次，只提醒不下单</span></div>'
+            + (f'<div class="tw" style="margin-top:8px"><table><tr><th>合约</th><th>仓位</th><th class="n">浮动盈亏</th><th>规则</th><th>最近事件</th></tr>{rows}</table></div>' if rows
+               else '<div class="ev">账户里没有仓位，也没登记过。</div>')
+            + '<div class="ev" style="margin-top:6px"><a href="/settings#positions">改规则</a></div></div>')
+
+
+def _positions_html() -> str:
+    from . import positions
+    reg = positions.load(S)
+    rows = _positions_rows(reg)
+    opts = "".join(f'<option value="{E(i["coin"])}">{E(i["name"])}</option>' for i in S.instruments)
+    return f"""
+<div class="card" id="positions" style="margin-top:18px"><h2 style="margin-top:0">仓位规则（仓位看守）</h2>
+<p class="sub">程序每 {positions.cfg(S)["poll_sec"]} 秒读一次你账户里的所有仓位（含手动开的），按下面的规则在手机上提醒你：跌破软下限并停留够久、收复软上限、到退出时刻、仓位消失（疑似止损）。
+<b>只提醒、不下单。</b>"事件进行中"会把停留时间翻倍，而且只有价格离 SL 不到 0.5% 才提醒跌破软下限（10/11 的教训）。</p>
+<div class="tw"><table><tr><th>合约</th><th>仓位</th><th class="n">浮动盈亏</th><th>规则</th><th>最近事件</th></tr>{rows or '<tr><td colspan=5 class="mut">还没有登记的仓位</td></tr>'}</table></div>
+<h3>设置 / 修改规则</h3>
+<form method="post" action="/settings/position" style="display:grid;gap:10px;max-width:640px">
+<label>合约<select name="coin">{opts}</select></label>
+<div class="grid"><label>SL（止损价）<input name="sl" type="number" step="any" placeholder="100.12"></label>
+<label>软下限<input name="soft_low" type="number" step="any" placeholder="101.5"></label>
+<label>软上限<input name="soft_high" type="number" step="any" placeholder="102.5"></label>
+<label>停留分钟<input name="dwell_min" type="number" step="any" min="0" placeholder="10"></label></div>
+<label>退出时刻（带时区）<input name="exit_at" placeholder="2026-10-12T11:30-07:00"></label>
+<label>开仓理由<input name="open_rule" placeholder="为什么开这单、什么情况下走"></label>
+<label>事件状态<select name="event_status"><option value="">不变</option><option value="ongoing">进行中（提醒更克制）</option><option value="concluded">已结束</option></select></label>
+<label style="flex-direction:row;gap:8px;color:var(--ink)"><input type="checkbox" name="clear" value="1"> 先清掉这个合约的旧规则</label>
+<p class="sub">留空的字段保持不变。命令行等价：<code>python -m desk.positions set BRENTOIL --sl 100.12 --soft-low 101.5 --soft-high 102.5 --dwell-min 10 --exit-at "2026-10-12T11:30-07:00" --event-status ongoing</code></p>
+<button type="submit">保存规则</button></form>
+</div>"""
+
+
+@app.post("/settings/position")
+def settings_position(req: Request, coin: str = Form(...), sl: str = Form(""), soft_low: str = Form(""), soft_high: str = Form(""),
+                      dwell_min: str = Form(""), exit_at: str = Form(""), open_rule: str = Form(""), event_status: str = Form(""),
+                      clear: str = Form("")):
+    if (r := _guard(req)):
+        return r
+    origin = req.headers.get("origin")
+    if origin and req.headers.get("host") and origin.split("//")[-1] != req.headers["host"]:
+        return Response("bad origin", status_code=403)
+    from . import positions
+    try:
+        ent = positions.set_rule(S, coin.strip(), clear=bool(clear), sl=sl.strip(), soft_low=soft_low.strip(), soft_high=soft_high.strip(),
+                                 dwell_min=dwell_min.strip(), exit_at=exit_at.strip(), open_rule=open_rule.strip()[:300],
+                                 event_status=event_status.strip())
+        msg = f"已保存 {ent['name']} 的规则：{_rule_text(ent['rule'])}"
+        notify.push(S, "仓位规则已改", f"{_user(req)}：{msg}")
+    except (ValueError, TypeError) as e:
+        msg = f"没保存：{e}"
+    return RedirectResponse("/settings?" + urlencode({"msg": msg}) + "#positions", status_code=303)
 
 
 @app.post("/settings/wallet")
