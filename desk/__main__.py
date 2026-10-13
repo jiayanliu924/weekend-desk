@@ -12,6 +12,8 @@ python -m desk deluser 名字      删除账号
 python -m desk refreeze         更新代码后、本周末决策前，用新代码重新冻结本周规则（否则本周会作废被跳过）
 python -m desk.positions set BRENTOIL --sl 100.12 --soft-low 101.5 ...   给手动仓位设规则（仓位看守，见 desk/positions.py）
 python -m desk.positions list   看登记簿；python -m desk.positions poll 手动读一次账户
+python -m desk.universe scan    发现 HIP-3 上所有会关门的市场，分类、过门槛、回测、排名（#13，见 knowledge/universe_README.md）
+python -m desk.universe add --top 10   把排名前 10 写进 config.toml（幂等；只允许周一到周四）
 """
 from __future__ import annotations
 

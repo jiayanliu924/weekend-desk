@@ -1,0 +1,22 @@
+# 品种扩展（#13）手工覆盖表：desk/universe.py 的命名规则认不出、或认错的市场写在这里。
+# 优先级：[exclude] > [markets] > 命名规则表 > [dex_default]。改完重跑 python3 -m desk.universe scan。
+#
+# 时间表键（见 desk/universe.py SCHEDULES）：
+#   us_equity      美股单票 24/5：周日 20:00 → 周五 20:00 美东
+#   us_index       美指 23/5：周日 18:00 → 周五 17:00 美东
+#   metals_energy  金属/能源 23/5：同上
+#   fx             外汇：周日 17:00 → 周五 17:00 美东
+#   kr_equity      韩股：周五 20:00 → 周一 09:01 首尔（trade.xyz 口径，同 SMSN）
+#   jp_equity      日股：周五 15:30 → 周一 09:00 东京
+#   hk_equity      港股：周五 16:00 → 周一 09:30 香港
+#   eu_equity      欧股：周五 17:30 → 周一 09:00 柏林（Xetra）
+
+[markets]
+# 例："xyz:TSMC" = "us_equity"   # 台积电 ADR 在 NYSE 交易，按美股时间表；如果是台股现货则没有合适时间表，不要加
+
+[exclude]
+# 例："xyz:FOO" = "预言机来源不明"
+
+[dex_default]
+# 整个 dex 兜底（不建议开；一开就把该 dex 里认不出的名字全按这个时间表算）
+# xyz = "us_equity"

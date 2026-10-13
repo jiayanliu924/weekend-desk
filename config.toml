@@ -230,6 +230,15 @@ lookback_h = 48
 # 每隔多少分钟扫一次
 every_min = 5
 
+[universe]
+# 品种扩展（#13，desk/universe.py）：扫描 HIP-3 dex 时的流动性门槛。主 dex 加密永续不进候选（7×24，没有休市结构）。
+min_day_ntl_vlm_usd = 200000.0
+min_oi_usd = 100000.0
+# impactPxs 买卖价之差（bps）上限
+max_spread_bps = 20.0
+# 候选回测最近多少个周末
+weekends = 12
+
 [notify]
 # 手机推送（ntfy.sh，免费）：在 .env 里填 NTFY_TOPIC
 server = "https://ntfy.sh"
