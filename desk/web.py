@@ -711,6 +711,7 @@ def options_page(req: Request):
 <div class="card"><div class="k">按规则选边累计</div><div class="v {_cls(t['chosen'])}">{_n(t['chosen'], 2, sign=True)}</div><div class="k">胜率 {_n(ps['hit_rate'] * 100 if ps['hit_rate'] is not None else None, 0, '%')}；卖跨式单次赚钱 {_n(ps['hit_rate_A'] * 100 if ps['hit_rate_A'] is not None else None, 0, '%')}</div></div>
 <div class="card"><div class="k">最差一笔</div><div class="v bad">{_n(worst['pnl'], 2, sign=True) if worst else '—'}</div><div class="k">{E(worst['sid'] + ' ' + options_paper.NAMES[worst['structure'][0]]) if worst else '还没有'}</div></div></div>
 <div class="tw"><table><tr><th>分组</th><th>样本</th><th>A 未对冲</th><th>A 对冲后</th><th>B</th><th>按规则选边</th></tr>{by_type or '<tr><td colspan=6 class="mut">第一个样本结算后出现。</td></tr>'}</table></div>"""
+    alp = _alpaca_rows()
     body = f"""<h1>期权研究</h1><p class="sub">问题：CPI、美联储议息这类事件前，期权价格里预期的波动，和实际走出来的波动谁大？<br>
 实际/隐含 &lt; 1：期权定价偏贵（买期权的人吃亏）；&gt; 1：偏便宜。这部分只研究，不交易。</p>
 <div class="note">{E(options.card_text(oc)).replace(chr(10), '<br>')}</div>
@@ -718,8 +719,31 @@ def options_page(req: Request):
 {shock_rows}
 <h2>样本</h2>
 <div class="tw"><table><tr><th>样本</th><th>类型</th><th>隐含波动（年化）</th><th>实际波动（年化）</th><th>实际/隐含</th><th>24h 实际涨跌 bps</th><th>纸面选边</th><th>A 未对冲 $</th><th>A 对冲后 $</th><th>B $</th><th>选边结果 $</th></tr>
-{''.join(rows) or '<tr><td colspan=11 class="mut">每天凌晨 1 点（加州时间）锁一次对照样本，24 小时后出结果；第一个事件样本是 10/14 CPI。历史粗看见"历史回测"。</td></tr>'}</table></div>"""
+{''.join(rows) or '<tr><td colspan=11 class="mut">每天凌晨 1 点（加州时间）锁一次对照样本，24 小时后出结果；第一个事件样本是 10/14 CPI。历史粗看见"历史回测"。</td></tr>'}</table></div>
+{alp}"""
     return page(req, "/options", "期权研究", body)
+
+
+def _alpaca_rows() -> str:
+    from . import alpaca_exec as ax
+    rows = ""
+    for r in ax.recent_rows(S, 20):
+        what = r.get("reason") or ""
+        if r["kind"] == "open":
+            what = (f"{r.get('underlying', '')} {ax.STRUCT_NAME.get(r.get('structure'), '')} "
+                    + (f"{r.get('qty')} 张，到期 {r.get('expiry')}，最多亏 ${r.get('max_loss_usd', 0):.0f}" if r.get("qty") else (r.get("note") or ""))
+                    + (f"；出错：{r['error']}" if r.get("error") else ""))
+        elif r["kind"] in ("close", "panic"):
+            what = (r.get("status") or r["kind"]) + (f"；{r['error']}" if r.get("error") else "")
+        elif r["kind"] == "close_pending":
+            what = r.get("why") or r.get("error") or "等开盘再平"
+        pnl = r.get("pnl_usd")
+        rows += (f"<tr><td>{_pt(r['written_at'])}</td><td>{E(r['weekend'])}</td><td>{E(r['kind'])}</td>"
+                 f"<td>{E(ax.MODE_NAME.get(r.get('mode'), r.get('mode') or ''))}</td><td class='ev'>{E(what)}</td>"
+                 f"<td class='n {_cls(pnl)}'>{'—' if pnl is None else f'${pnl:+.2f}'}</td></tr>")
+    return f"""<h2>美股期权执行（Alpaca）</h2><p class="sub">最近 20 条执行记录。模式：真钱 / 纸面账户 / 演练；条件清单在 <a href="/settings#alpaca">设置</a>。盈亏按中间价估算，以券商成交为准。</p>
+<div class="tw"><table><tr><th>时间</th><th>样本</th><th>动作</th><th>模式</th><th>内容</th><th class="n">估算盈亏</th></tr>
+{rows or '<tr><td colspan=6 class="mut">还没有记录（config [alpaca] enabled=false 时不会有）。</td></tr>'}</table></div>"""
 
 
 @app.get("/money", response_class=HTMLResponse)
@@ -1113,8 +1137,58 @@ def settings_page(req: Request):
 <button type="submit">保存并测试</button></form>
 <p class="sub">保存前会先用这个 key 试一次（花费不到 0.01 美分），不对就不保存。key 只存在服务器上，网页上只显示开头和最后 4 位。</p></div>"""
     body += _autotrade_html()
+    body += _alpaca_html()
     body += _positions_html()
     return page(req, "/settings", "设置", body)
+
+
+def _alpaca_html() -> str:
+    from . import alpaca_exec as ax
+    c = ax.cfg(S)
+    checks = ax.gate_checks(S, check_clock=False)
+    kid = os.environ.get("ALPACA_KEY_ID", "")
+    paper_flag = os.environ.get("ALPACA_PAPER", "1").strip() != "0"
+    mode = ax.mode_preview(S)
+    mode_cn = {"off": "关闭（enabled=false，什么都不做）", "paper": "纸面账户（假钱，真撮合）",
+               "dry": "演练（只记录，不发单）"}.get(mode, "真钱（开盘时）")
+    gates = "".join(f'<tr><td class="{"good" if x["ok"] else "bad"}">{"✓" if x["ok"] else "✗"}</td><td>{E(x["name"])}</td>'
+                    f'<td class="ev">{E(x["detail"])}</td></tr>' for x in checks)
+    ap = ax.approvals(S)
+    appr = "；".join(f"{w}：{E(ap[w]['ts'][:16].replace('T', ' '))} UTC（单笔 ≤ ${ap[w]['max_risk_usd']:.0f}）" if w in ap else f"{w}：未批准"
+                    for w in ax.WHO)
+    return f"""
+<div class="card" style="margin-top:18px" id="alpaca"><h2 style="margin-top:0">美股期权执行（Alpaca）</h2>
+<p>key：<b class="{'good' if kid else 'bad'}">{E(_mask(kid)) if kid else '未填'}</b>（{'纸面账户' if paper_flag else '真钱账户'}）·
+现在下单会走：<b>{E(mode_cn)}</b> · enabled={str(c['enabled']).lower()} · live={str(c['live']).lower()} · 单笔最多亏 ${c['max_risk_usd']:.0f} · 当日止损 ${c['daily_loss_stop_usd']:.0f}</p>
+<p class="sub">期权研究选了 A（卖波动）就做铁蝶式、选了 B（买波动）就做买跨式，标的是 SPY / IBIT / 财报个股。下面 8 条全部打勾才会动真钱，少一条就退回纸面账户或演练。说明见 knowledge/alpaca_exec_README.md。</p>
+<div class="tw"><table><tr><th></th><th>条件</th><th>现在</th></tr>{gates}</table></div>
+<p class="sub">批准：{appr}。批准要在服务器上跑 <code>python -m desk.alpaca_exec approve --who kea</code>（老板跑 <code>--who boss</code>）。</p>
+<form method="post" action="/settings/alpaca" style="display:grid;gap:10px;max-width:560px">
+<label>API Key ID<input name="key_id" autocomplete="off" placeholder="PK... 或 AK..." value=""></label>
+<label>Secret Key{'（已保存，只在要更换时填）' if os.environ.get('ALPACA_SECRET') else ''}<input name="secret" type="password" autocomplete="off"></label>
+<label style="flex-direction:row;gap:8px;color:var(--ink)"><input type="checkbox" name="paper" value="1" {'checked' if paper_flag else ''}> 这是纸面账户（Paper Trading）的 key</label>
+<button type="submit">保存 Alpaca key</button></form></div>"""
+
+
+@app.post("/settings/alpaca")
+def settings_alpaca(req: Request, key_id: str = Form(""), secret: str = Form(""), paper: str = Form("")):
+    if (r := _guard(req)):
+        return r
+    origin = req.headers.get("origin")
+    if origin and req.headers.get("host") and origin.split("//")[-1] != req.headers["host"]:
+        return Response("bad origin", status_code=403)
+    key_id, secret = key_id.strip(), secret.strip()
+    if not key_id or len(key_id) < 16 or not key_id.isalnum():
+        msg = "没保存：Key ID 应该是一串 20 位左右的字母数字（纸面账户一般 PK 开头，真钱账户 AK 开头）。"
+    elif not secret and not os.environ.get("ALPACA_SECRET"):
+        msg = "没保存：还要填 Secret Key。"
+    else:
+        save_env_key("ALPACA_KEY_ID", key_id)
+        if secret:
+            save_env_key("ALPACA_SECRET", secret)
+        save_env_key("ALPACA_PAPER", "1" if paper else "0")
+        msg = f"已保存 Alpaca key（{'纸面账户' if paper else '真钱账户'}）。真钱还要过其余条件，见下面的清单。"
+    return RedirectResponse("/settings?" + urlencode({"msg": msg}) + "#alpaca", status_code=303)
 
 
 def _autotrade_html() -> str:

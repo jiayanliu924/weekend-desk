@@ -227,6 +227,23 @@ fee_per_contract_usd = 0.65
 contract_multiplier = 100
 slippage_pct = 1.0
 
+[alpaca]
+# 11d 美股期权执行层（desk/alpaca_exec.py；说明见 knowledge/alpaca_exec_README.md）。
+# enabled=false：完全不动。enabled=true、live=false：有纸面 key 就发到 Alpaca 纸面账户，否则只演练记账。
+# 真钱要 live=true 且其余 7 条门全过（两人批准、回测门、纸面成绩、1 个仓位、当日止损、开盘），少一条就退回纸面/演练。
+enabled = false
+live = false
+# 单笔最多亏多少美元（张数 = floor(这个 / 每张最大亏损)；不够 1 张就不下）
+max_risk_usd = 100.0
+# 当天（美东）真钱已实现亏损到这个数就不再开新仓
+daily_loss_stop_usd = 100.0
+# 真钱前至少要有多少个已结算的事件/突发纸面样本，且按规则选边累计 ≥ 0
+paper_events_required = 5
+# 铁蝶式翅膀离平值多远（%）
+wing_pct = 3.0
+# CPI / FOMC / NFP 和非加密突发事件用哪个标的（SPY 或 QQQ）
+macro_underlying = "SPY"
+
 [positions]
 # 仓位看守（#12）：每隔多少秒读一次账户里的所有仓位（含手动开的），只读、不下单。规则用 python -m desk.positions set 或设置页填。
 poll_sec = 30

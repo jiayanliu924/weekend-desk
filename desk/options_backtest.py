@@ -25,6 +25,7 @@ IBIT 没有公开的隐含波动指数，用 BTC DVOL 当代理（IBIT 期权 20
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import random
 import statistics
@@ -708,6 +709,27 @@ def run(settings, currency: str = "BTC", since: date = date(2021, 1, 1), until: 
     return md, rows
 
 
+def write_gate(settings, rows: list[dict], underlying: str, market: str, synthetic: bool, side: str = "short",
+               out: Path | None = None) -> dict:
+    """给执行层（desk/alpaca_exec.py）的回测门：data/reports/options_gate.json。
+    side="short"：卖跨式口径（执行层的 A 是铁蝶，亏损有上限，所以这个口径偏保守——最差一笔会比铁蝶更差）。
+    盈亏按 [options.paper] notional_usd 名义金额计；pass 用 [alpaca] 的门槛算，执行层还会自己重新核对一遍。"""
+    from . import alpaca_exec
+    a = aggregate(rows, side)
+    c = alpaca_exec.cfg(settings)
+    n = a.get("n", 0)
+    g = {"n_events": n, "net_usd": a.get("net", 0.0), "net_ex_best3_usd": a.get("net_ex_best3", 0.0),
+         "worst_usd": a.get("worst", 0.0), "side": side, "underlying": underlying, "market": market,
+         "synthetic": bool(synthetic), "notional_usd": settings["options"]["paper"]["notional_usd"],
+         "written_at": datetime.now(UTC).isoformat()}
+    g["pass"] = bool(not synthetic and n >= c["gate_min_events"] and g["net_usd"] > 0 and g["net_ex_best3_usd"] > 0
+                     and g["worst_usd"] >= -c["gate_worst_multiple"] * c["max_risk_usd"])
+    out = out or alpaca_exec.gate_file(settings)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(g, ensure_ascii=False, indent=1))
+    return g
+
+
 def main(argv=None) -> int:
     from . import config
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
@@ -727,7 +749,7 @@ def main(argv=None) -> int:
     until = date.fromisoformat(a.until) if a.until else None
     sym = a.underlying.upper() if a.market == "us" else a.currency.upper()
     try:
-        md, _ = run(s, sym, since, until, synthetic=a.synthetic, out=a.out, weekends=not a.no_weekends,
+        md, rows = run(s, sym, since, until, synthetic=a.synthetic, out=a.out, weekends=not a.no_weekends,
                     market=a.market, fee_per_contract=a.fee_per_contract)
     except NetworkBlocked as e:
         host = "stooq.com / fred.stlouisfed.org" + ("（IBIT 还要 deribit.com）" if sym == "IBIT" else "") if a.market == "us" else "deribit.com"
@@ -738,6 +760,9 @@ def main(argv=None) -> int:
               f"数据会存到 {cache_dir(s)}/，之后离线也能重算。不要用 --synthetic 的结果当真。")
         return 2
     print(md)
+    if a.market == "us" and not a.synthetic:
+        g = write_gate(s, rows, sym, a.market, a.synthetic)
+        print(f"\n回测门已写入 data/reports/options_gate.json：{'通过' if g['pass'] else '没通过'}（{g['n_events']} 个事件，净 {g['net_usd']:+.2f}）")
     return 0
 
 

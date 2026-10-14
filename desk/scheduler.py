@@ -91,6 +91,13 @@ def due_jobs(now: datetime, settings, done: set) -> list[tuple[str, object]]:
             out.append((f"optshock:{slot}", None))
         for k in [k for k in done if k.startswith("optshock:") and int(k[9:]) < slot - 3]:
             done.discard(k)
+    # 11d：Alpaca 美股期权仓位——等开盘 / 过了窗口还没平的，每 15 分钟重试平仓
+    if (settings.raw.get("alpaca") or {}).get("enabled"):
+        slot = int(now.timestamp() // (15 * 60))
+        if f"alpacaretry:{slot}" not in done:
+            out.append((f"alpacaretry:{slot}", None))
+        for k in [k for k in done if k.startswith("alpacaretry:") and int(k[12:]) < slot - 3]:
+            done.discard(k)
     return out
 
 
@@ -101,6 +108,9 @@ def run_job(key: str, wk, settings):
     if key.startswith("optshock:"):
         from . import options_shock
         return options_shock.run(settings)
+    if key.startswith("alpacaretry:"):
+        from . import alpaca_exec
+        return alpaca_exec.retry_pending(settings)
     name = key.rsplit(":", 1)[1]
     if name == "open":
         return jobs.job_open(settings, wk)

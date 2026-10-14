@@ -343,6 +343,14 @@ def job_lock(settings, smp: Sample, extractor=None, clock=None, extra: dict | No
     rec = led.append("lock", smp.sid, lock)
     if smp.kind in ("event", "shock"):
         notify.push(settings, f"期权研究：已锁定 {smp.sid}", lock_text(rec), priority="high")
+    # 11d：美股期权执行层（Alpaca）。出任何错都不能影响研究账本
+    pp = rec.get("paper") or {}
+    if pp.get("chosen", "C") != "C" and (settings.raw.get("alpaca") or {}).get("enabled"):
+        try:
+            from . import alpaca_exec
+            alpaca_exec.open_for_sample(settings, smp, pp)
+        except Exception as e:  # noqa: BLE001
+            log.warning("alpaca open failed: %s", e)
     return rec
 
 
@@ -353,12 +361,16 @@ def job_outcome(settings, smp: Sample) -> dict:
         return w["outcome"]
     lock = w.get("lock")
     if not lock or not lock.get("ok"):
-        return led.append("outcome", smp.sid, {"ok": False, "problems": ["没有有效的锁定"]})
+        rec = led.append("outcome", smp.sid, {"ok": False, "problems": ["没有有效的锁定"]})
+        _alpaca_close(settings, smp)   # 研究结果作废也要平掉真实仓位
+        return rec
     a, b = to_ns(smp.lock), to_ns(smp.end)
     px = index_series(settings, a - int(120e9), b + int(120e9))
     rv, cov = realized_vol(px, a, b)
     if rv is None or cov < 0.8:
-        return led.append("outcome", smp.sid, {"ok": False, "problems": [f"窗口内指数数据覆盖率 {cov:.0%}，不足 80%"]})
+        rec = led.append("outcome", smp.sid, {"ok": False, "problems": [f"窗口内指数数据覆盖率 {cov:.0%}，不足 80%"]})
+        _alpaca_close(settings, smp)   # 研究结果作废也要平掉真实仓位
+        return rec
     iv = lock["implied_vol"]
     lr = math.log(rv / iv)
     p = lock["prediction"]
@@ -379,7 +391,19 @@ def job_outcome(settings, smp: Sample) -> dict:
     rec = led.append("outcome", smp.sid, out)
     if smp.kind in ("event", "shock"):
         notify.push(settings, f"期权研究：结果 {smp.sid}", outcome_text(lock, rec))
+    _alpaca_close(settings, smp)
     return rec
+
+
+def _alpaca_close(settings, smp: Sample) -> None:
+    """11d：样本结束时平掉对应的 Alpaca 仓位（如果有）。出错只记日志。"""
+    if not (settings.raw.get("alpaca") or {}).get("enabled"):
+        return
+    try:
+        from . import alpaca_exec
+        alpaca_exec.close_for_sample(settings, smp)
+    except Exception as e:  # noqa: BLE001
+        log.warning("alpaca close failed: %s", e)
 
 
 SURPRISE_PROMPT = """你是一个信息抽取器。只根据下面的原文判断，不得使用你自己的背景知识。
