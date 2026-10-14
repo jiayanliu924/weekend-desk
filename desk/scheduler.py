@@ -72,6 +72,14 @@ def due_jobs(now: datetime, settings, done: set) -> list[tuple[str, object]]:
     h = settings["notify"].get("daily_pdf_hour_pt", 7)
     if h <= pt.hour < h + 4 and f"dailypdf:{pt.date()}" not in done:
         out.append((f"dailypdf:{pt.date()}", None))
+    # 工作日持续抽取新闻 → 事件（周末窗口外也要有事件，头条动量和期权突发样本才看得到新闻）
+    every_x = int(settings["llm"].get("continuous_every_min", 10) or 0)
+    if every_x > 0:
+        slot = int(now.timestamp() // (every_x * 60))
+        if f"xtract:{slot}" not in done:
+            out.append((f"xtract:{slot}", None))
+        for k in [k for k in done if k.startswith("xtract:") and int(k[7:]) < slot - 3]:
+            done.discard(k)
     # 头条动量影子线：工作日也跑，每 every_min 分钟扫一次（只记账，不下单）
     hs = settings.raw.get("headline_shadow") or {}
     if hs.get("enabled", True):
@@ -102,6 +110,8 @@ def due_jobs(now: datetime, settings, done: set) -> list[tuple[str, object]]:
 
 
 def run_job(key: str, wk, settings):
+    if key.startswith("xtract:"):
+        return continuous_extract(settings)
     if key.startswith("headline:"):
         from . import headline_shadow
         return headline_shadow.run(settings)
@@ -140,6 +150,17 @@ def run_job(key: str, wk, settings):
     if key.startswith("qa:"):
         from . import qa
         return qa.run(settings)
+
+
+def continuous_extract(settings, extractor=None, now_ns: int | None = None) -> int:
+    """工作日/任意时刻：把最近 continuous_lookback_min 分钟收到、还没抽取过的新闻整理成事件。
+
+    已抽取过的新闻（同 prompt_version）会被 extract.pending 跳过，所以和周末窗口的抽取不会重复花钱。
+    """
+    from . import extract
+    look = int(settings["llm"].get("continuous_lookback_min", 90))
+    end = now_ns or time.time_ns()
+    return extract.run_extraction(settings, end - look * 60 * 1_000_000_000, end, extractor=extractor)
 
 
 def integrity(settings) -> None:

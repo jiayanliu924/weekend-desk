@@ -122,6 +122,10 @@ knowledge_cutoff = "2025-03-01"
 # 只抽取这个时间窗内收到的新闻（周五 16:00 至周日决策时刻），控制费用
 window_start = "16:00"
 max_items_per_run = 60
+# 工作日也持续抽取（头条动量影子线、期权突发样本要用）：每隔多少分钟抽一次最近多少分钟收到的新闻。
+# 周末窗口照旧；这里只是补上工作日的空档。设 continuous_every_min = 0 关闭。
+continuous_every_min = 10
+continuous_lookback_min = 90
 
 [model]
 # 7.1 主假设 H1：无实质新闻 → 偏离被抹掉；有实质新闻 → 偏离被确认
