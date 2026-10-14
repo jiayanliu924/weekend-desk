@@ -209,6 +209,24 @@ long_above = 1.1
 # 卖跨式"最大亏损"按标的走出多少个隐含标准差来压力测试
 stress_sigmas = 3.0
 
+[options.shock]
+# 突发冲击样本（11c，事件类别 ③；desk/options_shock.py）：抽取器吐出的重要事件（地缘 / 监管-ETF-SEC / 交易所被盗 / 宏观意外 / 关税）
+# 首次出现就用当下的期权链锁定一个 24 小时样本，锁定记录带 event_status。纸面规则：已结束 → 按历史选边；进行中 / 看不出 → 不动。只记账。
+enabled = true
+every_min = 5
+# 回看多久以前的抽取结果；同一件事 / 同类别在 dedupe_hours 内不重复开样本；新闻超过 max_news_age_h 小时的不开（隐含已不是"刚重新定价"）
+lookback_h = 24
+dedupe_hours = 24
+max_news_age_h = 6
+
+[options.us]
+# 美股期权回测口径（options_backtest --market us）：美国居民用不了 Deribit，真钱会在 Robinhood 做 IBIT / SPY / QQQ / 单票期权。
+# 手续费：每张合约每次成交（Robinhood 本身 0，但 OCC/交易所/监管费加起来约 $0.03–0.10；其他券商常见 $0.65），取 $0.65 保守
+fee_per_contract_usd = 0.65
+# 1 张 = 100 股；滑点按权利金百分比（美股期权事件时刻买卖价差比 Deribit 宽）
+contract_multiplier = 100
+slippage_pct = 1.0
+
 [positions]
 # 仓位看守（#12）：每隔多少秒读一次账户里的所有仓位（含手动开的），只读、不下单。规则用 python -m desk.positions set 或设置页填。
 poll_sec = 30

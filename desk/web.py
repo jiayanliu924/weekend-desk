@@ -646,6 +646,38 @@ def weekends(req: Request, coin: str | None = None):
     return page(req, "/weekends", "周末预测", body)
 
 
+def _shock_rows(oc: dict, ps: dict) -> str:
+    """"突发事件样本"卡片：按 已结束/进行中/看不出 的成绩 + 逐样本表。"""
+    from . import options_paper, options_shock
+    rows = options_shock.rows(S)
+    sb = (oc.get("shock") or {}).get("by_status", {})
+    pb = ps.get("shock_by_status", {})
+    cells = []
+    for st in ("concluded", "ongoing", "unknown"):
+        a, p = sb.get(st) or {}, pb.get(st) or {}
+        cells.append(f"<div class=\"card\"><div class=\"k\">{options.STATUS_NAMES[st]}</div><div class=\"v\">{a.get('n', 0)}</div>"
+                     f"<div class=\"k\">实际/隐含 {_n(a.get('ratio'), 2)}；A 卖跨式 {_n(p.get('A_unhedged'), 2, sign=True)}；按规则 {_n(p.get('chosen'), 2, sign=True)}</div></div>")
+    body = []
+    for r in rows:
+        pl = r.get("pnl") or {}
+        t = datetime.fromtimestamp(r["news_received_at"] / 1e9, tz=UTC).astimezone(PT).strftime("%m-%d %H:%M") if r.get("news_received_at") else "—"
+        ch = r.get("chosen") or "—"
+        body.append(f"<tr><td>{E(r['sid'])}</td><td>{E(r.get('category_name') or r['category'])}</td>"
+                    f"<td>{E(options.STATUS_NAMES.get(r['event_status'], r['event_status']))}</td>"
+                    f"<td title=\"{E(r.get('reason') or '')}\">{E((r.get('title') or '')[:70])}</td><td>{t}</td>"
+                    f"<td>{options._pct(r.get('implied_vol'))}</td><td>{options._pct(r.get('realized_vol'))}</td>"
+                    f"<td class=\"{'bad' if r.get('ratio') is not None and r['ratio'] < 1 else 'good' if r.get('ratio') is not None else ''}\">{_n(r.get('ratio'), 2)}</td>"
+                    f"<td>{E(ch)} {E(options_paper.NAMES.get(ch, ''))}</td>"
+                    f"<td class=\"{_cls(pl.get('A_unhedged'))}\">{_n(pl.get('A_unhedged'), 2, sign=True)}</td>"
+                    f"<td class=\"{_cls(pl.get('B'))}\">{_n(pl.get('B'), 2, sign=True)}</td>"
+                    f"<td class=\"{_cls(r.get('chosen_pnl'))}\">{_n(r.get('chosen_pnl'), 2, sign=True) if r.get('settled') else ('锁定失败' if not r.get('lock_ok') else '等结算')}</td></tr>")
+    return f"""<h2>突发事件样本</h2><p class="sub">事件类别 ③：地缘 / 监管-ETF-SEC / 交易所被盗 / 宏观意外 / 关税。新闻一到就用当下的期权链锁定 24 小时样本——
+问的不是"事前能不能预测"，而是"冲击刚被定价之后，隐含和随后实际谁大"。纸面规则：<b>已结束</b>的事件才按历史选边；<b>进行中 / 看不出</b>一律不动（教训簿 2026-10-11）。只记账。</p>
+<div class="grid">{''.join(cells)}</div>
+<div class="tw"><table><tr><th>样本</th><th>类别</th><th>状态</th><th>新闻</th><th>收到（PT）</th><th>隐含</th><th>实际</th><th>实际/隐含</th><th>纸面选边</th><th>A $</th><th>B $</th><th>选边结果 $</th></tr>
+{''.join(body) or '<tr><td colspan=12 class="mut">抽取器一吐出重要度 ≥2 的突发事件（关税、ETF、袭击、被盗……）这里就会出现一行。</td></tr>'}</table></div>"""
+
+
 @app.get("/options", response_class=HTMLResponse)
 def options_page(req: Request):
     if (r := _guard(req)):
@@ -670,6 +702,7 @@ def options_page(req: Request):
                       f"<td class='{_cls(v['A_hedged'])}'>{_n(v['A_hedged'], 2, sign=True)}</td><td class='{_cls(v['B'])}'>{_n(v['B'], 2, sign=True)}</td>"
                       f"<td class='{_cls(v['chosen'])}'>{_n(v['chosen'], 2, sign=True)}</td></tr>" for k, v in sorted(ps["by_type"].items()))
     worst = ps["worst"]
+    shock_rows = _shock_rows(oc, ps)
     paper_card = f"""<h2>纸面期权交易员</h2><p class="sub">每次锁定同时模拟三种结构：A 卖跨式（收权利金，赌实际波动小于隐含）、B 买跨式（付权利金，赌实际波动大于隐含）、C 不动。
 名义 {S['options']['paper']['notional_usd']:.0f} 美元标的等值，Deribit 吃单费 + 滑点全扣。选边规则：同组历史 ≥ {S['options']['min_history']} 个时按均值 实际/隐含 选，否则 C。只记账，不下单。</p>
 <div class="grid"><div class="card"><div class="k">样本数</div><div class="v">{ps['n']}</div><div class="k">实际选边 {ps['n_chosen']} 次</div></div>
@@ -682,6 +715,7 @@ def options_page(req: Request):
 实际/隐含 &lt; 1：期权定价偏贵（买期权的人吃亏）；&gt; 1：偏便宜。这部分只研究，不交易。</p>
 <div class="note">{E(options.card_text(oc)).replace(chr(10), '<br>')}</div>
 {paper_card}
+{shock_rows}
 <h2>样本</h2>
 <div class="tw"><table><tr><th>样本</th><th>类型</th><th>隐含波动（年化）</th><th>实际波动（年化）</th><th>实际/隐含</th><th>24h 实际涨跌 bps</th><th>纸面选边</th><th>A 未对冲 $</th><th>A 对冲后 $</th><th>B $</th><th>选边结果 $</th></tr>
 {''.join(rows) or '<tr><td colspan=11 class="mut">每天凌晨 1 点（加州时间）锁一次对照样本，24 小时后出结果；第一个事件样本是 10/14 CPI。历史粗看见"历史回测"。</td></tr>'}</table></div>"""

@@ -22,6 +22,10 @@ COIN_KEYWORDS: dict[str, list[str]] = {
     "TSLA": ["TSLA", "TESLA"],
     "INTC": ["INTC", "INTEL"],
     "SMSN": ["SMSN", "SAMSUNG", "KOSPI", "KOREA"],
+    # 比特币（期权研究的突发冲击样本，desk/options_shock.py）：币本身、ETF/监管、交易所、宏观流动性、关税/地缘避险
+    "BTC": ["BTC", "BITCOIN", "CRYPTO", "CRYPTOCURRENCY", "ETF", "IBIT", "SEC", "CFTC", "STABLECOIN", "TETHER", "USDT",
+            "COINBASE", "BINANCE", "BYBIT", "KRAKEN", "OKX", "MICROSTRATEGY", "STRATEGY",
+            "FED", "FOMC", "TREASURY", "POWELL", "TARIFF", "IRAN", "ISRAEL", "RUSSIA", "UKRAINE", "TAIWAN", "CHINA"],
 }
 
 # 原文倾向 → 该合约的方向。油价和"坏消息"是反的：袭击/封锁/制裁（原文"负面"）→ 供应冲击 → 油价涨 → 做多。

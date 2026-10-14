@@ -6,7 +6,11 @@
 每个样本：
   锁定时刻  算出未来 24 小时的"隐含波动"（用 Deribit 各到期日平值期权的隐含波动，按总方差插值到 24 小时）
   窗口结束  用 Deribit BTC 指数价算"实际波动"，比较 ln(实际 / 隐含)
-样本两类：事件（事件前 60 分钟锁定）和每日对照（每天 08:00 UTC 锁定，窗口内无事件的才算对照组）。
+样本三类事件 + 每日对照：
+  ① 排期宏观（CPI / FOMC / NFP，events.toml [events]）：事件前 60 分钟锁定
+  ② 财报（events.toml [earnings]，event_type = "EARNINGS:<ticker>"）：同样事件前 60 分钟锁定
+  ③ 突发冲击（desk/options_shock.py，event_type = "SHOCK:<类别>"）：新闻一到就锁定，锁定记录带 event_status
+  每日对照：每天 08:00 UTC 锁定，窗口内无排期事件的才算对照组。
 基线 A：隐含波动是公允的（预测 ln 比值 = 0）。基线 B：同类样本的历史平均比值。
 """
 from __future__ import annotations
@@ -40,28 +44,45 @@ NAME = re.compile(r"^([A-Z]+)-(\d{1,2})([A-Z]{3})(\d{2})-(\d+(?:d\d+)?)-([CP])$"
 # ---------------------------------------------------------------- calendar
 @dataclass(frozen=True)
 class Sample:
-    sid: str            # "EVT-CPI-2026-10" or "DAY-2026-10-07"
-    kind: str           # "event" | "daily"
-    event_type: str     # CPI / FOMC / NFP / none
+    sid: str            # "EVT-CPI-2026-10" / "EVT-ERN-TSLA-2026Q3" / "SHOCK-GEO-20261015-1430" / "DAY-2026-10-07"
+    kind: str           # "event" | "shock" | "daily"
+    event_type: str     # CPI / FOMC / NFP / EARNINGS:<ticker> / SHOCK:<category> / none
     event_at: datetime | None
     lock: datetime
     end: datetime
+    coin: str | None = None       # 财报：对应的 trade.xyz 合约（xyz:TSLA…），没有就 None
+    confirmed: bool = True        # 财报日期是否公司已公告（False = 按惯例估计）
+
+    @property
+    def is_earnings(self) -> bool:
+        return self.event_type.startswith("EARNINGS:")
 
 
 def load_events(root: Path) -> dict:
     p = Path(root) / "events.toml"
-    return tomllib.loads(p.read_text()) if p.exists() else {"events": [], "past_fomc": []}
+    d = tomllib.loads(p.read_text()) if p.exists() else {}
+    d.setdefault("events", [])
+    d.setdefault("earnings", [])
+    d.setdefault("past_fomc", [])
+    return d
 
 
 def event_samples(settings) -> list[Sample]:
+    """排期事件样本：① 宏观（[events]）+ ② 财报（[earnings]，event_type = EARNINGS:<ticker>）。按事件时间排序。"""
     o = settings["options"]
     tz = ZoneInfo(settings["clock"]["timezone"])
     out = []
-    for e in load_events(settings.root)["events"]:
+    cal = load_events(settings.root)
+    for e in cal["events"]:
         at = datetime.strptime(e["at"], "%Y-%m-%d %H:%M").replace(tzinfo=tz).astimezone(UTC)
         lock = at - timedelta(minutes=o["event_lead_min"])
         out.append(Sample(f"EVT-{e['id']}", "event", e["type"], at, lock, lock + timedelta(hours=o["window_hours"])))
-    return out
+    for e in cal["earnings"]:
+        at = datetime.strptime(e["at"], "%Y-%m-%d %H:%M").replace(tzinfo=tz).astimezone(UTC)
+        lock = at - timedelta(minutes=o["event_lead_min"])
+        out.append(Sample(f"EVT-{e['id']}", "event", f"EARNINGS:{e['ticker'].upper()}", at, lock,
+                          lock + timedelta(hours=o["window_hours"]), coin=e.get("coin"), confirmed=bool(e.get("confirmed", True))))
+    return sorted(out, key=lambda s_: s_.event_at)
 
 
 def daily_sample(day, settings) -> Sample:
@@ -72,7 +93,8 @@ def daily_sample(day, settings) -> Sample:
 
 
 def events_in(settings, a: datetime, b: datetime) -> list[Sample]:
-    return [e for e in event_samples(settings) if a <= e.event_at < b]
+    """窗口内的排期宏观事件（只算 ①；财报不改变每日对照组的分组口径）。"""
+    return [e for e in event_samples(settings) if a <= e.event_at < b and not e.is_earnings]
 
 
 # ---------------------------------------------------------------- collection
@@ -245,8 +267,11 @@ def _history(led: Ledger, settings, group: str) -> list[float]:
 
 
 def group_of(lock: dict) -> str:
+    """预测模型的历史分组：排期事件 / 突发冲击 / 每日（窗口有事件 / 对照）。突发样本绝不混进对照组。"""
     if lock["sample_kind"] == "event":
         return "event"
+    if lock["sample_kind"] == "shock":
+        return "shock"
     return "daily_with_event" if lock.get("has_event") else "control"
 
 
@@ -264,18 +289,21 @@ def predict(hist: list[float], n_macro: int, rows_for_ols: list[tuple[float, int
 
 
 # ---------------------------------------------------------------- jobs
-def job_lock(settings, smp: Sample, extractor=None, clock=None) -> dict:
+def job_lock(settings, smp: Sample, extractor=None, clock=None, extra: dict | None = None, run_extract: bool = True) -> dict:
+    """锁定一个样本。extra：并入锁定记录的附加字段（突发样本带 event_status / shock 详情）。
+    run_extract=False：突发样本的新闻已经抽取过（抽取结果就是触发源），不再跑一次。"""
     led = Ledger(settings.data, "options")
     existing = [r for r in led.all() if r["weekend"] == smp.sid and r["kind"] == "lock"]
     if existing:
         return existing[0]
     t = to_ns(smp.lock)
     # make sure the past day's news has been turned into an event table before locking (point-in-time)
-    try:
-        kw = {"clock": clock} if clock else {}
-        extract.run_extraction(settings, t - int(24 * 3600e9), t, extractor=extractor, **kw)
-    except Exception as e:  # noqa: BLE001
-        log.warning("extraction before options lock failed: %s", e)
+    if run_extract:
+        try:
+            kw = {"clock": clock} if clock else {}
+            extract.run_extraction(settings, t - int(24 * 3600e9), t, extractor=extractor, **kw)
+        except Exception as e:  # noqa: BLE001
+            log.warning("extraction before options lock failed: %s", e)
     snap_at, items = chain_at(settings, t)
     problems = []
     iv = None
@@ -293,6 +321,11 @@ def job_lock(settings, smp: Sample, extractor=None, clock=None) -> dict:
             "implied_vol": iv, "dvol": dvol_at(settings, t), "snapshot_received_at": snap_at,
             "has_event": bool(inside), "events_in_window": [e.sid for e in inside], "n_macro_events_24h": n_macro,
             "ok": not problems, "problems": problems, "prompt_version": settings["llm"]["prompt_version"]}
+    if smp.is_earnings:
+        lock["coin"] = smp.coin
+        lock["date_confirmed"] = smp.confirmed
+    if extra:
+        lock.update(extra)
     if lock["ok"]:
         hist = _history(led, settings, group_of(lock))
         rows = [(r["outcome"]["log_ratio"], r["lock"].get("n_macro_events_24h", 0))
@@ -308,7 +341,7 @@ def job_lock(settings, smp: Sample, extractor=None, clock=None) -> dict:
                 log.warning("paper plan failed: %s", e)
                 lock["paper"] = {"chosen": "C", "ok": False, "problems": [f"纸面建仓出错：{e}"]}
     rec = led.append("lock", smp.sid, lock)
-    if smp.kind == "event":
+    if smp.kind in ("event", "shock"):
         notify.push(settings, f"期权研究：已锁定 {smp.sid}", lock_text(rec), priority="high")
     return rec
 
@@ -344,7 +377,7 @@ def job_outcome(settings, smp: Sample) -> dict:
             out["paper"] = {"chosen": lock["paper"].get("chosen", "C"), "ok": False, "problems": [f"纸面结算出错：{e}"],
                             "pnl": {"A_unhedged": 0.0, "A_hedged": 0.0, "B": 0.0, "C": 0.0}}
     rec = led.append("outcome", smp.sid, out)
-    if smp.kind == "event":
+    if smp.kind in ("event", "shock"):
         notify.push(settings, f"期权研究：结果 {smp.sid}", outcome_text(lock, rec))
     return rec
 
@@ -358,6 +391,16 @@ SURPRISE_PROMPT = """你是一个信息抽取器。只根据下面的原文判�
 
 KEYWORDS = {"CPI": r"\bCPI\b|inflation|consumer price", "FOMC": r"\bFed\b|FOMC|rate decision|Powell|interest rate",
             "NFP": r"payroll|jobs report|nonfarm|unemployment rate"}
+# 财报：新闻里会出现的公司名（ticker 本身也匹配）
+EARNINGS_NAMES = {"NVDA": "Nvidia", "TSLA": "Tesla", "INTC": "Intel", "SMSN": "Samsung", "AAPL": "Apple",
+                  "MSFT": "Microsoft", "AMZN": "Amazon", "GOOGL": "Alphabet|Google", "META": "Meta", "AMD": "AMD"}
+
+
+def surprise_pattern(event_type: str) -> re.Pattern:
+    if event_type.startswith("EARNINGS:"):
+        tk = event_type.split(":", 1)[1]
+        return re.compile(rf"\b{re.escape(tk)}\b|{EARNINGS_NAMES.get(tk, tk)}", re.I)
+    return re.compile(KEYWORDS.get(event_type, re.escape(event_type)), re.I)
 
 
 def job_surprise(settings, smp: Sample, extractor=None) -> dict:
@@ -365,7 +408,7 @@ def job_surprise(settings, smp: Sample, extractor=None) -> dict:
     led = Ledger(settings.data, "options")
     a = to_ns(smp.event_at)
     b = a + int(settings["options"]["surprise_hours"] * 3600e9)
-    pat = re.compile(KEYWORDS.get(smp.event_type, smp.event_type), re.I)
+    pat = surprise_pattern(smp.event_type)
     rows = rawstore.query(settings.data, "news", select="received_at, key, payload",
                           sql_where=f"received_at >= {a} AND received_at < {b}")
     extractor = extractor or extract.AnthropicExtractor(settings["llm"]["model"])
@@ -429,6 +472,18 @@ def scorecard(settings) -> dict:
     em = [r for r in recs if r["lock"]["sample_kind"] == "event"]
     if em:
         res["event_err"] = {k: sum(r["outcome"][f"err_{k}"] for r in em) / len(em) for k in ("model", "A", "B")}
+    # ② 财报单列（它们也在 n_event 里）
+    ern = [r["outcome"]["log_ratio"] for r in em if r["lock"]["event_type"].startswith("EARNINGS:")]
+    res["n_earnings"], res["earnings_ratio"] = len(ern), gm(ern)
+    # ③ 突发冲击：按 event_status（已结束 / 进行中 / 看不出）分开，再按类别
+    sh = [r for r in recs if r["lock"]["sample_kind"] == "shock"]
+    res["shock"] = {"n": len(sh), "by_status": {}, "by_category": {}}
+    for st in extract.EVENT_STATUSES:
+        xs = [r["outcome"]["log_ratio"] for r in sh if (r["lock"].get("event_status") or "unknown") == st]
+        res["shock"]["by_status"][st] = {"n": len(xs), "ratio": gm(xs)}
+    for cat in sorted({r["lock"]["event_type"] for r in sh}):
+        xs = [r["outcome"]["log_ratio"] for r in sh if r["lock"]["event_type"] == cat]
+        res["shock"]["by_category"][cat] = {"n": len(xs), "ratio": gm(xs)}
     need = settings["options"]["eval_after_events"]
     if len(ev) >= need and p is not None:
         if p < 0.05:
@@ -440,6 +495,9 @@ def scorecard(settings) -> dict:
     return res
 
 
+STATUS_NAMES = {"concluded": "已结束", "ongoing": "进行中", "unknown": "看不出"}
+
+
 def _pct(x):
     return "—" if x is None else f"{x * 100:.1f}%"
 
@@ -448,8 +506,13 @@ def lock_text(rec: dict) -> str:
     if not rec.get("ok"):
         return "数据不全：" + "；".join(rec["problems"])
     p = rec["prediction"]
-    txt = (f"{rec['event_type']} 事件前锁定：未来 24 小时隐含波动 {_pct(rec['implied_vol'])}（年化），"
-           f"约合 ±{rec.get('implied_move_bps', 0):.0f} bps。\n预测 实际/隐含 = {math.exp(p['pred']):.2f}（{p['model_version']}）。")
+    if rec.get("sample_kind") == "shock":
+        sh = rec.get("shock") or {}
+        head = (f"突发 {rec['event_type']}（{STATUS_NAMES.get(rec.get('event_status'), '看不出')}）新闻到达后锁定："
+                f"{(sh.get('title') or '')[:60]}\n未来 24 小时隐含波动 {_pct(rec['implied_vol'])}（年化），")
+    else:
+        head = f"{rec['event_type']} 事件前锁定：未来 24 小时隐含波动 {_pct(rec['implied_vol'])}（年化），"
+    txt = head + (f"约合 ±{rec.get('implied_move_bps', 0):.0f} bps。\n预测 实际/隐含 = {math.exp(p['pred']):.2f}（{p['model_version']}）。")
     if rec.get("paper"):
         from . import options_paper
         txt += "\n" + options_paper.lock_text(rec)
@@ -472,6 +535,13 @@ def card_text(c: dict) -> str:
     f = lambda x: "—" if x is None else f"{x:.2f}"  # noqa: E731
     lines = [f"事件样本 {c['n_event']} 个，平均 实际/隐含 = {f(c['event_ratio'])}；"
              f"无事件对照日 {c['n_control']} 个，平均 {f(c['control_ratio'])}。"]
+    if c.get("n_earnings"):
+        lines.append(f"其中财报 {c['n_earnings']} 个，平均 {f(c['earnings_ratio'])}。")
+    sh = c.get("shock") or {}
+    if sh.get("n"):
+        bs = sh["by_status"]
+        lines.append("突发冲击 " + f"{sh['n']} 个：" + "，".join(
+            f"{STATUS_NAMES[st]} {bs[st]['n']} 个（{f(bs[st]['ratio'])}）" for st in ("concluded", "ongoing", "unknown") if bs[st]["n"]) + "。")
     if c.get("event_err"):
         e = c["event_err"]
         lines.append(f"事件样本预测误差（ln 比值）：模型 {e['model']:.3f} / 基线A {e['A']:.3f} / 基线B {e['B']:.3f}")

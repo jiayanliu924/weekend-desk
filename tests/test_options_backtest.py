@@ -116,3 +116,97 @@ def test_cli_blocked_exits_2(s, monkeypatch, capsys):
     monkeypatch.setattr(ob, "fetch_dvol", boom)
     assert ob.main(["--currency", "BTC", "--since", "2024-01-01"]) == 2
     assert "bot 服务器" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------- 美股口径（--market us，11c）：合成日线上跑，不碰网络
+def test_us_synthetic_rows_and_fees(s):
+    since, until = date(2024, 1, 1), date(2024, 6, 30)
+    px, iv = ob.synthetic_us_data(since, until)
+    assert all(datetime.fromtimestamp(t / 1000, tz=UTC).weekday() < 5 for t in px)     # 只有工作日
+    assert set(px) == set(iv)
+    pcfg, ucfg = s["options"]["paper"], ob.us_cfg(s)
+    assert ucfg == {"fee_per_contract_usd": 0.65, "contract_multiplier": 100, "slippage_pct": 1.0}
+    rows = ob.us_event_rows(ob.event_calendar(since, until), px, iv, pcfg, ucfg, underlying="SPY")
+    assert len(rows) == 16 and {r["kind"] for r in rows} == {"CPI", "FOMC", "NFP"}      # 没有周末样本
+    r = next(x for x in rows if x["kind"] == "FOMC")
+    assert r["iv"] == pytest.approx(0.22)                     # 锁定日（事件前一个交易日）VIX = 18 + 4
+    assert r["lock"] < r["at"] and r["ratio"] == pytest.approx(r["rv"] / r["iv"])
+    assert r["short"] + r["long"] == pytest.approx(-2 * r["fees"])
+    assert r["n_contracts"] == pytest.approx(1000 / (r["S0"] * 100))
+    # 费用 = 每张 0.65 × 2 腿 × 进出 + 1% 滑点（权利金 + 赔付）
+    assert r["fees"] == pytest.approx(0.65 * 2 * 2 * r["n_contracts"] + 0.01 * (r["premium"] + r["payout"]))
+    assert r["iv_over_trailing"] is not None and "ibit_options_listed" not in r
+    # 费用参数可改
+    st = ob.us_straddle_pnl(400.0, 404.0, 0.2, pcfg, {**ucfg, "fee_per_contract_usd": 0.0, "slippage_pct": 0.0})
+    assert st["fees"] == 0 and st["short"] == pytest.approx(st["premium"] - st["payout"])
+    # 两腿都归零（标的没动）时不用平仓，只有进场费
+    st0 = ob.us_straddle_pnl(400.0, 400.0, 0.2, pcfg, ucfg)
+    assert st0["payout"] == 0 and st0["fees"] == pytest.approx(0.65 * 2 * st0["n_contracts"] + 0.01 * st0["premium"])
+
+
+def test_us_long_fixture_implied_rich(s):
+    since, until = date(2021, 1, 1), date(2025, 12, 31)
+    px, iv = ob.synthetic_us_data(since, until)
+    rows = ob.us_event_rows(ob.event_calendar(since, until), px, iv, s["options"]["paper"], ob.us_cfg(s))
+    a = ob.aggregate(rows, "short")
+    assert a["n"] > 150 and 0.4 < a["geo_ratio"] < 1.0           # 合成：实际 = 隐含 × 0.85（单日估计的几何均值还会再偏低）
+    assert ob.by_kind_year(rows)[("ALL", "ALL")]["n"] == a["n"]
+
+
+def test_us_ibit_flag_and_report(s):
+    since, until = date(2024, 9, 1), date(2025, 1, 31)
+    px, iv = ob.synthetic_us_data(since, until)
+    rows = ob.us_event_rows(ob.event_calendar(since, until), px, iv, s["options"]["paper"], ob.us_cfg(s), underlying="IBIT")
+    assert any(not r["ibit_options_listed"] for r in rows) and any(r["ibit_options_listed"] for r in rows)
+    assert all(r["ibit_options_listed"] == (date.fromisoformat(r["at"][:10]) >= ob.IBIT_OPTIONS_SINCE) for r in rows)
+    md = ob.report_md("IBIT", since, until, rows, "合成", s["options"]["paper"], synthetic=True, market="us", ucfg=ob.us_cfg(s))
+    assert "美股口径" in md and "BTC DVOL" in md and "2024-11-19" in md and "合成数据" in md and "不是真实期权链" in md
+    md2 = ob.report_md("SPY", since, until, rows, "x", s["options"]["paper"], market="us", ucfg=ob.us_cfg(s))
+    assert "VIX 近似" in md2 and "每张合约每次成交 0.65 美元" in md2 and "Robinhood" in md2 and "合成数据" not in md2
+
+
+def test_us_run_and_cli(s, monkeypatch, capsys):
+    md, rows = ob.run(s, "QQQ", date(2024, 3, 1), date(2024, 6, 30), synthetic=True, market="us", fee_per_contract=0.1)
+    assert rows and "VXN 近似" in md and "每张合约每次成交 0.10 美元" in md
+    assert (Path(s.data) / "reports" / "options_backtest_US_QQQ_SYNTHETIC.md").exists()
+    with pytest.raises(ValueError):
+        ob.run(s, "BTC", date(2024, 3, 1), date(2024, 4, 1), synthetic=True, market="us")
+    monkeypatch.setattr("desk.config.load", lambda root=None: s)
+    assert ob.main(["--market", "us", "--underlying", "spy", "--since", "2024-03-01", "--until", "2024-04-30", "--synthetic"]) == 0
+    assert "美股口径，VIX 近似）：SPY" in capsys.readouterr().out
+    # 网络被拦、没缓存 → 退出码 2，提示去 bot 服务器跑
+    def boom(*a, **k):
+        raise ob.NetworkBlocked("CONNECT tunnel failed, response 403")
+    monkeypatch.setattr(ob, "fetch_stooq_daily", boom)
+    monkeypatch.setattr(ob, "fetch_fred_daily", boom)
+    assert ob.main(["--market", "us", "--underlying", "SPY", "--since", "2024-01-01"]) == 2
+    out = capsys.readouterr().out
+    assert "stooq.com" in out and "--market us --underlying SPY" in out
+    # 有缓存 → 用缓存
+    ob.save_series(s, "us_SPY_px_1d", {0: 400.0})
+    ob.save_series(s, "us_VIX_1d", {0: 18.0})
+    px, iv, src = ob.get_us_data(s, "SPY", date(2024, 1, 1), date(2024, 2, 1))
+    assert px == {0: 400.0} and iv == {0: 18.0} and "本地缓存" in src
+
+
+def test_us_csv_parsing_and_fallback(monkeypatch):
+    stooq = "Date,Open,High,Low,Close,Volume\n2024-01-02,470,472,468,471.5,1000\n2024-01-03,471,473,469,470.2,900\n"
+    d = ob.parse_daily_csv(stooq, "Date", "Close")
+    assert d == {ob._day_ms(date(2024, 1, 2)): 471.5, ob._day_ms(date(2024, 1, 3)): 470.2}
+    fred = "observation_date,VIXCLS\n2024-01-02,13.2\n2024-01-03,.\n2024-01-04,14.1\n"
+    d = ob.parse_daily_csv(fred, "observation_date", "VIXCLS")
+    assert d == {ob._day_ms(date(2024, 1, 2)): 13.2, ob._day_ms(date(2024, 1, 4)): 14.1}   # "." 跳过
+    with pytest.raises(RuntimeError):
+        ob.parse_daily_csv("a,b\n1,2\n", "Date", "Close")
+    # stooq 被拦 → 退到 FRED
+    def blocked(sym):
+        raise ob.NetworkBlocked("403")
+    assert ob._try_sources("x", [(blocked, "spy.us"), (lambda s_: {1: 2.0}, "SP500")]) == {1: 2.0}
+    with pytest.raises(ob.NetworkBlocked):
+        ob._try_sources("x", [(blocked, "spy.us"), (blocked, "SP500")])
+    with pytest.raises(ob.NetworkBlocked):
+        ob._try_sources("x", [(blocked, "ibit.us"), (lambda s_: {}, None)])      # None 源跳过
+    # DVOL 小时 → 日（21:00 UTC 那一格，×100 变"点"）
+    t = ob._day_ms(date(2024, 1, 2))
+    daily = ob.dvol_daily_from_hourly({t + 20 * ob.H_MS: 0.5, t + 21 * ob.H_MS: 0.55, t + 22 * ob.H_MS: 0.6})
+    assert list(daily) == [t] and daily[t] == pytest.approx(55.0)

@@ -8,7 +8,7 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-from . import agents, jobs, notify, options, positions, rawstore, report
+from . import agents, jobs, notify, options, options_shock, positions, rawstore, report
 from .clock import current_or_next_weekend, last_completed_weekend
 from .collector import Collector
 from .news import NewsPoller
@@ -82,6 +82,15 @@ def due_jobs(now: datetime, settings, done: set) -> list[tuple[str, object]]:
         # 状态文件别被每 5 分钟一个的 key 撑爆：只留最近几个
         for k in [k for k in done if k.startswith("headline:") and int(k[9:]) < slot - 3]:
             done.discard(k)
+    # 期权研究的突发冲击样本（11c）：每 every_min 分钟扫一次抽取结果，首次看到就锁定（只记账）
+    sh = settings["options"].get("shock") or {}
+    if settings["options"]["enabled"] and sh.get("enabled", True):
+        every = max(1, int(sh.get("every_min", 5)))
+        slot = int(now.timestamp() // (every * 60))
+        if f"optshock:{slot}" not in done:
+            out.append((f"optshock:{slot}", None))
+        for k in [k for k in done if k.startswith("optshock:") and int(k[9:]) < slot - 3]:
+            done.discard(k)
     return out
 
 
@@ -89,6 +98,9 @@ def run_job(key: str, wk, settings):
     if key.startswith("headline:"):
         from . import headline_shadow
         return headline_shadow.run(settings)
+    if key.startswith("optshock:"):
+        from . import options_shock
+        return options_shock.run(settings)
     name = key.rsplit(":", 1)[1]
     if name == "open":
         return jobs.job_open(settings, wk)
@@ -152,6 +164,7 @@ async def job_loop(settings):
         todo = [(k, w, run_job) for k, w in due_jobs(now, settings, done)]
         # options jobs return records too, but are pushed by the options module itself
         todo += [(k, smp, options.run) for k, smp in options.due(now, settings, done)]
+        todo += [(k, smp, options.run) for k, smp in options_shock.due(now, settings, done)]
         locks, outs = [], []
         for key, wk, fn in todo:
             try:

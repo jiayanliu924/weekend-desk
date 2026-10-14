@@ -111,9 +111,21 @@ def mark_usd(it: dict, S: float, K: float, T: float, cp: str) -> float:
 
 # ---------------------------------------------------------------- 选边规则 v1（写死）
 def paper_group(lock: dict) -> str:
-    """分组：事件样本按事件类型（CPI/FOMC/NFP），每日样本沿用 options.group_of（control / daily_with_event）。"""
+    """分组：事件样本按事件类型（CPI / FOMC / NFP / EARNINGS:<ticker>），突发样本按 SHOCK:<类别>，
+    每日样本沿用 options.group_of（control / daily_with_event）。"""
     from .options import group_of
-    return lock["event_type"] if lock.get("sample_kind") == "event" else group_of(lock)
+    return lock["event_type"] if lock.get("sample_kind") in ("event", "shock") else group_of(lock)
+
+
+def shock_gate(lock: dict) -> tuple[bool, str]:
+    """突发样本的事前门：只有"已结束"的事件才允许按历史选边；进行中 / 看不出 → 一律 C。
+    理由见教训簿 2026-10-11：进行中的事件尾部双向，卖波动会被反复扫；看不出的按最坏情况处理。"""
+    if lock.get("sample_kind") != "shock":
+        return True, ""
+    st = lock.get("event_status") or "unknown"
+    if st == "concluded":
+        return True, ""
+    return False, f"突发事件状态为 {'进行中' if st == 'ongoing' else '看不出'}：不选边（只有已结束的突发事件才按历史选边）"
 
 
 def choose_side(ratios: list[float], pcfg: dict, min_history: int) -> tuple[str, str]:
@@ -141,9 +153,15 @@ def plan(settings, led, lock: dict, items: list[dict], lock_at: datetime) -> dic
     pcfg = o["paper"]
     group = paper_group(lock)
     ratios = history_ratios(led, group)
-    chosen, reason = choose_side(ratios, pcfg, o["min_history"])
+    allowed, gate_reason = shock_gate(lock)
+    if allowed:
+        chosen, reason = choose_side(ratios, pcfg, o["min_history"])
+    else:
+        chosen, reason = "C", gate_reason
     base = {"chosen": chosen, "reason": reason, "group": group, "n_history": len(ratios),
             "notional_usd": pcfg["notional_usd"], "ok": False}
+    if lock.get("sample_kind") == "shock":
+        base["event_status"] = lock.get("event_status") or "unknown"
     expiry, rows = pick_expiry(items, lock_at, o["window_hours"])
     if expiry is None:
         return {**base, "problems": ["快照里没有盖住 24 小时窗口的到期日"]}
@@ -184,6 +202,8 @@ def settle(settings, lock: dict, px: list[tuple[int, float]], a_ns: int, b_ns: i
     pp = lock.get("paper") or {}
     out = {"chosen": pp.get("chosen", "C"), "reason": pp.get("reason"), "group": pp.get("group"),
            "n_history": pp.get("n_history", 0), "ok": False}
+    if "event_status" in pp:
+        out["event_status"] = pp["event_status"]
     if not pp.get("ok"):
         return {**out, "pnl": {"A_unhedged": 0.0, "A_hedged": 0.0, "B": 0.0, "C": 0.0}, "problems": pp.get("problems", ["锁定时没有纸面仓位"])}
     S0, K, n, sigma = pp["S0"], pp["strikes"]["call"], pp["n_contracts"], pp["sigma"]
@@ -274,6 +294,7 @@ def summary(settings) -> dict:
     keys = ("A_unhedged", "A_hedged", "B", "C", "chosen")
     tot = {k: 0.0 for k in keys}
     by_type: dict[str, dict] = {}
+    shock_by_status: dict[str, dict] = {}
     chosen_rows = []
     worst = None
     for r in recs:
@@ -286,12 +307,19 @@ def summary(settings) -> dict:
             d[k] += pp["pnl"][k]
         tot["chosen"] += pp["chosen_pnl"]
         d["chosen"] += pp["chosen_pnl"]
+        if r["lock"].get("sample_kind") == "shock":
+            st = r["lock"].get("event_status") or "unknown"
+            sd = shock_by_status.setdefault(st, {k: 0.0 for k in keys} | {"n": 0})
+            sd["n"] += 1
+            for k in keys[:4]:
+                sd[k] += pp["pnl"][k]
+            sd["chosen"] += pp["chosen_pnl"]
         if pp["chosen"] != "C":
             chosen_rows.append(pp["chosen_pnl"])
         for k in ("A_unhedged", "B"):
             if worst is None or pp["pnl"][k] < worst["pnl"]:
                 worst = {"sid": r["sid"], "structure": k, "pnl": pp["pnl"][k]}
-    return {"n": len(recs), "total": tot, "by_type": by_type, "n_chosen": len(chosen_rows),
+    return {"n": len(recs), "total": tot, "by_type": by_type, "shock_by_status": shock_by_status, "n_chosen": len(chosen_rows),
             "hit_rate": (sum(1 for x in chosen_rows if x > 0) / len(chosen_rows)) if chosen_rows else None,
             "hit_rate_A": (sum(1 for r in recs if r["outcome"]["paper"]["pnl"]["A_unhedged"] > 0) / len(recs)) if recs else None,
             "worst": worst}

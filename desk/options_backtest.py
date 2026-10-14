@@ -14,7 +14,13 @@
 局限（README 里有详细说明）：DVOL 是 30 天恒定期限、不是 24 小时的；没有微笑；小时 K 线算实际波动偏低。
 本机连不上 deribit.com 时：有缓存就用缓存，否则提示到 bot 服务器上跑；`--synthetic` 只用于测试，输出会标明"合成数据"。
 
+美股口径（11c，`--market us --underlying SPY|QQQ|IBIT`）：美国居民用不了 Deribit，真钱会在 Robinhood 做美股期权，
+所以再用 VIX（SPY）/ VXN（QQQ）当隐含、日收盘价当实际，算同一套 实际/隐含 和跨式盈亏；费用按美股期权每张合约收。
+IBIT 没有公开的隐含波动指数，用 BTC DVOL 当代理（IBIT 期权 2024-11-19 才上市，之前的行只是"假如有"）。
+数据源：stooq.com 的日线 CSV，不通时退到 FRED（VIXCLS / VXNCLS / SP500 / NASDAQ100）；都不通用缓存。这是 **VIX 近似**，不是真实期权链。
+
 用法：python3 -m desk.options_backtest --currency BTC --since 2021-01-01 [--out data/reports/options_backtest_BTC.md]
+      python3 -m desk.options_backtest --market us --underlying SPY --since 2021-01-01
 """
 from __future__ import annotations
 
@@ -322,6 +328,228 @@ def threshold_sweep(rows: list[dict], thresholds=THRESHOLDS) -> list[dict]:
     return out
 
 
+# ---------------------------------------------------------------- 美股口径（--market us）：日线 + VIX/VXN（IBIT 用 DVOL 代理）
+D_MS = 86_400_000
+STOOQ = "https://stooq.com/q/d/l/"
+FRED = "https://fred.stlouisfed.org/graph/fredgraph.csv"
+IBIT_OPTIONS_SINCE = date(2024, 11, 19)      # IBIT 期权上市日（Nasdaq ISE）
+US_UNDERLYINGS = {
+    "SPY": {"px": "spy.us", "iv": "^vix", "iv_name": "VIX", "fred_px": "SP500", "fred_iv": "VIXCLS"},
+    "QQQ": {"px": "qqq.us", "iv": "^vxn", "iv_name": "VXN", "fred_px": "NASDAQ100", "fred_iv": "VXNCLS"},
+    "IBIT": {"px": "ibit.us", "iv": "DVOL", "iv_name": "BTC DVOL（代理）", "fred_px": None, "fred_iv": None},
+}
+US_DEFAULTS = {"fee_per_contract_usd": 0.65, "contract_multiplier": 100, "slippage_pct": 1.0}
+TRADING_DAYS = 252
+
+
+def us_cfg(settings) -> dict:
+    return {**US_DEFAULTS, **(settings["options"].get("us") or {})}
+
+
+def _day_ms(d: date) -> int:
+    return int(datetime.combine(d, dtime(0), UTC).timestamp() * 1000)
+
+
+def fetch_stooq_daily(symbol: str) -> dict[int, float]:
+    """stooq 日线 CSV（Date,Open,High,Low,Close[,Volume]）→ {当日 00:00 UTC 毫秒: 收盘}。全量，几十 KB。"""
+    import httpx
+    try:
+        r = httpx.get(STOOQ, params={"s": symbol, "i": "d"}, timeout=60, follow_redirects=True)
+        r.raise_for_status()
+    except Exception as e:  # noqa: BLE001
+        if _blocked(e):
+            raise NetworkBlocked(str(e)) from e
+        raise
+    return parse_daily_csv(r.text, "Date", "Close")
+
+
+def fetch_fred_daily(series: str) -> dict[int, float]:
+    """FRED 日线 CSV（observation_date/DATE, <series>）；缺失值是 "."。"""
+    import httpx
+    try:
+        r = httpx.get(FRED, params={"id": series}, timeout=60, follow_redirects=True)
+        r.raise_for_status()
+    except Exception as e:  # noqa: BLE001
+        if _blocked(e):
+            raise NetworkBlocked(str(e)) from e
+        raise
+    head = r.text.splitlines()[0].split(",") if r.text else []
+    return parse_daily_csv(r.text, head[0] if head else "DATE", head[1] if len(head) > 1 else series)
+
+
+def parse_daily_csv(text: str, date_col: str, value_col: str) -> dict[int, float]:
+    import csv
+    import io
+    out: dict[int, float] = {}
+    rd = csv.DictReader(io.StringIO(text))
+    if not rd.fieldnames or date_col not in rd.fieldnames or value_col not in rd.fieldnames:
+        raise RuntimeError(f"CSV 没有 {date_col}/{value_col} 列：{(rd.fieldnames or [])[:6]}")
+    for row in rd:
+        v = (row.get(value_col) or "").strip()
+        ds = (row.get(date_col) or "").strip()
+        if not v or v == "." or not ds:
+            continue
+        try:
+            out[_day_ms(date.fromisoformat(ds))] = float(v)
+        except ValueError:
+            continue
+    return out
+
+
+def dvol_daily_from_hourly(dvol_1h: dict[int, float], hour_utc: int = 21) -> dict[int, float]:
+    """小时 DVOL → 每天美股收盘附近（默认 21:00 UTC）的一个值，单位改成"点"（×100）以和 VIX 一致。"""
+    out = {}
+    for t, v in dvol_1h.items():
+        if (t // H_MS) % 24 == hour_utc:
+            out[t // D_MS * D_MS] = v * 100
+    return out
+
+
+def _try_sources(name: str, sources: list) -> dict[int, float]:
+    """依次尝试数据源；全部被拦 → NetworkBlocked；其它错误继续试下一个。"""
+    last: Exception | None = None
+    blocked = False
+    for fn, arg in sources:
+        if not arg:
+            continue
+        try:
+            d = fn(arg)
+            if d:
+                return d
+        except NetworkBlocked as e:
+            blocked, last = True, e
+        except Exception as e:  # noqa: BLE001
+            last = e
+    if blocked:
+        raise NetworkBlocked(f"{name}: {last}")
+    raise RuntimeError(f"{name}: 没有数据源可用（{type(last).__name__ if last else ''} {last})")
+
+
+def get_us_data(settings, underlying: str, since: date, until: date) -> tuple[dict[int, float], dict[int, float], str]:
+    """返回 (日收盘价, 日隐含指数(点), 来源说明)。stooq → FRED → 本地缓存。IBIT 的隐含 = Deribit DVOL（复用加密口径的缓存）。"""
+    u = US_UNDERLYINGS[underlying]
+    names = {"px": f"us_{underlying}_px_1d", "iv": f"us_{u['iv'].strip('^').upper()}_1d"}
+    cached = {k: load_series(settings, n) or {} for k, n in names.items()}
+    srcs = []
+    try:
+        px = _try_sources(f"{underlying} 价格", [(fetch_stooq_daily, u["px"]), (fetch_fred_daily, u["fred_px"])])
+        srcs.append(f"价格 {len(px)} 天")
+        if u["iv"] == "DVOL":
+            start_ms = _day_ms(since) - 10 * D_MS
+            end_ms = min(_day_ms(until + timedelta(days=2)), int(time.time() * 1000))
+            have = load_series(settings, "BTC_dvol_1h") or {}
+            a = (max(have) + H_MS) if have and min(have) <= start_ms + 2 * D_MS else start_ms
+            fresh = fetch_dvol("BTC", a, end_ms) if a < end_ms else {}
+            d1h = {**have, **fresh}
+            save_series(settings, "BTC_dvol_1h", d1h)
+            iv = dvol_daily_from_hourly(d1h)
+            srcs.append(f"BTC DVOL 代理 {len(iv)} 天（Deribit）")
+        else:
+            iv = _try_sources(u["iv_name"], [(fetch_stooq_daily, u["iv"]), (fetch_fred_daily, u["fred_iv"])])
+            srcs.append(f"{u['iv_name']} {len(iv)} 天")
+        save_series(settings, names["px"], px)
+        save_series(settings, names["iv"], iv)
+        return px, iv, "stooq/FRED 日线（" + "，".join(srcs) + f"；缓存 {cache_dir(settings)}）"
+    except NetworkBlocked as e:
+        if cached["px"] and cached["iv"]:
+            return cached["px"], cached["iv"], f"本地缓存 {cache_dir(settings)}（网络不可达：{str(e)[:80]}）"
+        raise
+    except Exception as e:  # noqa: BLE001
+        if cached["px"] and cached["iv"]:
+            return cached["px"], cached["iv"], f"本地缓存 {cache_dir(settings)}（网络失败：{type(e).__name__} {str(e)[:80]}）"
+        raise RuntimeError(f"没有数据：网络失败（{type(e).__name__} {e}），本地也没有缓存") from e
+
+
+def synthetic_us_data(since: date, until: date, seed: int = 11, base_vix: float = 18.0, event_bump: float = 4.0,
+                      realized_scale: float = 0.85, event_day_mult: float = 1.0) -> tuple[dict[int, float], dict[int, float]]:
+    """确定性的美股合成日线（只用于测试）：工作日一个收盘价；VIX 平时 base_vix，事件前一天抬高 event_bump；
+    实际日波动 = 当天适用的 VIX × realized_scale（隐含系统性偏贵），事件当天再放大 event_day_mult 倍。"""
+    rng = random.Random(seed)
+    ev_days = {e.at.astimezone(ET).date() for e in event_calendar(since, until, weekends=False)}
+    px, iv = {}, {}
+    p = 400.0
+    d = since - timedelta(days=12)
+    while d <= until + timedelta(days=2):
+        if d.weekday() < 5:
+            nxt = d + timedelta(days=1)
+            while nxt.weekday() >= 5:
+                nxt += timedelta(days=1)
+            v = base_vix + (event_bump if nxt in ev_days else 0.0)
+            # 事件当天的实际波动按"前一天（锁定日）的 VIX"来定，和回测的隐含口径对齐
+            v_use = base_vix + event_bump if d in ev_days else v
+            sig = v_use / 100 * realized_scale * (event_day_mult if d in ev_days else 1.0) / math.sqrt(TRADING_DAYS)
+            p *= math.exp(rng.gauss(0, sig) - 0.5 * sig * sig)
+            px[_day_ms(d)] = p
+            iv[_day_ms(d)] = v
+        d += timedelta(days=1)
+    return px, iv
+
+
+def us_straddle_pnl(S0: float, S_end: float, iv: float, pcfg: dict, ucfg: dict) -> dict:
+    """1 个交易日的平值跨式（美股）：按 IV 用 B-S 定价，收盘按内在价值结算。
+    张数 = 名义 / (S0 × 100)，纸面允许小数张；费用 = 每张 fee_per_contract × 2 腿 × 进出各一次 + 权利金/赔付的滑点。"""
+    from .options_paper import bs_price
+    T = 1 / TRADING_DAYS
+    mult = ucfg["contract_multiplier"]
+    n_sh = pcfg["notional_usd"] / S0
+    n_ct = n_sh / mult
+    c, p = bs_price(S0, S0, T, iv, "C"), bs_price(S0, S0, T, iv, "P")
+    premium = (c + p) * n_sh
+    payout = abs(S_end - S0) * n_sh
+    fee_in = ucfg["fee_per_contract_usd"] * 2 * n_ct
+    fee_out = ucfg["fee_per_contract_usd"] * 2 * n_ct if payout > 0 else 0.0     # 两腿都归零就不用平
+    slip = ucfg["slippage_pct"] / 100 * (premium + payout)
+    fees = fee_in + fee_out + slip
+    return {"premium": premium, "payout": payout, "fees": fees, "n_contracts": n_ct,
+            "short": premium - payout - fees, "long": payout - premium - fees}
+
+
+def _prev_day(series: dict[int, float], t_ms: int, back: int = 6) -> int | None:
+    """series 里 t 之前最近的一个交易日 key。"""
+    for i in range(1, back + 1):
+        k = t_ms - i * D_MS
+        if k in series:
+            return k
+    return None
+
+
+def us_event_rows(events: list[Event], px: dict[int, float], iv: dict[int, float], pcfg: dict, ucfg: dict,
+                  underlying: str = "SPY", trailing_days: int = 7) -> list[dict]:
+    """每个排期事件一行：锁定 = 事件前一个交易日收盘（隐含 = 那天的 VIX/100），窗口 = 到事件当天收盘。
+    实际 = 单日对数收益的绝对值 × √(π/2) × √252（单个样本的无偏标准差估计）。"""
+    rows = []
+    for e in events:
+        if e.kind == "WEEKEND":
+            continue
+        d_ms = _day_ms(e.at.astimezone(ET).date())
+        if d_ms not in px:
+            continue
+        lk = _prev_day(px, d_ms)
+        if lk is None or lk not in iv or iv[lk] <= 0:
+            continue
+        S0, S_end, v = px[lk], px[d_ms], iv[lk] / 100
+        r1 = math.log(S_end / S0)
+        rv = abs(r1) * math.sqrt(math.pi / 2) * math.sqrt(TRADING_DAYS)
+        if rv <= 0:
+            continue
+        # 过去 trailing_days 个交易日的日收益标准差年化（事前可知）
+        ks, k = [], lk
+        while len(ks) < trailing_days + 1 and k is not None:
+            ks.append(k)
+            k = _prev_day(px, k)
+        rets = [math.log(px[a] / px[b]) for a, b in zip(ks, ks[1:])]
+        trail = math.sqrt(sum(x * x for x in rets) / len(rets) * TRADING_DAYS) if len(rets) >= 3 else None
+        st = us_straddle_pnl(S0, S_end, v, pcfg, ucfg)
+        row = {"kind": e.kind, "year": e.year, "at": e.at.isoformat(), "lock": datetime.fromtimestamp(lk / 1000, tz=UTC).isoformat(),
+               "iv": v, "rv": rv, "ratio": rv / v, "log_ratio": math.log(rv / v),
+               "iv_over_trailing": (v / trail) if trail else None, "S0": S0, "S_end": S_end,
+               "move_pct": (S_end / S0 - 1) * 100, "vrp": (v * v - rv * rv) / TRADING_DAYS, **st}
+        if underlying == "IBIT":
+            row["ibit_options_listed"] = e.at.date() >= IBIT_OPTIONS_SINCE
+        rows.append(row)
+    return rows
+
+
 # ---------------------------------------------------------------- 报告（中文）
 def _f(x, nd=2, sign=False):
     if x is None:
@@ -336,13 +564,31 @@ def _agg_line(a: dict) -> str:
             f"{a['worst']:+.2f} | {a['net_ex_best3']:+.2f} |")
 
 
-def report_md(currency: str, since: date, until: date, rows: list[dict], source: str, pcfg: dict, synthetic: bool = False) -> str:
-    L = [f"# 期权事件波动率回测（DVOL 近似）：{currency}，{since} → {until}", ""]
+def report_md(currency: str, since: date, until: date, rows: list[dict], source: str, pcfg: dict, synthetic: bool = False,
+              market: str = "crypto", ucfg: dict | None = None) -> str:
+    us = market == "us"
+    ucfg = ucfg or US_DEFAULTS
+    if us:
+        ivn = US_UNDERLYINGS.get(currency, {}).get("iv_name", "VIX")
+        L = [f"# 期权事件波动率回测（美股口径，{ivn} 近似）：{currency}，{since} → {until}", ""]
+    else:
+        L = [f"# 期权事件波动率回测（DVOL 近似）：{currency}，{since} → {until}", ""]
     if synthetic:
-        L += ["**⚠ 合成数据：下面所有数字都来自人造的价格和 DVOL，只用于验证程序逻辑，没有任何市场含义。**", ""]
-    L += [f"生成 {datetime.now(UTC):%Y-%m-%d %H:%M} UTC。数据来源：{source}。",
-          f"名义 {pcfg['notional_usd']:.0f} 美元标的等值；费用：每腿 {pcfg['fee_pct_underlying']}% 标的、封顶权利金 {pcfg['fee_cap_pct_premium']}%，"
-          f"滑点权利金 {pcfg['slippage_pct']}%，进出各一次。隐含 = 事件前 1 小时 DVOL（30 天恒定期限，近似）；实际 = 之后 24 小时小时收益年化。", ""]
+        L += [f"**⚠ 合成数据：下面所有数字都来自人造的价格和 {'VIX' if us else 'DVOL'}，只用于验证程序逻辑，没有任何市场含义。**", ""]
+    if us:
+        L += [f"**⚠ 这是 {ivn} 近似，不是真实期权链**：隐含 = 事件前一个交易日收盘的 {ivn}（30 天恒定期限指数）÷100；"
+              "实际 = 事件当天收盘对前一收盘的单日对数收益 × √(π/2) × √252。跨式按 1 个交易日平值定价，收盘按内在价值结算。", ""]
+        if currency == "IBIT":
+            n_pre = sum(1 for r in rows if not r.get("ibit_options_listed", True))
+            L += [f"**IBIT 说明**：IBIT 期权 {IBIT_OPTIONS_SINCE} 才上市；IBIT 没有公开的隐含波动指数，全程用 BTC DVOL 当代理。"
+                  f"上市前的 {n_pre} 行只是\"假如当时有 IBIT 期权\"，不是可交易过的历史。", ""]
+        L += [f"生成 {datetime.now(UTC):%Y-%m-%d %H:%M} UTC。数据来源：{source}。",
+              f"名义 {pcfg['notional_usd']:.0f} 美元标的等值（= {pcfg['notional_usd']:.0f}/(价格×{ucfg['contract_multiplier']}) 张，纸面允许小数张）；"
+              f"费用：每张合约每次成交 {ucfg['fee_per_contract_usd']:.2f} 美元 × 2 腿 × 进出，再加权利金/赔付的 {ucfg['slippage_pct']}% 滑点。", ""]
+    else:
+        L += [f"生成 {datetime.now(UTC):%Y-%m-%d %H:%M} UTC。数据来源：{source}。",
+              f"名义 {pcfg['notional_usd']:.0f} 美元标的等值；费用：每腿 {pcfg['fee_pct_underlying']}% 标的、封顶权利金 {pcfg['fee_cap_pct_premium']}%，"
+              f"滑点权利金 {pcfg['slippage_pct']}%，进出各一次。隐含 = 事件前 1 小时 DVOL（30 天恒定期限，近似）；实际 = 之后 24 小时小时收益年化。", ""]
     if not rows:
         L += ["**没有一个事件有完整数据。**"]
         return "\n".join(L)
@@ -373,7 +619,20 @@ def report_md(currency: str, since: date, until: date, rows: list[dict], source:
     for r in rows:
         L.append(f"| {r['kind']} | {r['at'][:16].replace('T', ' ')} | {r['iv'] * 100:.0f}% | {r['rv'] * 100:.0f}% | {r['ratio']:.2f} | "
                  f"{r['move_pct']:+.2f} | {r['premium']:.2f} | {r['fees']:.2f} | {r['short']:+.2f} | {r['long']:+.2f} |")
-    L += ["", "## 结论（自动生成，看数据说话）", ""] + verdict_lines(rows, agg)
+    L += ["", "## 结论（自动生成，看数据说话）", ""] + verdict_lines(rows, agg, approx=("VIX" if us else "DVOL"))
+    if us:
+        L += ["", "## 口径与局限", "",
+              f"- {ivn} 是 30 天恒定期限的隐含波动指数，不是事件日 0DTE/周度期权的隐含；事件前短期期权的隐含通常明显高于 {ivn}，"
+              "所以这里的\"隐含\"偏低、卖方盈亏偏保守，买方偏乐观。",
+              "- 实际波动只用一个单日收益估计（×√(π/2) 无偏修正），单个样本噪声很大；只看按类型 × 年份的汇总，不看单行。",
+              "- 窗口是\"前一收盘 → 事件日收盘\"，不是精确的 24 小时；CPI/非农 08:30 ET 发布在窗口内，FOMC 14:00 ET 也在。",
+              "- 没有波动率微笑；按单一 IV 用 B-S 定平值跨式；结算按内在价值（等于拿到期交割）。",
+              f"- 费用：每张 {ucfg['fee_per_contract_usd']:.2f} 美元是常见券商口径；Robinhood 本身不收佣金，只有 OCC/交易所/监管费（每张几美分）。"
+              "滑点按权利金百分比，事件时刻真实点差会更宽。",
+              "- 没有周末样本（美股周末不交易）。",
+              "- 2025 年 10–12 月 BLS 因停摆改期：10 月 CPI 与 10 月非农取消，其余按改期日。",
+              "- 这只是研究口径；真钱在 Robinhood 卖跨式需要更高的期权权限等级，备选的有限风险结构见 knowledge/options_backtest_README.md。"]
+        return "\n".join(L)
     L += ["", "## 口径与局限", "",
           "- DVOL 是 30 天恒定期限的隐含波动指数，不是 24 小时期权的隐含波动；事件前短期期权的隐含通常比 DVOL 高，所以这里的"
           "\"隐含\"偏低、卖方盈亏偏保守（实际可收的权利金更多），买方盈亏偏乐观。",
@@ -385,7 +644,7 @@ def report_md(currency: str, since: date, until: date, rows: list[dict], source:
     return "\n".join(L)
 
 
-def verdict_lines(rows: list[dict], agg: dict) -> list[str]:
+def verdict_lines(rows: list[dict], agg: dict, approx: str = "DVOL") -> list[str]:
     L = []
     a = agg.get(("ALL", "ALL"), {})
     if a.get("n"):
@@ -400,10 +659,10 @@ def verdict_lines(rows: list[dict], agg: dict) -> list[str]:
     tot = agg.get(("ALL", "ALL"))
     if tot and tot["n"] >= 20:
         if tot["geo_ratio"] < 0.9 and tot["net_ex_best3"] > 0:
-            L.append("- **隐含系统性高于实际，且卖方盈利不靠最好的 3 笔：事件前卖波动的假设在 DVOL 近似下初步成立。**"
+            L.append(f"- **隐含系统性高于实际，且卖方盈利不靠最好的 3 笔：事件前卖波动的假设在 {approx} 近似下初步成立。**"
                      "但卖方最差一笔要和权利金比：尾部一次能吃掉多少次收益，见上表。")
         elif tot["geo_ratio"] > 1.1:
-            L.append("- **实际系统性高于隐含：事件前买波动的假设在 DVOL 近似下初步成立。**")
+            L.append(f"- **实际系统性高于隐含：事件前买波动的假设在 {approx} 近似下初步成立。**")
         else:
             L.append("- 实际与隐含大体相当，或盈利全靠少数几笔：没有可交易的边际。")
     else:
@@ -413,18 +672,37 @@ def verdict_lines(rows: list[dict], agg: dict) -> list[str]:
 
 # ---------------------------------------------------------------- 入口
 def run(settings, currency: str = "BTC", since: date = date(2021, 1, 1), until: date | None = None,
-        synthetic: bool = False, out: Path | None = None, weekends: bool = True) -> tuple[str, list[dict]]:
+        synthetic: bool = False, out: Path | None = None, weekends: bool = True, market: str = "crypto",
+        fee_per_contract: float | None = None) -> tuple[str, list[dict]]:
+    """market="crypto"：Deribit DVOL + 永续小时线（currency = BTC/ETH）；
+    market="us"：stooq/FRED 日线 + VIX/VXN（currency = SPY/QQQ/IBIT 作为标的），费用按美股期权每张合约。"""
     until = until or (datetime.now(UTC).date() - timedelta(days=2))
     pcfg = settings["options"]["paper"]
-    if synthetic:
-        dvol, px = synthetic_data(since, until)
-        source = "合成数据（--synthetic，仅测试）"
+    if market == "us":
+        if currency not in US_UNDERLYINGS:
+            raise ValueError(f"--market us 只支持 {', '.join(US_UNDERLYINGS)}，不是 {currency}")
+        ucfg = us_cfg(settings)
+        if fee_per_contract is not None:
+            ucfg = {**ucfg, "fee_per_contract_usd": fee_per_contract}
+        if synthetic:
+            px, iv = synthetic_us_data(since, until)
+            source = "合成数据（--synthetic，仅测试）"
+        else:
+            px, iv, source = get_us_data(settings, currency, since, until)
+        events = event_calendar(since, until, settings["options"]["event_lead_min"] / 60, weekends=False)
+        rows = us_event_rows(events, px, iv, pcfg, ucfg, underlying=currency)
+        md = report_md(currency, since, until, rows, source, pcfg, synthetic=synthetic, market="us", ucfg=ucfg)
+        out = out or Path(settings.data) / "reports" / f"options_backtest_US_{currency}{'_SYNTHETIC' if synthetic else ''}.md"
     else:
-        dvol, px, source = get_data(settings, currency, since, until)
-    events = event_calendar(since, until, settings["options"]["event_lead_min"] / 60, weekends=weekends)
-    rows = event_rows(events, dvol, px, pcfg, settings["options"]["window_hours"])
-    md = report_md(currency, since, until, rows, source, pcfg, synthetic=synthetic)
-    out = out or Path(settings.data) / "reports" / f"options_backtest_{currency}{'_SYNTHETIC' if synthetic else ''}.md"
+        if synthetic:
+            dvol, px = synthetic_data(since, until)
+            source = "合成数据（--synthetic，仅测试）"
+        else:
+            dvol, px, source = get_data(settings, currency, since, until)
+        events = event_calendar(since, until, settings["options"]["event_lead_min"] / 60, weekends=weekends)
+        rows = event_rows(events, dvol, px, pcfg, settings["options"]["window_hours"])
+        md = report_md(currency, since, until, rows, source, pcfg, synthetic=synthetic)
+        out = out or Path(settings.data) / "reports" / f"options_backtest_{currency}{'_SYNTHETIC' if synthetic else ''}.md"
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(md)
     return md, rows
@@ -433,7 +711,11 @@ def run(settings, currency: str = "BTC", since: date = date(2021, 1, 1), until: 
 def main(argv=None) -> int:
     from . import config
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--currency", default="BTC")
+    ap.add_argument("--market", choices=["crypto", "us"], default="crypto",
+                    help="crypto = Deribit DVOL（默认）；us = 美股口径（VIX/VXN + 日线，费用按每张合约）")
+    ap.add_argument("--currency", default="BTC", help="crypto：BTC/ETH")
+    ap.add_argument("--underlying", default="SPY", help="us：SPY / QQQ / IBIT")
+    ap.add_argument("--fee-per-contract", type=float, default=None, help="us：每张合约每次成交的费用（美元），默认读 [options.us]")
     ap.add_argument("--since", default="2021-01-01")
     ap.add_argument("--until", default=None)
     ap.add_argument("--no-weekends", action="store_true")
@@ -443,11 +725,16 @@ def main(argv=None) -> int:
     s = config.load()
     since = date.fromisoformat(a.since)
     until = date.fromisoformat(a.until) if a.until else None
+    sym = a.underlying.upper() if a.market == "us" else a.currency.upper()
     try:
-        md, _ = run(s, a.currency.upper(), since, until, synthetic=a.synthetic, out=a.out, weekends=not a.no_weekends)
+        md, _ = run(s, sym, since, until, synthetic=a.synthetic, out=a.out, weekends=not a.no_weekends,
+                    market=a.market, fee_per_contract=a.fee_per_contract)
     except NetworkBlocked as e:
-        print(f"本机连不上 deribit.com（{str(e)[:100]}），本地也没有缓存。\n"
-              f"请到 bot 服务器上跑：python3 -m desk.options_backtest --currency {a.currency} --since {a.since}\n"
+        host = "stooq.com / fred.stlouisfed.org" + ("（IBIT 还要 deribit.com）" if sym == "IBIT" else "") if a.market == "us" else "deribit.com"
+        cmd = (f"python3 -m desk.options_backtest --market us --underlying {sym} --since {a.since}" if a.market == "us"
+               else f"python3 -m desk.options_backtest --currency {sym} --since {a.since}")
+        print(f"本机连不上 {host}（{str(e)[:100]}），本地也没有缓存。\n"
+              f"请到 bot 服务器上跑：{cmd}\n"
               f"数据会存到 {cache_dir(s)}/，之后离线也能重算。不要用 --synthetic 的结果当真。")
         return 2
     print(md)

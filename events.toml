@@ -21,6 +21,28 @@ events = [
   { id = "FOMC-2027-12", type = "FOMC", at = "2027-12-08 14:00" },
 ]
 
+# 事件类别 ②：财报（desk/options.py event_samples 里 event_type = "EARNINGS:<ticker>"；纸面交易员按这个键分组）。
+# 时间为美东；"盘后"按实际公告惯例填（特斯拉/英伟达/英特尔都在 16:00 收盘后几分钟发稿）。
+# coin = 对应的 trade.xyz 合约（有就填）。confirmed = false 表示公司还没公告、按惯例估计，公告后改成 true 并核对时间。
+# 2026-10-14 核对：
+#   TSLA  Q3-2026：公司 8-K（2026-10-02 交付公告）写明 "after market close on Wednesday, October 21, 2026"，电话会 17:30 ET。
+#         https://www.sec.gov/Archives/edgar/data/0001318605/000162828026064366/exhibit991111111.htm
+#   INTC  Q3-2026：公司新闻稿 "Thursday, October 29, 2026, promptly after close of market"，电话会 14:00 PT。
+#         https://www.intc.com/news-events/press-releases/detail/1782/intel-to-report-third-quarter-2026-financial-results
+#   SMSN  Q3-2026 初步业绩（guidance）：2026-10-08 07:49 KST 已发布（= 10-07 18:49 ET），留作记录。
+#         https://news.samsung.com/global/samsung-electronics-announces-earnings-guidance-for-third-quarter-2026
+#         Q3-2026 正式业绩：公司 IR 公告电话会 2026-10-29 10:00 KST；业绩稿按惯例当天 08:00 KST 前后发（= 10-28 19:00 ET）。
+#         https://www.samsung.com/global/ir/reports-disclosures/notices/
+#   NVDA  FY2027 Q3：公司尚未公告；按惯例（11 月第三个周三盘后）估计 2026-11-18 16:20 ET。公告后改 confirmed = true。
+#         https://days.to/nvidia-earnings（"The event date has not yet been officially confirmed"）
+earnings = [
+  { id = "ERN-SMSN-2026Q3-PRELIM", ticker = "SMSN", coin = "xyz:SMSN", at = "2026-10-07 18:50", confirmed = true,  note = "三星 Q3 初步业绩（已发布 2026-10-08 KST）" },
+  { id = "ERN-TSLA-2026Q3",        ticker = "TSLA", coin = "xyz:TSLA", at = "2026-10-21 16:05", confirmed = true,  note = "盘后；电话会 17:30 ET" },
+  { id = "ERN-SMSN-2026Q3",        ticker = "SMSN", coin = "xyz:SMSN", at = "2026-10-28 19:00", confirmed = true,  note = "= 10-29 08:00 KST 业绩稿；电话会 10:00 KST（公司 IR 公告）" },
+  { id = "ERN-INTC-2026Q3",        ticker = "INTC", coin = "xyz:INTC", at = "2026-10-29 16:05", confirmed = true,  note = "盘后；电话会 14:00 PT" },
+  { id = "ERN-NVDA-FY27Q3",        ticker = "NVDA", coin = "xyz:NVDA", at = "2026-11-18 16:20", confirmed = false, note = "公司未公告，按惯例估计" },
+]
+
 # 已经过去的 2026 年议息日，只用于回补历史做粗略探索（不计入正式成绩）
 past_fomc = ["2026-01-28 14:00", "2026-03-18 14:00", "2026-04-29 14:00", "2026-06-17 14:00",
              "2026-07-29 14:00", "2026-09-16 14:00"]
