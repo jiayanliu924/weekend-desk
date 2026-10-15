@@ -141,6 +141,7 @@ feature_version = "f1"
 #      只做 families_enabled 里的品种族；|偏离| > fade_threshold_bps 才反向；出手门槛按全额手续费；
 #      停手：该品种族最近 stop_lookback_weekends 个已完成周末、按 v2 规则算的全额手续费盈亏之和 < 0 → 本周末不出手
 #      （不足这么多周末 → 照常出手）。K=4 是事先写死的，不按回测结果调。
+#      停手历史 = 账本正式周末 + 账本缺的日历周末用实验室同一套回补 K 线（15m 优先、退回 1h），和 strategy_lab 一致。
 # 品种族：XYZ100/SP500 → us_index，BRENTOIL → metals_energy，SMSN → kr_equity，NVDA/TSLA/INTC → us_equity（desk/universe.classify）。
 # 不管这里选哪个版本，v2 和 fade50_stocks（v2 去掉停手）两条影子每个周末都记。
 version = "v2"

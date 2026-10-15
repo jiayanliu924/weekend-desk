@@ -153,12 +153,16 @@ def test_job_history_is_same_family_official_strictly_before(s):
     _rec(led, "2026-10-09|TSLA", 80, 100.8, 100.0)            # 本周末：不许用
     _rec(led, "2026-10-16|NVDA", 80, 100.8, 100.0)            # 未来
     w = weekend_for_friday(date(2026, 10, 9), s, s.inst("NVDA"))
-    h = jobs.v2_history(s, led, w)
+    hh = jobs.v2_history(s, led, w)                            # 测试目录里没有 K 线缓存 → 缺回补，只用账本
+    h = hh["rows"]
     assert [x["weekend"] for x in h] == ["2026-09-18|NVDA", "2026-09-25|TSLA", "2026-10-02|NVDA"]
+    assert {x["source"] for x in h} == {"ledger"} and hh["backfill_missing"] and hh["n_ledger_weekends"] == 3
     assert h[0]["move_bps"] == pytest.approx((100.9 / 100.8 - 1) * 1e4) and h[0]["spread_bps"] == 2.0
-    assert not model.decide_action(feats(90), {"pred_bps": 0.0}, DISC, s, v2_history=h)["stop"]["stop"]   # 3 个周末 → 照做
+    a = model.decide_action(feats(90), {"pred_bps": 0.0}, DISC, s, v2_history=hh)
+    assert a["side"] == -1 and not a["stop"]["stop"] and a["stop"]["backfill_missing"]       # 3 个周末 → 照做
+    assert "停手判断只用了 3 个周末（缺回补数据）" in a["reason"]
     wx = weekend_for_friday(date(2026, 10, 9), s, s.inst("SP500"))
-    assert [x["weekend"] for x in jobs.v2_history(s, led, wx)] == ["2026-09-25|XYZ100"]
+    assert [x["weekend"] for x in jobs.v2_history(s, led, wx)["rows"]] == ["2026-09-25|XYZ100"]
 
 
 # ---------------------------------------------------------------- 影子
@@ -224,3 +228,71 @@ def test_job_lock_under_v2_end_to_end(s):
     assert lock["action"]["strategy_version"] == "v2"
     assert lock["shadow"]["fade50"]["side"] == -1 and lock["shadow"]["v2"]["side"] == 0
     assert {"v2", "fade50_stocks"} <= set(out["shadow"]) and out["pnl_net_usd"] == 0.0
+
+
+# ---------------------------------------------------------------- 停手历史 = 账本 + 回补补缺（和实验室一致）
+def bfrow(fri, name, dev, move, gran="15m"):
+    return {"fri": fri, "name": name, "dev_bps": dev, "move_bps": move, "spread_bps": None, "source": f"backfill_{gran}"}
+
+
+def test_backfill_fills_gaps_and_ledger_wins_on_overlap(s):
+    led = Ledger(s.data)
+    _rec(led, "2026-09-25|NVDA", 80, 100.8, 100.9)            # 账本：反向亏（move ≈ +9.9）
+    _rec(led, "2026-10-02|TSLA", 80, 100.8, 100.9)
+    bf = [bfrow("2026-09-11", "NVDA", 80, 20), bfrow("2026-09-11", "INTC", -90, -10),   # 空档 → 用回补
+          bfrow("2026-09-18", "TSLA", 80, 30, "1h"),
+          bfrow("2026-09-25", "NVDA", 80, -500), bfrow("2026-09-25", "INTC", 80, -500),  # 和账本重叠 → 账本赢（整个周末）
+          bfrow("2026-10-09", "NVDA", 80, -500)]                                         # 本周末 → 不许用
+    w = weekend_for_friday(date(2026, 10, 9), s, s.inst("NVDA"))
+    hh = jobs.v2_history(s, led, w, backfill_rows=bf)
+    src = {(x["fri"], x["name"]): x["source"] for x in hh["rows"]}
+    assert src == {("2026-09-11", "NVDA"): "backfill_15m", ("2026-09-11", "INTC"): "backfill_15m",
+                   ("2026-09-18", "TSLA"): "backfill_1h", ("2026-09-25", "NVDA"): "ledger", ("2026-10-02", "TSLA"): "ledger"}
+    assert not hh["backfill_missing"] and hh["n_ledger_weekends"] == 2 and hh["n_backfill_weekends"] == 2
+    a = model.decide_action(feats(90), {"pred_bps": 0.0}, DISC, s, v2_history=hh)
+    mv = (100.9 / 100.8 - 1) * 1e4
+    exp = (-20 - 14) + (-10 - 14) + (-30 - 14) + 2 * (-mv - 13)   # 账本行有点差 2 → 半点差 1 → 成本 13
+    st = a["stop"]
+    assert st["sum_bps"] == pytest.approx(exp) and st["stop"] and a["side"] == 0 and a["reason"].startswith(STOP_REASON)
+    assert [(x["fri"], x["source"]) for x in st["weekends"]] == [("2026-09-11", "backfill_15m"), ("2026-09-18", "backfill_1h"),
+                                                                ("2026-09-25", "ledger"), ("2026-10-02", "ledger")]
+    assert st["weekends"][0]["names"] == ["INTC", "NVDA"] and st["sources"] == ["backfill_15m", "backfill_1h", "ledger"]
+    assert "停手判断只用了" not in a["reason"]
+    # 族外合约直接不出手，不算停手
+    assert "stop" not in model.decide_action(feats(90, "XYZ100"), {"pred_bps": 0.0}, DISC, s, v2_history=hh)
+
+
+def test_stop_recorded_even_when_dev_below_threshold(s):
+    hh = {"rows": [bfrow(f, "NVDA", 80, 10) for f in fridays(4)], "backfill_missing": False}
+    a = model.decide_action(feats(20), {"pred_bps": 0.0}, DISC, s, v2_history=hh)
+    assert a["side"] == 0 and a["stop"]["stop"] and len(a["stop"]["weekends"]) == 4
+
+
+def test_live_stop_matches_lab_on_same_backfill(s):
+    """磁盘上有 K 线缓存、账本为空：实盘停手历史（jobs.v2_history 读盘）和实验室 v2_state 每个周末给出同一个停/不停和同一个合计。"""
+    import math
+    from datetime import datetime, timezone
+    from tests.test_strategy_lab import _write_cache
+    UTC = timezone.utc
+    now = datetime(2026, 10, 14, tzinfo=UTC)
+    for i, nm in enumerate(("NVDA", "TSLA", "INTC")):
+        fn = lambda k, i=i: 100.0 * (1 + 0.012 * math.sin(k / 3.6e6 / (7 + 3 * i)) + 0.004 * math.sin(k / 3.6e6 / 2.3))  # noqa: E731
+        coin = s.inst(nm)["coin"]
+        _write_cache(s, coin, "1h", datetime(2026, 6, 1, tzinfo=UTC), now, fn)
+        _write_cache(s, coin, "15m", datetime(2026, 8, 23, tzinfo=UTC), now, fn)
+    rows, _, _ = sl.build_rows(s, now, None, False, names=["NVDA", "TSLA", "INTC"])
+    fris = sorted({r["fri"] for r in rows})
+    assert len(fris) >= 10 and any(abs(r["dev_bps"]) > 50 for r in rows)
+    led = Ledger(s.data)
+    v2p = sl.v2_params(s)
+    n_stop = 0
+    for fri in fris[2:]:
+        w = weekend_for_friday(date.fromisoformat(fri), s, s.inst("NVDA"))
+        hh = jobs.v2_history(s, led, w)
+        assert not hh["backfill_missing"] and {x["source"][:9] for x in hh["rows"]} == {"backfill_"}
+        live = model.v2_stop_from_history(hh, s, 4)
+        lab = sl.v2_state(sl._past(rows, fri), "美股单票", 14.0, v2p)
+        assert live["stop"] == lab["stop"], fri
+        assert (live["sum_bps"] is None and lab["sum_bps"] is None) or live["sum_bps"] == pytest.approx(lab["sum_bps"]), fri
+        n_stop += live["stop"]
+    assert 0 < n_stop < len(fris) - 2          # 夹具里停手和不停手都出现过，比较才有意义

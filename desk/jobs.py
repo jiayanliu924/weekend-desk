@@ -107,17 +107,25 @@ def regime_history(settings, led: Ledger, w: Weekend) -> list[dict]:
     return out
 
 
-def v2_history(settings, led: Ledger, w: Weekend) -> list[dict]:
-    """v2 停手规则用的历史：和本合约同一品种族、严格早于本周末、已完成的**正式**记录（evaluate.official），
-    每条 {weekend, name, dev_bps, move_bps, spread_bps, dislocated, wick_ratio}，按时间顺序。
-    盈亏由 model.v2_rule_net_bps 按"如果当时按 v2 做"、全额手续费重算——不看当时主策略实际做了什么。"""
+def v2_history(settings, led: Ledger, w: Weekend, backfill_rows: list[dict] | None = None) -> dict:
+    """v2 停手规则用的历史（2026-10-15 改：实盘停手必须和实验室一致）。
+
+    同一品种族、严格早于本周末的每个日历周末：
+      - 账本里有这个族的**正式**记录（evaluate.official）→ 用账本（账本优先，整个周末都用账本的行）；
+      - 否则 → 用回补行：和 strategy_lab 完全同一套（strategy_lab.load_candles 只读本地缓存、weekend_rows：15m 优先、退回 1h）。
+    每行 {weekend, fri, name, dev_bps, move_bps, spread_bps, dislocated, wick_ratio, source}；盈亏由 model.v2_rule_net_bps
+    按"如果当时按 v2 做"、全额手续费重算（回补行没有点差 → 半点差 2 bps，和实验室的 14 bps 一致）——不看主策略当时做了什么。
+    data/reports/history_weekends.json 不用：它的"决策价"是重开那一刻、出场是重开后 1 小时，和实验室/实盘不是同一笔交易。
+    返回 {"rows", "backfill_missing", "n_ledger_weekends", "n_backfill_weekends"}；没有任何回补行时只用账本，并在 lock 里注明。
+    backfill_rows 只给测试注入用（None = 从磁盘读）。"""
     from .clock import friday_of, name_of
     default = settings.instruments[0]["name"]
     me = w.name or default
     fam = model.instrument_family((settings.inst(me) or {}).get("coin") or w.coin or me)
-    out = []
+    cur = w.friday.isoformat()
+    ledger_rows = []
     for r in led.completed():
-        if friday_of(r["weekend"]) >= w.friday.isoformat() or not evaluate.official(r, settings):
+        if friday_of(r["weekend"]) >= cur or not evaluate.official(r, settings):
             continue
         nm = name_of(r["weekend"], default)
         coin = (settings.inst(nm) or {}).get("coin") or r["lock"].get("coin") or nm
@@ -127,9 +135,37 @@ def v2_history(settings, led: Ledger, w: Weekend) -> list[dict]:
         if mv is None:
             continue
         f = r["lock"]["features"]
-        out.append({"weekend": r["weekend"], "name": nm, "dev_bps": f["dev_bps"], "move_bps": mv,
-                    "spread_bps": f.get("spread_bps"), "dislocated": f.get("dislocated"), "wick_ratio": f.get("wick_ratio")})
-    out.sort(key=lambda h: h["weekend"])
+        ledger_rows.append({"weekend": r["weekend"], "fri": friday_of(r["weekend"]), "name": nm, "dev_bps": f["dev_bps"],
+                            "move_bps": mv, "spread_bps": f.get("spread_bps"), "dislocated": f.get("dislocated"),
+                            "wick_ratio": f.get("wick_ratio"), "source": "ledger"})
+    if backfill_rows is None:
+        backfill_rows = _v2_backfill_rows(settings, fam, w)
+    bf = [b for b in backfill_rows if b["fri"] < cur]
+    led_fris = {r["fri"] for r in ledger_rows}
+    fill = [{**b, "weekend": f"{b['fri']}|{b['name']}"} for b in bf if b["fri"] not in led_fris]
+    rows = sorted(ledger_rows + fill, key=lambda h: (h["fri"], h["name"]))
+    out = {"rows": rows, "backfill_missing": not bf, "n_ledger_weekends": len(led_fris),
+           "n_backfill_weekends": len({b["fri"] for b in fill})}
+    if not bf:
+        log.warning("v2 停手：%s 族没有回补数据，只用账本 %d 个周末", fam, len(led_fris))
+    return out
+
+
+def _v2_backfill_rows(settings, fam: str, w: Weekend) -> list[dict]:
+    """同族每个合约的回补周末行（strategy_lab 同一套：只读本地缓存，15m 优先、退回 1h），只取在本周末决策前已平仓的。"""
+    from . import strategy_lab as sl
+    out = []
+    for inst in settings.instruments:
+        if model.instrument_family(inst["coin"]) != fam:
+            continue
+        try:
+            cbi, _ = sl.load_candles(settings, inst["coin"], fetch=False)
+            rows = sl.weekend_rows(settings, inst, cbi, w.decision) if cbi else []
+        except Exception as e:  # noqa: BLE001
+            log.warning("v2 停手：读 %s 回补缓存失败：%s", inst["name"], e)
+            continue
+        out += [{"fri": r["fri"], "name": r["name"], "dev_bps": r["dev_bps"], "move_bps": r["move_bps"],
+                 "spread_bps": None, "source": f"backfill_{r['gran']}"} for r in rows]
     return out
 
 

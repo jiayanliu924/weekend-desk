@@ -147,7 +147,31 @@ def v2_weekend_pnls(history: list[dict], cfg) -> list[tuple[str, float]]:
     return sorted(by.items())
 
 
-def decide_v2(features: dict, cfg, history: list[dict] | None = None, use_stop: bool = True) -> dict:
+def v2_stop_from_history(history, cfg, k: int) -> dict:
+    """history = 行列表，或 jobs.v2_history 给的 {"rows": [...], "backfill_missing": bool, ...}。
+    每行 {weekend|fri, dev_bps, move_bps, source: ledger|backfill_15m|backfill_1h, name}；按日历周末合计 v2 规则净 bps → v2_stop，
+    并记下最近 k 个周末各自的来源、合约、净 bps（写进 lock，事后能查停手是被哪些周末触发的）。"""
+    meta = history if isinstance(history, dict) else {}
+    rows = (history.get("rows") if isinstance(history, dict) else history) or []
+    by: dict[str, float] = {}
+    src: dict[str, set] = {}
+    names: dict[str, set] = {}
+    for h in rows:
+        fri = (h.get("fri") or h["weekend"])[:10]
+        by[fri] = by.get(fri, 0.0) + v2_rule_net_bps(h, cfg)
+        src.setdefault(fri, set()).add(h.get("source", "ledger"))
+        names.setdefault(fri, set()).add(h.get("name") or (h.get("weekend") or "").split("|")[-1])
+    st = v2_stop(sorted(by.items()), k)
+    last = sorted(by)[-k:] if k > 0 else []
+    st["weekends"] = [{"fri": f, "net_bps": by[f], "source": "+".join(sorted(src[f])), "names": sorted(names[f])} for f in last]
+    st["sources"] = sorted(set().union(*(src[f] for f in last))) if last else []
+    if meta.get("backfill_missing"):
+        st["backfill_missing"] = True
+        st["why"] += f"；停手判断只用了 {st['n']} 个周末（缺回补数据）"
+    return st
+
+
+def decide_v2(features: dict, cfg, history=None, use_stop: bool = True) -> dict:
     """v2：只做 families_enabled 里的品种族；|偏离| > fade_threshold_bps 才反向；门槛按全额手续费（decide_action_core
     里 cost = 挂单 + 吃单 + 半点差、再加 buffer）；use_stop 时近 K 个周末按 v2 规则为负就停手。仓位/插针否决照旧。"""
     sc = strategy_cfg(cfg)
@@ -156,12 +180,12 @@ def decide_v2(features: dict, cfg, history: list[dict] | None = None, use_stop: 
     if fam not in sc["families_enabled"]:
         return {**_no_trade("v2", "v2：该品种族样本外未通过，不出手"), "edge_bps": -dev, "family": fam}
     thr = float(sc["fade_threshold_bps"])
+    k = int(sc["stop_lookback_weekends"])
+    stop = v2_stop_from_history(history, cfg, k) if use_stop else None
     if abs(dev) <= thr:
-        return {**_no_trade("v2", f"v2：|偏离| {abs(dev):.0f} ≤ {thr:.0f} bps，不出手"), "edge_bps": -dev, "family": fam}
-    stop = None
+        return {**_no_trade("v2", f"v2：|偏离| {abs(dev):.0f} ≤ {thr:.0f} bps，不出手"), "edge_bps": -dev, "family": fam,
+                **({"stop": stop} if stop else {})}
     if use_stop:
-        k = int(sc["stop_lookback_weekends"])
-        stop = v2_stop(v2_weekend_pnls(history or [], cfg), k)
         if stop["stop"]:
             return {**_no_trade("v2", f"v2：近 {k} 个周末该规则累计为负，停手一周（{stop['why']}）"),
                     "edge_bps": -dev, "family": fam, "stop": stop}
