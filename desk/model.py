@@ -78,7 +78,7 @@ SHADOW_LABELS = {
 #      品种族；出手门槛按全额手续费；再加一条事先写死（不按结果调）的停手规则：这个品种族最近 K=4 个已完成周末、
 #      按 v2 规则算的全额手续费盈亏之和 < 0 → 本周末不出手；历史不足 K 个周末 → 照常出手。
 STRATEGY_DEFAULTS = {"version": "v1", "families_enabled": ["us_equity"], "fade_threshold_bps": 50.0,
-                     "stop_lookback_weekends": 4}
+                     "stop_lookback_weekends": 4, "primary_use_stop": True}
 FAMILY_CN = {"us_equity": "美股单票", "us_index": "美指", "metals_energy": "Brent/金属能源", "kr_equity": "韩股"}
 
 
@@ -321,7 +321,7 @@ def decide_action(features: dict, pred: dict, fees: dict, cfg, v2_history: list[
     """主策略出手。[strategy].version = "v2" → decide_v2（只做通过的品种族、|偏离|>50 反向、全额成本、4 周末停手；
     v2_history 见 decide_v2）；"v1"（或没有 [strategy] 段）→ 原 H1 规则 decide_action_core（fees 按链上费率）。"""
     if strategy_cfg(cfg)["version"] == "v2":
-        a = decide_v2(features, cfg, v2_history, use_stop=True)
+        a = decide_v2(features, cfg, v2_history, use_stop=bool(strategy_cfg(cfg).get("primary_use_stop", True)))
         a["strategy_version"] = "v2"
         return a
     return decide_action_core(features, pred, fees, cfg)

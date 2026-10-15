@@ -278,6 +278,11 @@ version = "v2"
 families_enabled = ["us_equity"]
 fade_threshold_bps = 50
 stop_lookback_weekends = 4
+# 主策略是否用停手（2026-10-15 夜，17 只单票重跑实验室后改为 false）：
+# 停手是看了 3 只单票"08-21 后反向转负"才加的；扩到 17 只后这个翻转不存在（反向>50 之前 +5.0、之后 +6.5 bps/笔），
+# 样本外停手停了 5 个周末、错过 +$179，v2(含停手) 样本外 +$52 且靠 1–2 个周末（不通过），不停手的 反向>50 +$231 通过。
+# 停手版本仍作为影子 v2 每周记账（用上面的 K=4），看实盘里它到底省钱还是错过钱。
+primary_use_stop = false
 
 [costs]
 # 7.5 trade.xyz 基础费率（bps）。系统会读取链上 growthMode；开启时按 growth_discount 打折。

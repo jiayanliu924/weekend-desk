@@ -375,8 +375,9 @@ def strategy_line(settings) -> str:
     sc = strategy_cfg(settings)
     if sc["version"] == "v2":
         fams = "、".join(FAMILY_CN.get(f, f) for f in sc["families_enabled"]) or "—"
-        return (f"当前主策略：v2（只做{fams}、偏离>{float(sc['fade_threshold_bps']):.0f} 反向、全额成本、"
-                f"近 {int(sc['stop_lookback_weekends'])} 周末为负就停）")
+        stop = (f"近 {int(sc['stop_lookback_weekends'])} 周末为负就停" if sc.get("primary_use_stop", True)
+                else f"不停手；停手版本作为影子对照")
+        return (f"当前主策略：v2（只做{fams}、偏离>{float(sc['fade_threshold_bps']):.0f} 反向、全额成本、{stop}）")
     return "当前主策略：v1（H1 规则：安静周末反向、信息周末顺向，门槛按链上费率）"
 
 

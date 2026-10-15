@@ -19,8 +19,22 @@ STOP_REASON = "v2：近 4 个周末该规则累计为负，停手一周"
 
 @pytest.fixture
 def s(tmp_path):
+    """主策略带停手（primary_use_stop = true）的 v2：这里的测试断言的是停手机制本身。"""
     shutil.copy(ROOT / "config.toml", tmp_path / "config.toml")
+    p = tmp_path / "config.toml"
+    txt = p.read_text()
+    assert "primary_use_stop = false" in txt
+    p.write_text(txt.replace("primary_use_stop = false", "primary_use_stop = true", 1))
     return config.load(tmp_path)
+
+
+@pytest.fixture
+def s_repo(tmp_path):
+    """仓库里的实际配置（主策略不停手）。"""
+    d = tmp_path / "repo"
+    d.mkdir()
+    shutil.copy(ROOT / "config.toml", d / "config.toml")
+    return config.load(d)
 
 
 @pytest.fixture
@@ -218,9 +232,10 @@ def test_lab_v2_stop_does_not_peek_at_current_weekend():
 
 
 # ---------------------------------------------------------------- 看板
-def test_strategy_line(s, s1):
+def test_strategy_line(s, s1, s_repo):
     from desk import web
     assert web.strategy_line(s) == "当前主策略：v2（只做美股单票、偏离>50 反向、全额成本、近 4 周末为负就停）"
+    assert web.strategy_line(s_repo) == "当前主策略：v2（只做美股单票、偏离>50 反向、全额成本、不停手；停手版本作为影子对照）"
     assert web.strategy_line(s1).startswith("当前主策略：v1")
 
 
@@ -302,3 +317,20 @@ def test_live_stop_matches_lab_on_same_backfill(s):
         assert (live["sum_bps"] is None and lab["sum_bps"] is None) or live["sum_bps"] == pytest.approx(lab["sum_bps"]), fri
         n_stop += live["stop"]
     assert 0 < n_stop < len(fris) - 2          # 夹具里停手和不停手都出现过，比较才有意义
+
+
+def test_primary_use_stop_switch_keeps_shadow_stop():
+    """primary_use_stop=false：主策略不停手，但影子 v2 仍按 K 停手（两者可对照）。"""
+    from desk import model
+    cfg = {"strategy": {"version": "v2", "families_enabled": ["us_equity"], "fade_threshold_bps": 50,
+                        "stop_lookback_weekends": 2, "primary_use_stop": False},
+           "costs": {"maker_bps": 3.0, "taker_bps": 9.0, "growth_discount": 0.9, "edge_buffer_bps": 2.0},
+           "risk": {"paper_notional_usd": 1000, "capital_usd": 5000, "first_loss_frac": 0.02,
+                    "max_depth_fraction": 0.1, "worst_adverse_bps": 500, "conf_min": 0.5, "conf_max": 2.0}}
+    feats = {"dev_bps": 120.0, "coin": "xyz:NVDA", "name": "NVDA", "dec_mid": 100.0, "best_bid": 99.99,
+             "best_ask": 100.01, "spread_bps": 2.0}
+    losing = [{"fri": "2026-09-25", "dev_bps": 100.0, "move_bps": 80.0}, {"fri": "2026-10-02", "dev_bps": 100.0, "move_bps": 80.0}]
+    prim = model.decide_action(feats, {"pred_bps": 0.0}, {"maker_bps": 3, "taker_bps": 9}, cfg, v2_history=losing)
+    sh = model.decide_v2(feats, cfg, losing, use_stop=True)
+    assert prim["side"] == -1            # primary ignores the stop
+    assert sh["side"] == 0 and sh["stop"]["stop"]   # shadow v2 still stops
