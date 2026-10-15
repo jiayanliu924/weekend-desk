@@ -83,7 +83,8 @@ _SYMBOL_RULES: list[tuple[str, frozenset[str], str]] = [
                             "DIS", "NKE", "BA", "CAT", "GE", "HON", "IBM", "CSCO", "ANET", "PANW", "CRWD", "SNOW", "NOW",
                             "SHOP", "SQ", "PYPL", "ABNB", "RIVN", "LCID", "GME", "AMC", "SPY", "QQQ", "IWM", "DIA", "TLT",
                             "GLD", "SLV", "USO", "OPEN", "SOFI", "RKLB", "ASTS", "IONQ", "RGTI", "QBTS", "CRCL", "CORZ",
-                            "APLD", "NBIS", "OKLO", "VRT", "DELL", "HPE", "MRVL", "LRCX", "AMAT", "KLAC"}), "us_equity"),
+                            "APLD", "NBIS", "OKLO", "VRT", "DELL", "HPE", "MRVL", "LRCX", "AMAT", "KLAC",
+                            "CRWV", "SNDK", "CBRS"}), "us_equity"),
 ]
 _SUFFIX_RULES: list[tuple[str, str]] = [   # 命名里带交易所后缀/前缀
     (r"(\.KS|\.KQ|-KR|_KR|^KR:|^KRX:)$|^(KR|KRX)[:_-]", "kr_equity"),

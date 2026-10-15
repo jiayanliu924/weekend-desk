@@ -8,7 +8,9 @@ H1 原样规则（v0）：无实质新闻 → 偏离被抹掉（预测 0）；�
 """
 from __future__ import annotations
 
+import functools
 import json
+from pathlib import Path
 
 import numpy as np
 
@@ -95,8 +97,30 @@ def instrument_family(name_or_coin: str | None) -> str:
     if not name_or_coin:
         return "unknown"
     from .universe import classify
-    key, _ = classify(name_or_coin, name_or_coin.split(":")[0] if ":" in name_or_coin else "")
+    key, _ = classify(name_or_coin, name_or_coin.split(":")[0] if ":" in name_or_coin else "", _family_overrides())
     return key
+
+
+@functools.lru_cache(maxsize=1)
+def _family_overrides() -> dict:
+    """knowledge/universe_overrides.toml 里只取 [markets]（人工确认过的时间表），和 universe scan 同一份表；
+    不取 [exclude] / [dex_default]——它们管"进不进候选"，不改一个已经在配置里的合约属于哪个族。"""
+    from .universe import load_overrides
+    try:
+        return {"markets": load_overrides(Path(__file__).resolve().parent.parent).get("markets", {})}
+    except Exception:   # noqa: BLE001 — 覆盖文件坏了不该让下单路径崩；命名规则照常生效
+        return {}
+
+
+def tradable_instruments(settings) -> list[dict]:
+    """主策略实际会出手的合约（按合约平分本金时的分母）。v1：全部合约；v2：品种族在 families_enabled 里的合约
+    （和 decide_v2 同一个品种族映射）。"""
+    insts = list(settings.instruments)
+    sc = strategy_cfg(settings)
+    if sc["version"] != "v2":
+        return insts
+    fams = set(sc["families_enabled"])
+    return [i for i in insts if features_family({"coin": i.get("coin"), "name": i.get("name")}) in fams]
 
 
 def features_family(features: dict) -> str:

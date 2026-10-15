@@ -12,6 +12,7 @@ import pytest
 from desk import backtest_lib as bl
 from desk import clock, config
 from desk import universe as u
+from tests.conftest import core7
 
 ROOT = Path(__file__).resolve().parent.parent
 UTC = timezone.utc
@@ -22,6 +23,7 @@ NOW = datetime(2026, 10, 12, 12, tzinfo=UTC)   # 周一
 @pytest.fixture
 def s(tmp_path):
     shutil.copy(ROOT / "config.toml", tmp_path / "config.toml")
+    core7(tmp_path / "config.toml")   # 断言按原 7 个合约（in_config 状态、追加 stanza 的顺序）
     (tmp_path / "knowledge").mkdir()
     shutil.copy(ROOT / "knowledge" / "universe_overrides.toml", tmp_path / "knowledge" / "universe_overrides.toml")
     return config.load(tmp_path)

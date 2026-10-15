@@ -21,7 +21,7 @@ import os
 import time
 from pathlib import Path
 
-from . import notify
+from . import model, notify
 from .ledger import Ledger
 
 log = logging.getLogger("autotrade")
@@ -273,13 +273,14 @@ def entry(settings, w, lock: dict | None) -> dict | None:
         notify.push(settings, "自动下单已停止", f"累计真实亏损 ${-lost:.2f}，超过上限 ${cfg['max_loss_usd']:.0f}", priority="high")
         return led.append("entry", w.wid, {**base, "skipped": "累计亏损超过上限，已自动关闭"})
     risk = settings["risk"]
-    n = max(1, len(settings.instruments))
+    # 分母 = 主策略实际会出手的合约数（v2 只做 us_equity；v1 = 全部），不是配置里的合约总数
+    n = max(1, len(model.tradable_instruments(settings)))
     notional = cfg["capital_usd"] / n
     # 回撤自动缩仓：累计真实亏损越多，下得越小（竞品"资本减少时自动收缩风险"的小 bot 版）
     dd_factor = max(0.25, 1.0 + 2.0 * min(0.0, lost) / max(1.0, cfg["capital_usd"]))
     notional *= dd_factor
     feats = lock.get("features", {})
-    # 联合压测：7 个合约可能被同一个周一宏观事件同时推同向，按完全相关给整组一个首损预算，均摊到每个合约
+    # 联合压测：会出手的合约可能被同一个周一宏观事件同时推同向，按完全相关给整组一个首损预算，均摊到每个合约
     worst = feats.get("max_abs_dev_bps") or risk.get("worst_adverse_bps", 500.0)
     joint_cap = risk.get("joint_first_loss_frac", 0.25) * cfg["capital_usd"] / n / (worst / 1e4)
     notional = min(notional, joint_cap)

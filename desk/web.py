@@ -22,7 +22,7 @@ from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from starlette.middleware.sessions import SessionMiddleware
 
-from . import agents, config, evaluate, headline_shadow, notify, options, pdfreport, rawstore, sim
+from . import agents, config, evaluate, headline_shadow, model, notify, options, pdfreport, rawstore, sim
 from .clock import current_or_next_weekend, friday_of, name_of
 from .ledger import Ledger
 
@@ -539,7 +539,7 @@ def overview(req: Request):
 <h2>本周末打算（纸面练习）</h2>
 {plan_head}{plan}
 
-<h2>7 个合约</h2>
+<h2>{len(S.instruments)} 个合约</h2>
 <div class="tw"><table><tr><th>合约</th><th class="n">最新价</th><th>锁定时间</th><th class="n">实时样本</th><th class="n">实时模拟</th><th class="n">历史回测</th></tr>{inst_rows}</table></div>
 
 <h2>报告</h2>
@@ -1294,7 +1294,7 @@ def _autotrade_html() -> str:
 <label style="flex-direction:row;gap:8px;color:var(--ink)"><input type="radio" name="mode" value="off" {sel('off')}> 关闭</label>
 <label style="flex-direction:row;gap:8px;color:var(--ink)"><input type="radio" name="mode" value="shadow" {sel('shadow')}> 演习：到点推送"本来会下什么单"，不真下（建议先演习一个周末）</label>
 <label style="flex-direction:row;gap:8px;color:var(--ink)"><input type="radio" name="mode" value="live" {sel('live')}> 真下单</label>
-<div class="grid"><label>本金上限（美元，平均分给 7 个合约）<input name="capital" type="number" min="20" max="5000" step="10" value="{cfg['capital_usd']:.0f}"></label>
+<div class="grid"><label>本金上限（美元，平均分给 {len(model.tradable_instruments(S))} 个会出手的合约）<input name="capital" type="number" min="20" max="5000" step="10" value="{cfg['capital_usd']:.0f}"></label>
 <label>最多亏多少就自动停（美元）<input name="max_loss" type="number" min="5" max="2000" step="5" value="{cfg['max_loss_usd']:.0f}"></label></div>
 <label style="flex-direction:row;gap:8px;color:var(--ink)"><input type="checkbox" name="ack" value="1"> 我知道选"真下单"会用真钱，可能亏损；这个方法还没有真实成绩</label>
 <button type="submit">保存模式</button></form>

@@ -12,7 +12,7 @@ import json
 import math
 from pathlib import Path
 
-from . import evaluate, options
+from . import evaluate, model, options
 from .ledger import Ledger
 
 
@@ -75,8 +75,8 @@ def run(settings, capital: float = 2000.0, leverage: float = 2.0, mode: str = "m
     leverage = min(max(0.1, float(leverage)), 30.0)
     trades = (_history_weekend_trades if source == "history" else _live_weekend_trades)(settings, mode)
     trades.sort(key=lambda t: (t["date"], t.get("name", "")))
-    n_inst = max(1, len(settings.instruments))
-    notional = capital * leverage / n_inst      # 本金平均分给每个合约，避免 7 个合约同时满仓
+    n_inst = max(1, len(model.tradable_instruments(settings)))   # v2 只分给会出手的合约；v1 = 全部
+    notional = capital * leverage / n_inst      # 本金平均分给每个合约，避免所有合约同时满仓
     per_inst = notional
     eq, peak, mdd, rows = capital, capital, 0.0, []
     for t in trades:

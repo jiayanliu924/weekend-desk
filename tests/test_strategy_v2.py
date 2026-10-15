@@ -60,8 +60,14 @@ def test_repo_default_is_v2_and_v1_still_available(s, s1):
 
 def test_every_configured_instrument_maps_to_a_family(s):
     fam = {i["name"]: model.instrument_family(i["coin"]) for i in s.instruments}
-    assert fam == {"XYZ100": "us_index", "SP500": "us_index", "BRENTOIL": "metals_energy", "SMSN": "kr_equity",
-                   "NVDA": "us_equity", "TSLA": "us_equity", "INTC": "us_equity"}
+    core = {"XYZ100": "us_index", "SP500": "us_index", "BRENTOIL": "metals_energy", "SMSN": "kr_equity",
+            "NVDA": "us_equity", "TSLA": "us_equity", "INTC": "us_equity"}
+    assert {k: fam[k] for k in core} == core
+    # 2026-10-15 扩展的美股单票：全部必须认成 us_equity（按 coin、也按裸名），配置里不许有认不出的合约
+    added = ["HOOD", "PLTR", "MSFT", "MU", "AMZN", "CRWV", "SNDK", "CRCL", "META", "GOOGL", "AAPL", "MSTR", "AMD", "CBRS"]
+    assert set(fam) == set(core) | set(added)
+    for n in added:
+        assert fam[n] == "us_equity" and model.instrument_family(n) == "us_equity", n
     assert model.instrument_family("NVDA") == "us_equity" and model.instrument_family(None) == "unknown"
 
 

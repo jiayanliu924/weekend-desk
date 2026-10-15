@@ -17,7 +17,7 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.cidfonts import UnicodeCIDFont
 from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
-from . import evaluate, options, sim
+from . import evaluate, model, options, sim
 from .clock import friday_of, name_of
 from .ledger import Ledger
 
@@ -382,7 +382,7 @@ def build(settings, capital: float = 2000.0, leverage: float = 2.0, daily_for: d
 
     for src, title in (("live", "如果放真钱：实时模拟"), ("history", "如果放真钱：历史回测（上线前 K 线，仅供参考）")):
         r = sim.run(settings, capital, leverage, "maker", src)
-        s.append(Paragraph(f"{title}（本金 ${capital:,.0f}，{leverage:g} 倍杠杆，平均分给 {len(settings.instruments)} 个合约，挂单进/吃单出）", H2))
+        s.append(Paragraph(f"{title}（本金 ${capital:,.0f}，{leverage:g} 倍杠杆，平均分给 {len(model.tradable_instruments(settings))} 个会出手的合约，挂单进/吃单出）", H2))
         if not r["n"]:
             s.append(Paragraph("暂无数据。", P))
             continue

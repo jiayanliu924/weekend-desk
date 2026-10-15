@@ -74,6 +74,136 @@ close = "20:00"
 resume_day = "MON"
 resume = "09:01"
 
+
+# 2026-10-15 扩展：美股单票，按**流动性规则**入选（不看回测排名，防挑冠军）：
+# 24h 成交额 ≥ $10M、持仓 ≥ $10M、impact 点差 ≤ 5 bps；排除 3 倍杠杆 ETF（SOXL、KORU）。
+# 数据来源：2026-10-15 服务器 universe scan。v2 只做 us_equity，这些自动纳入；指数/商品/韩股不加。
+[[market.instruments]]
+name = "HOOD"
+coin = "xyz:HOOD"
+tz = "America/New_York"
+close_day = "FRI"
+close = "20:00"
+resume_day = "SUN"
+resume = "20:00"
+
+[[market.instruments]]
+name = "PLTR"
+coin = "xyz:PLTR"
+tz = "America/New_York"
+close_day = "FRI"
+close = "20:00"
+resume_day = "SUN"
+resume = "20:00"
+
+[[market.instruments]]
+name = "MSFT"
+coin = "xyz:MSFT"
+tz = "America/New_York"
+close_day = "FRI"
+close = "20:00"
+resume_day = "SUN"
+resume = "20:00"
+
+[[market.instruments]]
+name = "MU"
+coin = "xyz:MU"
+tz = "America/New_York"
+close_day = "FRI"
+close = "20:00"
+resume_day = "SUN"
+resume = "20:00"
+
+[[market.instruments]]
+name = "AMZN"
+coin = "xyz:AMZN"
+tz = "America/New_York"
+close_day = "FRI"
+close = "20:00"
+resume_day = "SUN"
+resume = "20:00"
+
+[[market.instruments]]
+name = "CRWV"
+coin = "xyz:CRWV"
+tz = "America/New_York"
+close_day = "FRI"
+close = "20:00"
+resume_day = "SUN"
+resume = "20:00"
+
+[[market.instruments]]
+name = "SNDK"
+coin = "xyz:SNDK"
+tz = "America/New_York"
+close_day = "FRI"
+close = "20:00"
+resume_day = "SUN"
+resume = "20:00"
+
+[[market.instruments]]
+name = "CRCL"
+coin = "xyz:CRCL"
+tz = "America/New_York"
+close_day = "FRI"
+close = "20:00"
+resume_day = "SUN"
+resume = "20:00"
+
+[[market.instruments]]
+name = "META"
+coin = "xyz:META"
+tz = "America/New_York"
+close_day = "FRI"
+close = "20:00"
+resume_day = "SUN"
+resume = "20:00"
+
+[[market.instruments]]
+name = "GOOGL"
+coin = "xyz:GOOGL"
+tz = "America/New_York"
+close_day = "FRI"
+close = "20:00"
+resume_day = "SUN"
+resume = "20:00"
+
+[[market.instruments]]
+name = "AAPL"
+coin = "xyz:AAPL"
+tz = "America/New_York"
+close_day = "FRI"
+close = "20:00"
+resume_day = "SUN"
+resume = "20:00"
+
+[[market.instruments]]
+name = "MSTR"
+coin = "xyz:MSTR"
+tz = "America/New_York"
+close_day = "FRI"
+close = "20:00"
+resume_day = "SUN"
+resume = "20:00"
+
+[[market.instruments]]
+name = "AMD"
+coin = "xyz:AMD"
+tz = "America/New_York"
+close_day = "FRI"
+close = "20:00"
+resume_day = "SUN"
+resume = "20:00"
+
+[[market.instruments]]
+name = "CBRS"
+coin = "xyz:CBRS"
+tz = "America/New_York"
+close_day = "FRI"
+close = "20:00"
+resume_day = "SUN"
+resume = "20:00"
+
 [clock]
 timezone = "America/New_York"
 # 周五外部价格停止时间（美东）
