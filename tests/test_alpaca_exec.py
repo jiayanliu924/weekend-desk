@@ -1,6 +1,7 @@
 """美股期权执行层（11d）：标的映射、选合约、张数、铁蝶腿、多腿单格式、每条门单独不过时绝不碰真钱下单、全过才走真钱、
 当日止损、平仓生命周期、批准 CLI、没 key 时演练。全部用假 transport，不碰网络。"""
 import json
+import math
 import shutil
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -133,11 +134,12 @@ def make_all_pass(s, monkeypatch):
     ax.approve(s, "boss")
     write_gate(s)
     seed_paper(s, 5, 10.0)
+    seed_real(s, 10)
 
 
 def write_gate(s, **over):
-    g = {"n_events": 80, "net_usd": 120.0, "net_ex_best3_usd": 40.0, "worst_usd": -150.0, "pass": True,
-         "synthetic": False, "underlying": "SPY", "side": "short"} | over
+    g = {"method": "dvol_proxy", "events_only": True, "n_events": 80, "net_usd": 120.0, "net_ex_best3_usd": 40.0,
+         "worst_usd": -150.0, "pass": True, "synthetic": False, "underlying": "SPY", "side": "short"} | over
     p = ax.gate_file(s)
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(g))
@@ -149,6 +151,18 @@ def seed_paper(s, n, pnl_each, kind="event"):
         sid = f"EVT-T-{kind}-{i}"
         led.append("lock", sid, {"sample_kind": kind, "event_type": "CPI", "ok": True})
         led.append("outcome", sid, {"ok": True, "ratio": 1.0, "paper": {"ok": True, "chosen": "A", "chosen_pnl": pnl_each}})
+
+
+def seed_real(s, n, a_pnl=5.0, b_pnl=-8.0, kind="event", ratio=0.9, start=0):
+    """用真实期权链结算过的样本（锁定有快照）。chosen = C，所以不影响"纸面成绩"那条门的累计。"""
+    led = Ledger(s.data, "options")
+    for i in range(start, start + n):
+        sid = f"EVT-REAL-{kind}-{i}"
+        led.append("lock", sid, {"sample_kind": kind, "event_type": "CPI" if kind == "event" else ("none" if kind == "daily" else "SHOCK:GEO"),
+                                 "ok": True, "snapshot_received_at": 1, "implied_vol": 0.5})
+        led.append("outcome", sid, {"ok": True, "ratio": ratio, "log_ratio": math.log(ratio),
+                                    "paper": {"ok": True, "chosen": "C", "chosen_pnl": 0.0,
+                                              "pnl": {"A_unhedged": a_pnl, "A_hedged": a_pnl, "B": b_pnl, "C": 0.0}}})
 
 
 # ---------------------------------------------------------------- 映射 / 选合约 / 张数
@@ -248,6 +262,11 @@ GATE_BREAKERS = {
     "gate_ex_best3": lambda s, mp: write_gate(s, net_ex_best3_usd=-0.01),
     "gate_worst": lambda s, mp: write_gate(s, worst_usd=-3 * RISK - 1),
     "gate_synthetic": lambda s, mp: write_gate(s, synthetic=True),
+    "gate_old_format_with_weekends": lambda s, mp: write_gate(s, method=None, events_only=None),
+    "real_few": lambda s, mp: (Ledger(s.data, "options").path.unlink(), seed_paper(s, 5, 10.0), seed_real(s, 9)),
+    "real_daily_only": lambda s, mp: (Ledger(s.data, "options").path.unlink(), seed_paper(s, 5, 10.0), seed_real(s, 30, kind="daily")),
+    "real_losing": lambda s, mp: (Ledger(s.data, "options").path.unlink(), seed_paper(s, 5, 10.0), seed_real(s, 12, a_pnl=-2.0, b_pnl=-1.0)),
+    "real_worst": lambda s, mp: seed_real(s, 1, a_pnl=-3 * RISK - 1, start=99),
     "paper_few": lambda s, mp: (Ledger(s.data, "options").path.unlink(), seed_paper(s, 4, 10.0)),
     "paper_daily_only": lambda s, mp: (Ledger(s.data, "options").path.unlink(), seed_paper(s, 9, 10.0, kind="daily")),
     "paper_negative": lambda s, mp: seed_paper(s, 1, -51.0),
@@ -444,6 +463,44 @@ def test_backtest_gate_writer(s):
     assert not ob.write_gate(s, rows, "SPY", "us", True)["pass"]
 
 
+def test_backtest_gate_excludes_weekends(s):
+    """周末样本（DVOL 近似在周末系统性高估卖方）不进回测门：事件全亏、周末大赚 → 门不过。"""
+    from desk import options_backtest as ob
+    ev = [{"kind": "CPI", "short": -1.0, "long": 0.5, "log_ratio": 0.0, "ratio": 1.0, "fees": 0.1, "premium": 1.0}] * 70
+    wk = [{"kind": "WEEKEND", "short": 50.0, "long": -51.0, "log_ratio": -0.9, "ratio": 0.4, "fees": 0.1, "premium": 1.0}] * 300
+    g = ob.write_gate(s, ev + wk, "BTC", "crypto", False)
+    d = json.loads(ax.gate_file(s).read_text())
+    assert d["method"] == "dvol_proxy" and d["events_only"] and d["n_weekend_excluded"] == 300
+    assert d["n_events"] == 70 and d["net_usd"] == pytest.approx(-70.0) and not g["pass"]
+    chk = {x["key"]: x for x in ax.gate_checks(s, check_clock=False)}
+    assert not chk["backtest"]["ok"] and "周末" in chk["backtest"]["detail"]
+    # 同一批周末行要是算进去会"通过"——这正是要防的假象
+    assert ob.aggregate(ev + wk)["net"] > 0
+    # 报告里周末行有明确标注
+    rows = [dict(r, year=2024) for r in ev + wk]
+    lines = ob.verdict_lines(rows, ob.by_kind_year(rows))
+    assert any(ob.WEEKEND_NOTE in x for x in lines) and any("只算排期事件" in x for x in lines)
+
+
+def test_can_go_live_needs_both_backtest_gates(s, monkeypatch):
+    make_all_pass(s, monkeypatch)
+    fk = FakeAlpaca()
+    assert ax.can_go_live(s, NOW, fk.transport)[0]
+    # 只有近似门过、真实报价门不过
+    Ledger(s.data, "options").path.unlink()
+    seed_paper(s, 5, 10.0)
+    ok, reasons = ax.can_go_live(s, NOW, fk.transport)
+    assert not ok and any(r.startswith("真实报价门") and "要 ≥ 10" in r for r in reasons)
+    assert not any(r.startswith("近似回测门") for r in reasons)
+    # 只有真实报价门过、近似门不过
+    seed_real(s, 10)
+    write_gate(s, net_usd=-5.0)
+    ok, reasons = ax.can_go_live(s, NOW, fk.transport)
+    assert not ok and any(r.startswith("近似回测门") for r in reasons)
+    assert not any(r.startswith("真实报价门") for r in reasons)
+    assert not fk.orders(ax.BASE_LIVE)
+
+
 def test_web_sections(s, monkeypatch, tmp_path):
     import importlib
     from fastapi.testclient import TestClient
@@ -459,8 +516,10 @@ def test_web_sections(s, monkeypatch, tmp_path):
     c.post("/login", data={"username": "kea", "password": "correct horse battery"})
     h = c.get("/settings").text
     assert "美股期权执行（Alpaca）" in h and "两人批准" in h and "✗" in h
+    assert "近似回测门" in h and "真实报价门" in h
     o = c.get("/options").text
     assert "美股期权执行（Alpaca）" in o and "测试原因" in o
+    assert "真实报价 vs 近似回测" in o and "周末" in o
     r = c.post("/settings/alpaca", data={"key_id": "PK1234567890ABCDEFGH", "secret": "sec", "paper": "1"}, follow_redirects=False)
     assert r.status_code == 303
     env = Path(web.S.root, ".env").read_text()

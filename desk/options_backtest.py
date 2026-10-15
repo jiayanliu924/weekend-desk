@@ -40,6 +40,10 @@ UTC = timezone.utc
 API = "https://www.deribit.com/api/v2/public"
 H_MS = 3_600_000
 THRESHOLDS = (1.0, 1.1, 1.2, 1.3, 1.5)
+# 2026-10-15 在真实数据上发现：DVOL 回测的卖方盈利几乎全来自周末样本，而 CPI/FOMC/NFP 六年加起来接近 0。
+# 原因是口径：DVOL 是含工作日的 30 天恒定期限指数，周末真实到期的期权早就按"安静"定价了，拿 DVOL 当周末 24 小时隐含 → 卖方被系统性高估。
+# 真实 24 小时期权链（2026-10-08 起的每日对照）实际/隐含 ≈ 0.91，不是 DVOL 口径的 ≈ 0.4。所以周末行只展示、单独标注，不进回测门。
+WEEKEND_NOTE = "DVOL 近似在周末系统性高估卖方（周末真实期权已按安静定价）"
 
 
 class NetworkBlocked(RuntimeError):
@@ -593,6 +597,10 @@ def report_md(currency: str, since: date, until: date, rows: list[dict], source:
     if not rows:
         L += ["**没有一个事件有完整数据。**"]
         return "\n".join(L)
+    if any(r["kind"] == "WEEKEND" for r in rows):
+        L += [f"**⚠ WEEKEND 行：{WEEKEND_NOTE}。** DVOL 是含工作日的 30 天指数；周末真实到期的期权隐含本来就低，"
+              "拿 DVOL 当周末 24 小时的隐含，会把\"卖方收的权利金\"算多。2026-10-08 起用真实期权链采的每日样本 实际/隐含 ≈ 0.9，"
+              "远高于 DVOL 口径的周末比值。周末行只作参考，**不进回测门**（回测门只算 CPI/FOMC/NFP）。", ""]
     kinds = sorted({r["kind"] for r in rows})
     years = sorted({str(r["year"]) for r in rows})
     agg = by_kind_year(rows, "short")
@@ -639,7 +647,7 @@ def report_md(currency: str, since: date, until: date, rows: list[dict], source:
           "\"隐含\"偏低、卖方盈亏偏保守（实际可收的权利金更多），买方盈亏偏乐观。",
           "- 没有波动率微笑：按单一 IV 用 B-S 定平值跨式。",
           "- 实际波动用小时收盘价算，比分钟级偏低（漏掉盘中来回）；线上 options.py 用分钟级指数价。",
-          "- 周末样本 = 周六 00:00 UTC 起 24 小时，锁定在周五 23:00 UTC。",
+          "- 周末样本 = 周六 00:00 UTC 起 24 小时，锁定在周五 23:00 UTC。" + f"**{WEEKEND_NOTE}**：这些行不进回测门。",
           "- 费用按 Deribit 吃单费（封顶）+ 滑点，内在价值结算当作到期交割；没算 delta 对冲。",
           "- 2025 年 10–12 月 BLS 因停摆改期：10 月 CPI 与 10 月非农取消，其余按改期日。"]
     return "\n".join(L)
@@ -648,17 +656,25 @@ def report_md(currency: str, since: date, until: date, rows: list[dict], source:
 def verdict_lines(rows: list[dict], agg: dict, approx: str = "DVOL") -> list[str]:
     L = []
     a = agg.get(("ALL", "ALL"), {})
+    has_wk = any(r["kind"] == "WEEKEND" for r in rows)
     if a.get("n"):
         L.append(f"- 全部 {a['n']} 个样本：几何均值 实际/隐含 = {a['geo_ratio']:.2f}，卖跨式胜率 {a['hit_rate'] * 100:.0f}%，"
-                 f"净 {a['net']:+.2f} 美元（去掉最好 3 笔 {a['net_ex_best3']:+.2f}），最差一笔 {a['worst']:+.2f}。")
+                 f"净 {a['net']:+.2f} 美元（去掉最好 3 笔 {a['net_ex_best3']:+.2f}），最差一笔 {a['worst']:+.2f}"
+                 + ("（含周末样本，周末是口径假象，见下）。" if has_wk else "。"))
+    ev_rows = event_only(rows)
+    ev = aggregate(ev_rows, "short")
+    if has_wk and ev.get("n"):
+        L.append(f"- **只算排期事件（CPI/FOMC/NFP）{ev['n']} 个：几何均值 实际/隐含 = {ev['geo_ratio']:.2f}，卖方净 {ev['net']:+.2f} 美元"
+                 f"（去掉最好 3 笔 {ev['net_ex_best3']:+.2f}），最差一笔 {ev['worst']:+.2f}。** 回测门只看这一行。")
     for k in ("FOMC", "CPI", "NFP", "WEEKEND"):
         yrs = [(y, v) for (kk, y), v in agg.items() if kk == k and y != "ALL"]
         if not yrs:
             continue
         parts = "，".join(f"{y} 年 {v['geo_ratio']:.2f}（{v['n']} 个，卖方净 {v['net']:+.0f}）" for y, v in sorted(yrs))
-        L.append(f"- {k} 按年：{parts}。")
-    tot = agg.get(("ALL", "ALL"))
-    if tot and tot["n"] >= 20:
+        L.append(f"- {k} 按年：{parts}。" + (f" ⚠ {WEEKEND_NOTE}，不进回测门。" if k == "WEEKEND" else ""))
+    # 结论只按排期事件下（周末是 DVOL 口径假象）
+    tot = ev if has_wk else agg.get(("ALL", "ALL"))
+    if tot and tot.get("n", 0) >= 20:
         if tot["geo_ratio"] < 0.9 and tot["net_ex_best3"] > 0:
             L.append(f"- **隐含系统性高于实际，且卖方盈利不靠最好的 3 笔：事件前卖波动的假设在 {approx} 近似下初步成立。**"
                      "但卖方最差一笔要和权利金比：尾部一次能吃掉多少次收益，见上表。")
@@ -709,18 +725,51 @@ def run(settings, currency: str = "BTC", since: date = date(2021, 1, 1), until: 
     return md, rows
 
 
+def event_only(rows: list[dict]) -> list[dict]:
+    """去掉周末样本：DVOL 近似在周末系统性高估卖方（见 WEEKEND_NOTE），回测门只用排期事件。"""
+    return [r for r in rows if r.get("kind") != "WEEKEND"]
+
+
+def kind_summary(rows: list[dict]) -> dict:
+    """每类（CPI/FOMC/NFP/WEEKEND/EVENTS）的 DVOL 口径汇总，给网页"真实报价 vs 近似回测"框用。"""
+    out = {}
+    for k in sorted({r["kind"] for r in rows}):
+        a = aggregate([r for r in rows if r["kind"] == k], "short")
+        out[k] = {"n": a["n"], "geo_ratio": a["geo_ratio"], "net_short_usd": a["net"]}
+    ev = aggregate(event_only(rows), "short")
+    if ev.get("n"):
+        out["EVENTS"] = {"n": ev["n"], "geo_ratio": ev["geo_ratio"], "net_short_usd": ev["net"]}
+    return out
+
+
+def write_summary(settings, rows: list[dict], sym: str, market: str, synthetic: bool, out: Path | None = None) -> Path:
+    """data/reports/options_backtest_<sym>_summary.json：按类型的几何均值 实际/隐含 和卖方净盈亏（周末单独标注）。"""
+    out = out or Path(settings.data) / "reports" / f"options_backtest_{'US_' if market == 'us' else ''}{sym}_summary.json"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps({"method": "dvol_proxy" if market == "crypto" else "vix_proxy", "symbol": sym, "market": market,
+                               "synthetic": bool(synthetic), "by_kind": kind_summary(rows), "weekend_note": WEEKEND_NOTE,
+                               "written_at": datetime.now(UTC).isoformat()}, ensure_ascii=False, indent=1))
+    return out
+
+
 def write_gate(settings, rows: list[dict], underlying: str, market: str, synthetic: bool, side: str = "short",
                out: Path | None = None) -> dict:
     """给执行层（desk/alpaca_exec.py）的回测门：data/reports/options_gate.json。
+    **只算排期事件**：周末样本一律去掉（DVOL 近似在周末系统性高估卖方，见 WEEKEND_NOTE）。
     side="short"：卖跨式口径（执行层的 A 是铁蝶，亏损有上限，所以这个口径偏保守——最差一笔会比铁蝶更差）。
-    盈亏按 [options.paper] notional_usd 名义金额计；pass 用 [alpaca] 的门槛算，执行层还会自己重新核对一遍。"""
+    盈亏按 [options.paper] notional_usd 名义金额计；pass 用 [alpaca] 的门槛算，执行层还会自己重新核对一遍。
+    执行层还要另一道"真实报价门"（options.real_chain_stats → options_real_gate.json）同时通过。"""
     from . import alpaca_exec
-    a = aggregate(rows, side)
+    ev_rows = event_only(rows)
+    a = aggregate(ev_rows, side)
     c = alpaca_exec.cfg(settings)
     n = a.get("n", 0)
-    g = {"n_events": n, "net_usd": a.get("net", 0.0), "net_ex_best3_usd": a.get("net_ex_best3", 0.0),
+    ivx = US_UNDERLYINGS.get(underlying, {}).get("iv_name", "VIX") if market == "us" else "DVOL"
+    g = {"method": "dvol_proxy", "iv_index": ivx, "events_only": True, "n_weekend_excluded": len(rows) - len(ev_rows),
+         "n_events": n, "net_usd": a.get("net", 0.0), "net_ex_best3_usd": a.get("net_ex_best3", 0.0),
          "worst_usd": a.get("worst", 0.0), "side": side, "underlying": underlying, "market": market,
          "synthetic": bool(synthetic), "notional_usd": settings["options"]["paper"]["notional_usd"],
+         "note": f"只算 CPI/FOMC/NFP；周末样本不算（{WEEKEND_NOTE}）",
          "written_at": datetime.now(UTC).isoformat()}
     g["pass"] = bool(not synthetic and n >= c["gate_min_events"] and g["net_usd"] > 0 and g["net_ex_best3_usd"] > 0
                      and g["worst_usd"] >= -c["gate_worst_multiple"] * c["max_risk_usd"])
@@ -760,6 +809,10 @@ def main(argv=None) -> int:
               f"数据会存到 {cache_dir(s)}/，之后离线也能重算。不要用 --synthetic 的结果当真。")
         return 2
     print(md)
+    try:
+        write_summary(s, rows, sym, a.market, a.synthetic)
+    except Exception as e:  # noqa: BLE001
+        print(f"（汇总 json 没写成：{e}）")
     if a.market == "us" and not a.synthetic:
         g = write_gate(s, rows, sym, a.market, a.synthetic)
         print(f"\n回测门已写入 data/reports/options_gate.json：{'通过' if g['pass'] else '没通过'}（{g['n_events']} 个事件，净 {g['net_usd']:+.2f}）")

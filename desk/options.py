@@ -391,6 +391,10 @@ def job_outcome(settings, smp: Sample) -> dict:
     rec = led.append("outcome", smp.sid, out)
     if smp.kind in ("event", "shock"):
         notify.push(settings, f"期权研究：结果 {smp.sid}", outcome_text(lock, rec))
+    try:   # 真实报价证据门：每次结算后重算（只扫账本，很便宜）
+        write_real_gate(settings)
+    except Exception as e:  # noqa: BLE001
+        log.warning("real-chain gate failed: %s", e)
     _alpaca_close(settings, smp)
     return rec
 
@@ -517,6 +521,96 @@ def scorecard(settings) -> dict:
     else:
         res["verdict"] = f"事件样本 {len(ev)}/{need}，还不够下结论"
     return res
+
+
+# ---------------------------------------------------------------- 真实报价证据门（11e）
+REAL_GROUPS = ("daily", "event", "shock")
+REAL_GROUP_NAMES = {"daily": "每日对照", "event": "排期事件", "shock": "突发冲击", "event_like": "事件+突发"}
+REAL_MIN_EVENT_LIKE = 10
+
+
+def real_gate_file(settings) -> Path:
+    return Path(settings.data) / "reports" / "options_real_gate.json"
+
+
+def used_real_chain(r: dict) -> bool:
+    """这个样本的隐含波动是不是来自本机存下的 Deribit 真实期权链（锁定时有快照、算出了隐含）。"""
+    lk = r["lock"]
+    return bool(lk.get("ok") and lk.get("snapshot_received_at") is not None and lk.get("implied_vol"))
+
+
+def _real_group_stats(rs: list[dict]) -> dict:
+    """一组样本：n、几何均值 实际/隐含、纸面 A（卖跨式，未对冲）/ B（买跨式）累计净盈亏（全额手续费+滑点，
+    即 options_paper.settle 的口径）、胜率、最差一笔。"""
+    lrs = []
+    for r in rs:
+        o = r["outcome"]
+        lr = o.get("log_ratio")
+        if lr is None and o.get("ratio"):
+            lr = math.log(o["ratio"])
+        if lr is not None:
+            lrs.append(lr)
+    pa, pb = [], []
+    for r in rs:
+        pp = r["outcome"].get("paper") or {}
+        if pp.get("ok") and pp.get("pnl"):
+            pa.append(float(pp["pnl"]["A_unhedged"]))
+            pb.append(float(pp["pnl"]["B"]))
+    n_p = len(pa)
+    return {"n": len(rs), "geo_ratio": math.exp(sum(lrs) / len(lrs)) if lrs else None,
+            "n_paper": n_p, "A_net": sum(pa), "B_net": sum(pb),
+            "hit_A": (sum(1 for x in pa if x > 0) / n_p) if n_p else None,
+            "hit_B": (sum(1 for x in pb if x > 0) / n_p) if n_p else None,
+            "worst": min(pa + pb) if n_p else None}
+
+
+def real_chain_stats(settings) -> dict:
+    """真实期权链证据：只用锁定时用了本机存的 Deribit 期权快照、且已结算成功的样本（每日 + 事件 + 突发）。
+    按组 daily / event / shock，再合一个 event_like（事件 + 突发）。pass 规则（写死）：
+      event_like 样本 ≥ 10 个，且纸面 A 或 B 在 event_like 上累计净盈亏 > 0，且 event_like 最差一笔 ≥ −3 × [alpaca] max_risk_usd。"""
+    from . import alpaca_exec
+    led = Ledger(settings.data, "options")
+    recs = [r for r in completed(led) if official(r) and used_real_chain(r)]
+    groups = {g: _real_group_stats([r for r in recs if r["lock"].get("sample_kind") == g]) for g in REAL_GROUPS}
+    ev_like = [r for r in recs if r["lock"].get("sample_kind") in ("event", "shock")]
+    groups["event_like"] = _real_group_stats(ev_like)
+    by_type = {}
+    for et in sorted({r["lock"]["event_type"] for r in ev_like}):
+        by_type[et] = _real_group_stats([r for r in ev_like if r["lock"]["event_type"] == et])
+    c = alpaca_exec.cfg(settings)
+    floor = -float(c["gate_worst_multiple"]) * float(c["max_risk_usd"])
+    el = groups["event_like"]
+    reasons = []
+    if el["n"] < REAL_MIN_EVENT_LIKE:
+        reasons.append(f"真实报价的事件/突发样本 {el['n']} 个（要 ≥ {REAL_MIN_EVENT_LIKE}）")
+    if not (el["n_paper"] and (el["A_net"] > 0 or el["B_net"] > 0)):
+        reasons.append(f"纸面卖跨式累计 {el['A_net']:+.2f}、买跨式累计 {el['B_net']:+.2f} 美元，两个都不赚钱（要至少一个 > 0）")
+    if el["worst"] is not None and el["worst"] < floor:
+        reasons.append(f"最差一笔 {el['worst']:+.2f} < {floor:+.0f}（{c['gate_worst_multiple']:.0f} 倍单笔风险上限）")
+    return {"method": "real_chain", "groups": groups, "by_type": by_type, "n_event_like": el["n"],
+            "min_event_like": REAL_MIN_EVENT_LIKE, "worst_floor_usd": floor,
+            "pass": not reasons, "reasons": reasons, "notional_usd": settings["options"]["paper"]["notional_usd"],
+            "fees": "全额：Deribit 吃单费（封顶）+ 滑点，进出各一次（options_paper 口径）",
+            "written_at": datetime.now(UTC).isoformat()}
+
+
+def write_real_gate(settings) -> dict:
+    g = real_chain_stats(settings)
+    p = real_gate_file(settings)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(g, ensure_ascii=False, indent=1))
+    return g
+
+
+def real_text(st: dict) -> str:
+    f = lambda x: "—" if x is None else f"{x:.2f}"  # noqa: E731
+    L = []
+    for g in ("daily", "event", "shock"):
+        d = st["groups"][g]
+        if d["n"]:
+            L.append(f"{REAL_GROUP_NAMES[g]} {d['n']} 个：实际/隐含 {f(d['geo_ratio'])}，纸面卖跨式 {d['A_net']:+.2f}、买跨式 {d['B_net']:+.2f} 美元")
+    L.append("真实报价门：" + ("通过" if st["pass"] else "没通过——" + "；".join(st["reasons"])))
+    return "\n".join(L)
 
 
 STATUS_NAMES = {"concluded": "已结束", "ongoing": "进行中", "unknown": "看不出"}

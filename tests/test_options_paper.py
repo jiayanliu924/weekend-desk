@@ -228,3 +228,55 @@ def test_options_page_renders_paper_card(tmp_path, monkeypatch):
     r = c.get("/options")
     assert r.status_code == 200
     assert "纸面期权交易员" in r.text and "A 卖跨式" in r.text and "control" in r.text and "最差一笔" in r.text
+
+
+# ---------------------------------------------------------------- 真实报价证据门（real_chain_stats）
+def _seed(led, sid, kind, ratio, a, b, real=True, ok=True, et="CPI", paper_ok=True):
+    lock = {"sample_kind": kind, "event_type": et, "ok": True, "implied_vol": 0.5}
+    if real:
+        lock["snapshot_received_at"] = 123
+    led.append("lock", sid, lock)
+    led.append("outcome", sid, {"ok": ok, "ratio": ratio, "log_ratio": math.log(ratio),
+                                "paper": {"ok": paper_ok, "chosen": "C", "chosen_pnl": 0.0,
+                                          "pnl": {"A_unhedged": a, "A_hedged": a, "B": b, "C": 0.0}}})
+
+
+def test_real_chain_stats_math(s):
+    led = Ledger(s.data, "options")
+    _seed(led, "DAY-1", "daily", 0.8, 3.0, -4.0, et="none")
+    _seed(led, "DAY-2", "daily", 1.25, -2.0, 1.0, et="none")
+    _seed(led, "EVT-1", "event", 0.5, 6.0, -7.0)
+    _seed(led, "EVT-2", "event", 2.0, -9.0, 8.0)
+    _seed(led, "SHOCK-1", "shock", 1.0, 1.0, -2.0, et="SHOCK:GEO")
+    _seed(led, "EVT-NOCHAIN", "event", 0.1, 100.0, -100.0, real=False)     # 没用真实期权链 → 不算
+    _seed(led, "EVT-BAD", "event", 0.1, 100.0, -100.0, ok=False)          # 结算失败 → 不算
+    st = options.real_chain_stats(s)
+    g = st["groups"]
+    assert g["daily"]["n"] == 2 and g["daily"]["geo_ratio"] == pytest.approx(1.0)          # √(0.8·1.25)
+    assert g["daily"]["A_net"] == pytest.approx(1.0) and g["daily"]["B_net"] == pytest.approx(-3.0)
+    assert g["daily"]["hit_A"] == pytest.approx(0.5) and g["daily"]["worst"] == pytest.approx(-4.0)
+    assert g["event"]["n"] == 2 and g["event"]["geo_ratio"] == pytest.approx(1.0)          # √(0.5·2)
+    assert g["event"]["A_net"] == pytest.approx(-3.0) and g["event"]["B_net"] == pytest.approx(1.0)
+    assert g["event"]["worst"] == pytest.approx(-9.0)
+    el = g["event_like"]
+    assert el["n"] == 3 and st["n_event_like"] == 3
+    assert el["geo_ratio"] == pytest.approx(1.0) and el["A_net"] == pytest.approx(-2.0) and el["B_net"] == pytest.approx(-1.0)
+    assert el["hit_B"] == pytest.approx(1 / 3)
+    assert st["by_type"]["CPI"]["n"] == 2 and st["by_type"]["SHOCK:GEO"]["n"] == 1
+    assert not st["pass"] and any("≥ 10" in r for r in st["reasons"]) and any("都不赚钱" in r for r in st["reasons"])
+
+
+def test_real_chain_gate_pass_and_file(s):
+    import json
+    led = Ledger(s.data, "options")
+    for i in range(10):
+        _seed(led, f"EVT-{i}", "event" if i % 2 else "shock", 0.9, 2.0, -3.0)
+    st = options.real_chain_stats(s)
+    assert st["pass"] and st["groups"]["event_like"]["A_net"] == pytest.approx(20.0)
+    # 最差一笔低于 −3 × max_risk_usd → 不过
+    _seed(led, "EVT-TAIL", "event", 3.0, -3 * s.raw["alpaca"]["max_risk_usd"] - 1, 1000.0)
+    st = options.real_chain_stats(s)
+    assert not st["pass"] and any("最差一笔" in r for r in st["reasons"])
+    g = options.write_real_gate(s)
+    d = json.loads(options.real_gate_file(s).read_text())
+    assert d["method"] == "real_chain" and d["pass"] is False and g["pass"] is False and d["n_event_like"] == 11
