@@ -295,21 +295,36 @@ def append_stanzas(config_path: Path, insts: list[dict], comment_by_name: dict[s
 
 
 # ---------------------------------------------------------------- 周末回测（同一套反向逻辑）
-def weekend_rows(settings, inst: dict, candles: list[dict], interval: str, n_weekends: int, now: datetime) -> list[dict]:
-    """最近 n 个已完成周末：锚 = 关门前最后一根 K 线，决策 = 重开 −15min，平仓 = 重开 +5min。"""
+def weekend_rows(settings, inst: dict, candles: list[dict], interval: str, n_weekends: int, now: datetime,
+                 diag: dict | None = None) -> list[dict]:
+    """最近 n 个已完成周末：锚 = 关门前最后一根 K 线，决策 = 重开 −15min，平仓 = 重开 +5min。
+
+    diag（可选）收集"为什么这个周末没有样本"：K 线没覆盖到 / 缺关门价 / 缺决策价 / 缺平仓价。
+    周末链上成交稀，决策价最多往前找 2 小时（15m = 8 根）；关门价、平仓价仍只找 4 根。
+    """
     iv = INTERVAL_MS[interval]
     by_t = {int(c["t"]): c for c in candles}
+    first_t = min(by_t) if by_t else None
+    dec_back = max(4, (2 * 3_600_000) // iv)
     w = last_completed_weekend(now, settings, inst)
     rows = []
+    d = diag if diag is not None else {}
+    for k in ("before_candles", "no_close", "no_decision", "no_exit"):
+        d.setdefault(k, 0)
     for _ in range(n_weekends):
-        p_close = price_at_or_before(by_t, iv, w.close)
-        p_dec = price_at_or_before(by_t, iv, w.decision)
-        p_out = price_at_or_after(by_t, iv, w.exit)
-        if all((p_close, p_dec, p_out)):
-            rows.append({"name": inst["name"], "day": w.friday.isoformat(), "label": w.friday.isoformat(),
-                         "t_decision": w.decision.isoformat(), "close_px": p_close, "dec_px": p_dec, "reopen_px": p_out,
-                         "dev_bps": (p_dec / p_close - 1) * 1e4, "y_bps": (p_out / p_close - 1) * 1e4,
-                         "move_from_dec_bps": (p_out / p_dec - 1) * 1e4})
+        if first_t is None or bl.ms(w.close) < first_t:
+            d["before_candles"] += 1
+        else:
+            p_close = price_at_or_before(by_t, iv, w.close)
+            p_dec = price_at_or_before(by_t, iv, w.decision, max_back=dec_back)
+            p_out = price_at_or_after(by_t, iv, w.exit)
+            if all((p_close, p_dec, p_out)):
+                rows.append({"name": inst["name"], "day": w.friday.isoformat(), "label": w.friday.isoformat(),
+                             "t_decision": w.decision.isoformat(), "close_px": p_close, "dec_px": p_dec, "reopen_px": p_out,
+                             "dev_bps": (p_dec / p_close - 1) * 1e4, "y_bps": (p_out / p_close - 1) * 1e4,
+                             "move_from_dec_bps": (p_out / p_dec - 1) * 1e4})
+            else:
+                d["no_close" if not p_close else "no_decision" if not p_dec else "no_exit"] += 1
         w = weekend_for_friday(w.friday - timedelta(days=7), settings, inst)
     rows.reverse()
     return rows
@@ -346,15 +361,32 @@ def effective_samples(n_per_name: list[int], rhos: list[float | None]) -> float:
     return sum(n_per_name) / (1 + (k - 1) * rbar)
 
 
+def _default_get_candles(settings):
+    """真网络路径：节流 + 退避（backtest_lib.info_post），并且 cache_max_age_h 小时内抓过的缓存直接用。"""
+    age = float(gate_cfg(settings).get("cache_max_age_h", 6.0))
+    return lambda st, coin, days: bl.get_candles(st, coin, days, max_cache_age_h=age)
+
+
+def _why_empty(diag: dict, n_candles: int, interval: str, cs: list[dict]) -> str:
+    if not n_candles:
+        return "K 线为空"
+    span = (f"{datetime.fromtimestamp(int(cs[0]['t']) / 1000, tz=UTC):%m-%d}→"
+            f"{datetime.fromtimestamp(int(cs[-1]['t']) / 1000, tz=UTC):%m-%d}")
+    lab ={"before_candles": "早于 K 线覆盖", "no_close": "缺关门价", "no_decision": "缺决策价", "no_exit": "缺平仓价"}
+    parts = [f"{lab[k]} {diag[k]}" for k in lab if diag.get(k)]
+    return f"有 {n_candles} 根 {interval} K 线（{span}），但没有一个周末取得到三个价：" + "，".join(parts)
+
+
 def backtest_candidate(settings, inst: dict, n_weekends: int, now: datetime, notional: float, half_spread: float,
                        ref_rows: list[dict] | None, get_candles=None) -> dict:
-    get_candles = get_candles or bl.get_candles
+    get_candles = get_candles or _default_get_candles(settings)
     days = n_weekends * 7 + 10
     try:
         cs, iv, src = get_candles(settings, inst["coin"], days)
     except Exception as e:  # noqa: BLE001
-        return {"n": 0, "error": f"没有 K 线：{e}", "source": "失败"}
-    rows = weekend_rows(settings, inst, cs, iv, n_weekends, now)
+        return {"n": 0, "error": f"没有 K 线：{e}", "source": "失败", "rate_limited": bl.is_rate_limited(e)}
+    diag: dict = {}
+    rows = weekend_rows(settings, inst, cs, iv, n_weekends, now, diag)
     st = trade_stats(rows, settings, notional, mode="fade", half_spread_bps=half_spread)
     rho, overlap = correlation_with(rows, ref_rows or [])
     out = {"n": st["n"], "trades": st["trades"], "threshold_bps": st["threshold_bps"], "source": src,
@@ -362,8 +394,10 @@ def backtest_candidate(settings, inst: dict, n_weekends: int, now: datetime, not
            "avg_net_bps": st.get("avg_net_bps"), "total_net_usd": st.get("total_net_usd"),
            "worst_bps": st["worst"]["net_bps"] if st.get("worst") else None,
            "worst_day": st["worst"]["day"] if st.get("worst") else None,
-           "p50_absdev": st.get("p50"), "rho_xyz100": rho, "rho_overlap": overlap,
+           "p50_absdev": st.get("p50"), "rho_xyz100": rho, "rho_overlap": overlap, "missing": diag,
            "weekends": [{k: r[k] for k in ("day", "dev_bps", "y_bps", "move_from_dec_bps")} for r in rows]}
+    if not rows:
+        out["error"] = _why_empty(diag, len(cs), iv, cs)
     return out
 
 
@@ -407,6 +441,13 @@ def scan(settings, raw: dict, n_weekends: int | None = None, now: datetime | Non
             inst = in_cfg.get(m.coin) or in_cfg.get(m.symbol) or (stanza_for(m.coin, m.schedule) if m.schedule != UNKNOWN else None)
             if inst:
                 m.backtest = backtest_candidate(settings, inst, n_weekends, now, notional, half_spread, ref_rows, get_candles)
+    # 第二轮：第一轮被限速（429）的再试一次（info_post 已经退避过；这里再等一个完整窗口）
+    retry = [m for m in markets if m.backtest and m.backtest.get("rate_limited")]
+    if retry:
+        bl.PACER.sleep(60.0)
+        for m in retry:
+            inst = in_cfg.get(m.coin) or in_cfg.get(m.symbol) or stanza_for(m.coin, m.schedule)
+            m.backtest = backtest_candidate(settings, inst, n_weekends, now, notional, half_spread, ref_rows, get_candles)
     cands = sorted((m for m in markets if m.status == "candidate"), key=rank_key)
     n_eff = effective_samples([(m.backtest or {}).get("n", 0) for m in cands],
                               [(m.backtest or {}).get("rho_xyz100") for m in cands])
@@ -441,6 +482,10 @@ def report_md(res: dict) -> str:
          f"手续费全额口径（growthMode 折扣不计），每笔名义 ${res['notional_usd']:.0f}，半点差 {res['half_spread_bps']:.0f} bps。", ""]
     if res.get("errors"):
         L += ["发现阶段出错：" + "；".join(f"{k or '主 dex'}: {v}" for k, v in res["errors"].items()), ""]
+    bt_need = [m for m in ms if m["status"] in ("candidate", "in_config") and m.get("backtest") is not None]
+    bt_ok = [m for m in bt_need if (m["backtest"] or {}).get("n")]
+    L += [f"**回测覆盖：{len(bt_ok)} / {len(bt_need)} 个（候选 + 已在 config）取到了周末样本。**"
+          + ("" if len(bt_ok) == len(bt_need) else " 没取到的原因见文末“回测失败 / 样本为 0”，不是“没信号”。"), ""]
     L += [f"## 候选排名（已过分类与门槛，按每笔平均净 bps；共 {len(by_status.get('candidate', []))} 个）", "",
           "| # | 市场 | 时间表 | 判定依据 | 24h 成交额 | 持仓 | 点差 bps | growth | 周末数 | 反转率(全部) | 出手 | 命中率 | 平均净 bps | 累计 USD | 最差一笔 | ρ(XYZ100) |",
           "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
@@ -484,6 +529,14 @@ def report_md(res: dict) -> str:
         for m in by_status["review"]:
             L.append(f"| {m['coin']} | {m['dex']} | {_usd(m['day_ntl_vlm'])} | {_usd(m['oi_usd'])} | "
                      f"{'—' if m['spread_bps'] is None else f'{m['spread_bps']:.1f}'} | {'过' if m['gate_ok'] else '不过'} | {m['why']} |")
+    failed = [m for m in ms if m["status"] in ("candidate", "in_config") and m.get("backtest") is not None
+              and not (m["backtest"] or {}).get("n")]
+    if failed:
+        L += ["", "## 回测失败 / 样本为 0（原因）", "",
+              "限速（429）的已自动退避重试过；仍失败的再跑一次 scan 即可（K 线会走缓存，不重复吃权重）。", "",
+              "| 市场 | 状态 | 原因 |", "|---|---|---|"]
+        for m in failed:
+            L.append(f"| {m['coin']} | {m['status']} | {(m['backtest'] or {}).get('error') or '—'} |")
     for st, title in (("excluded", "覆盖文件排除"), ("delisted", "已下架")):
         if by_status.get(st):
             L += ["", f"## {title}", "", ", ".join(m["coin"] for m in by_status[st])]

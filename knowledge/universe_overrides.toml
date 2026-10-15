@@ -1,21 +1,71 @@
 # 品种扩展（#13）手工覆盖表：desk/universe.py 的命名规则认不出、或认错的市场写在这里。
-# 优先级：[exclude] > [markets] > 命名规则表 > [dex_default]。改完重跑 python3 -m desk.universe scan。
+# 优先级：[exclude] > # ======================================================================================================
+# ★ 待人工确认（2026-10-15 扫描里认不出的名字）。SKHY / DRAM 故意不写进 [markets]，scan 不会把它们当候选；
+#   SKHX 查到了官方文档，已写进 [markets]，但仍请人工再核：
 #
-# 时间表键（见 desk/universe.py SCHEDULES）：
-#   us_equity      美股单票 24/5：周日 20:00 → 周五 20:00 美东
-#   us_index       美指 23/5：周日 18:00 → 周五 17:00 美东
-#   metals_energy  金属/能源 23/5：同上
-#   fx             外汇：周日 17:00 → 周五 17:00 美东
-#   kr_equity      韩股：周五 20:00 → 周一 09:01 首尔（trade.xyz 口径，同 SMSN）
-#   jp_equity      日股：周五 15:30 → 周一 09:00 东京
-#   hk_equity      港股：周五 16:00 → 周一 09:30 香港
-#   eu_equity      欧股：周五 17:30 → 周一 09:00 柏林（Xetra）
+#   ★★ xyz:SKHX —— 这是全部候选里成交额最高的市场，最值得先确认。
+#      2026-10-15 查 docs.trade.xyz/asset-directory/korea：SKHX = SK 海力士普通股（KRX 000660），
+#      预言机 = 韩元价 ÷ 美元/韩元，时间表同 SMSN（周五 20:00 → 周一 09:01 首尔）。证据清楚，已写进下面 [markets]
+#      为 kr_equity；但它就是 2026 年那次"价格异常、$59M 连环爆仓"的合约（trade.xyz 赔付），插针风险高，
+#      model.decide_action 的插针否决对它尤其重要。上真钱前请人工再核一次。
+#   xyz:SKHY —— 名字像 SK 海力士，但 trade.xyz 韩国资产页上没有这个代码；可能是另一个 dex 的同名/旧代码。待确认。
+#   xyz:DRAM、io:DRAM —— 可能是存储芯片主题 ETF/篮子，也可能是别的东西；底层与时间表查不清。待确认。
+#
+# 和任务清单不一致、按官方文档处理的一条：
+#   xyz:EWY —— 清单写的是 us_equity（EWY 是 NYSE Arca 上市的 iShares 韩国 ETF），但 docs.trade.xyz 把它列在
+#   "Korea" 资产页、按韩国时段定价（ETF 净值，无外汇换算）。所以这里按 kr_equity。如果确认它其实按美股时段定价，
+#   改成 "us_equity" 即可。io:EWY 是另一个 dex，按清单 us_equity。
+# ======================================================================================================
 
 [markets]
-# 例："xyz:TSMC" = "us_equity"   # 台积电 ADR 在 NYSE 交易，按美股时间表；如果是台股现货则没有合适时间表，不要加
+# —— 外汇（周日 17:00 → 周五 17:00 美东）
+"xyz:EUR" = "fx"
+"xyz:JPY" = "fx"
+"xyz:GBP" = "fx"
+# —— 美国上市 ETF / 单票（24/5：周五 20:00 → 周日 20:00 美东）
+"xyz:EWJ" = "us_equity"     # iShares 日本 ETF（美国上市）
+"xyz:EWZ" = "us_equity"     # iShares 巴西 ETF
+"xyz:SMH" = "us_equity"     # VanEck 半导体 ETF
+"xyz:SOXL" = "us_equity"    # 3 倍半导体 ETF
+"xyz:XLE" = "us_equity"     # 能源板块 ETF
+"xyz:KORU" = "us_equity"    # 3 倍韩国 ETF（美国上市）
+"io:EWY" = "us_equity"      # iShares 韩国 ETF（io dex；xyz:EWY 见上方说明）
+"xyz:SNDK" = "us_equity"    # SanDisk
+"io:SNDK" = "us_equity"
+"xyz:CRWV" = "us_equity"    # CoreWeave
+"xyz:LITE" = "us_equity"    # Lumentum
+"xyz:AAOI" = "us_equity"    # Applied Optoelectronics
+"xyz:BE" = "us_equity"      # Bloom Energy
+"xyz:IREN" = "us_equity"    # IREN
+"xyz:MRNA" = "us_equity"    # Moderna
+"xyz:HIMS" = "us_equity"    # Hims & Hers
+"xyz:NOK" = "us_equity"     # Nokia ADR
+"xyz:WDC" = "us_equity"     # Western Digital
+"xyz:BABA" = "us_equity"    # 阿里巴巴 ADR（NYSE；港股是另一条）
+"xyz:STRC" = "us_equity"    # Strategy 优先股 STRC（Nasdaq）
+"xyz:USAR" = "us_equity"    # USA Rare Earth
+"xyz:BMNR" = "us_equity"    # BitMine Immersion
+"xyz:CBRS" = "us_equity"
+# —— 美指（23/5：周五 17:00 → 周日 18:00 美东）
+"mkts:USTECH" = "us_index"
+"mkts:SMALL2000" = "us_index"
+# —— 日股
+"xyz:KIOXIA" = "jp_equity"  # 铠侠（东证）
+# —— 韩股（周五 20:00 → 周一 09:01 首尔；docs.trade.xyz/asset-directory/korea）
+"xyz:SKHX" = "kr_equity"    # SK 海力士（KRX 000660）——见上方 ★★
+"xyz:EWY" = "kr_equity"     # 见上方说明：官方文档列在韩国资产页
 
 [exclude]
-# 例："xyz:FOO" = "预言机来源不明"
+# 私募 / pre-IPO：没有公开的参考市场，没有"真市场关门 → 重开"结构，周末反向逻辑不成立
+"xyz:SPCX" = "SpaceX，未上市，无参考市场"
+"io:ANTH" = "Anthropic，未上市，无参考市场"
+"io:OAI" = "OpenAI，未上市，无参考市场"
+"xyz:CXMT" = "长鑫存储，未上市，无参考市场"
+"xyz:ZHIPU" = "智谱，无可用的公开参考市场"
+"xyz:MINIMAX" = "MiniMax，无可用的公开参考市场"
+"xyz:UNITREE" = "宇树，未上市，无参考市场"
+"xyz:SHEIN" = "SHEIN，未上市，无参考市场"
+"xyz:PURRDAT" = "无公开参考市场"
 
 [dex_default]
 # 整个 dex 兜底（不建议开；一开就把该 dex 里认不出的名字全按这个时间表算）

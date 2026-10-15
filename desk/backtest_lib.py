@@ -72,28 +72,119 @@ def is_blocked_error(e: Exception | str) -> bool:
     return "403" in s or "Proxy" in s or "CONNECT" in s or "connect_rejected" in s
 
 
-# ---------------------------------------------------------------- K 线抓取 + 缓存
-def fetch_candles_paged(coin: str, interval: str, days: int) -> list[dict]:
-    """沿用 backfill.fetch_candles 的接口，但 candleSnapshot 一次最多 5000 根，往前翻页直到够 days 天。"""
-    from . import backfill
+# ---------------------------------------------------------------- 限速（2026-10-15 universe 扫描 39/45 个"周末数 0"的根因）
+# Hyperliquid info 接口按 IP 限速：每分钟 1200 权重。candleSnapshot 基础权重 20，另外每返回 60 根 K 线 +1，
+# 一次 5000 根 ≈ 104 权重 → 一分钟只够约 10 次；而服务器上的收集器同一个 IP 也在用权重。
+# 以前 universe scan 对 45 个候选连着打、没有节流也没有重试：前 6 个拿到 K 线，之后全被 429，
+# 429 又被当成"这个周期没有"去试 5m、1h（再吃 429），最后 RuntimeError 被 backtest_candidate 吞成 n=0，
+# 报告里只显示"周末数 0"。修法：按权重节流 + 429/5xx 退避重试 + 不在 429 时换周期 + 新鲜缓存直接用 + 报告列出失败原因。
+INFO_WEIGHT_BUDGET = 800       # 每分钟自己最多用多少权重（留 400 给收集器等同 IP 的程序）
+CANDLE_BASE_WEIGHT = 20
+CANDLE_MAX_WEIGHT = CANDLE_BASE_WEIGHT + 5000 // 60 + 1
+
+
+class Pacer:
+    """滑动 60 秒窗口的权重节流。clock/sleep 可注入，测试用假时钟。"""
+
+    def __init__(self, budget: float = INFO_WEIGHT_BUDGET, window_s: float = 60.0, clock=time.monotonic, sleep=time.sleep):
+        self.budget, self.window = budget, window_s
+        self.clock, self.sleep = clock, sleep
+        self.used: list[tuple[float, float]] = []
+        self.slept = 0.0
+
+    def _trim(self) -> None:
+        now = self.clock()
+        self.used = [(t, w) for t, w in self.used if now - t < self.window]
+
+    def wait(self, weight: float) -> None:
+        """等到"窗口内已用 + 这次最多会用"不超过预算。"""
+        self._trim()
+        while self.used and sum(w for _, w in self.used) + weight > self.budget:
+            dt = self.window - (self.clock() - self.used[0][0]) + 0.05
+            if dt > 0:
+                self.sleep(dt)
+                self.slept += dt
+            self._trim()
+
+    def record(self, weight: float) -> None:
+        self.used.append((self.clock(), weight))
+
+
+PACER = Pacer()
+
+
+def is_rate_limited(e: Exception | str) -> bool:
+    resp = getattr(e, "response", None)
+    code = getattr(resp, "status_code", None)
+    return code == 429 or "429" in str(e) or "Too Many Requests" in str(e) or "rate limit" in str(e).lower()
+
+
+def _is_retryable(e: Exception) -> bool:
+    if is_rate_limited(e):
+        return True
+    code = getattr(getattr(e, "response", None), "status_code", None)
+    if code is not None and 500 <= code < 600:
+        return True
+    return type(e).__name__ in ("ReadTimeout", "ConnectTimeout", "RemoteProtocolError", "ReadError", "TimeoutException")
+
+
+def _httpx_post(payload: dict, timeout: float = 60.0):
     import httpx
+    from . import backfill
+    r = httpx.post(backfill.INFO_URL, json=payload, timeout=timeout)
+    r.raise_for_status()
+    return r.json()
+
+
+def info_post(payload: dict, weight: float = CANDLE_MAX_WEIGHT, post=None, pacer: Pacer | None = None,
+              retries: int = 5, backoff_s: float = 2.0, items_per_weight: int = 60):
+    """节流 + 退避重试的 info 请求。被代理拦（403）不重试——整台机器连不上，重试没用。"""
+    post = post or _httpx_post
+    pacer = pacer or PACER
+    last: Exception | None = None
+    for attempt in range(retries + 1):
+        pacer.wait(weight)
+        try:
+            res = post(payload)
+        except Exception as e:  # noqa: BLE001
+            pacer.record(CANDLE_BASE_WEIGHT)
+            last = e
+            if is_blocked_error(e) and not is_rate_limited(e):
+                raise
+            if not _is_retryable(e) or attempt == retries:
+                raise
+            # 429：等满一个窗口再试（指数退避，封顶 60 秒）
+            dt = min(60.0, backoff_s * (2 ** attempt))
+            pacer.sleep(dt)
+            pacer.slept += dt
+            continue
+        n = len(res) if isinstance(res, list) else 0
+        pacer.record(CANDLE_BASE_WEIGHT + n // items_per_weight)
+        return res
+    raise last  # pragma: no cover
+
+
+# ---------------------------------------------------------------- K 线抓取 + 缓存
+def fetch_candles_paged(coin: str, interval: str, days: int, post=None, pacer: Pacer | None = None) -> list[dict]:
+    """沿用 backfill.fetch_candles 的接口，但 candleSnapshot 一次最多 5000 根，往前翻页直到够 days 天。
+
+    Hyperliquid 每个周期只保留最近 5000 根（15m ≈ 52 天，1h ≈ 208 天），更早的要靠本地缓存累积（save_cache 会合并）。
+    """
     end = int(time.time() * 1000)
     start = end - days * 86400 * 1000
     out: dict[int, dict] = {}
     cur_end = end
     for _ in range(60):
-        r = httpx.post(backfill.INFO_URL, json={"type": "candleSnapshot",
-                                                "req": {"coin": coin, "interval": interval, "startTime": start, "endTime": cur_end}},
-                       timeout=60)
-        r.raise_for_status()
-        cs = r.json()
+        cs = info_post({"type": "candleSnapshot",
+                        "req": {"coin": coin, "interval": interval, "startTime": start, "endTime": cur_end}},
+                       post=post, pacer=pacer)
         if not cs:
             break
         new = [c for c in cs if int(c["t"]) not in out]
         for c in cs:
             out[int(c["t"])] = c
-        if not new or int(cs[0]["t"]) <= start:
-            break
+        if not new or int(cs[0]["t"]) <= start or len(cs) < 5000:
+            break   # 不满 5000 根说明这一段已经是能拿到的全部，不用再翻（省一次请求的权重）
         cur_end = int(cs[0]["t"]) - 1
     return [out[t] for t in sorted(out)]
 
@@ -102,43 +193,79 @@ def cache_path(settings, coin: str, interval: str) -> Path:
     return Path(settings.data) / "backfill" / f"candles_{coin.replace(':', '_')}_{interval}.parquet"
 
 
-def save_cache(settings, coin: str, interval: str, candles: list[dict]) -> Path:
+def _read_cache(p: Path) -> tuple[list[dict], int]:
+    import pyarrow.parquet as pq
+    tb = pq.read_table(p).to_pylist()
+    fetched = max((int(r.get("fetched_at") or 0) for r in tb), default=0)
+    return [{"t": int(r["t"]), "o": r["o"], "h": r["h"], "l": r["l"], "c": r["c"], "v": r["v"]} for r in tb], fetched
+
+
+def save_cache(settings, coin: str, interval: str, candles: list[dict], merge: bool = True) -> Path:
+    """写缓存；merge=True 时和已有缓存按时间戳合并（新数据覆盖旧的同一根），让历史随每次抓取累积、超过 5000 根上限。"""
     import pyarrow as pa
     import pyarrow.parquet as pq
     p = cache_path(settings, coin, interval)
     p.parent.mkdir(parents=True, exist_ok=True)
+    by_t: dict[int, dict] = {}
+    if merge and p.exists():
+        try:
+            old, _ = _read_cache(p)
+            by_t.update({int(c["t"]): c for c in old})
+        except Exception:  # noqa: BLE001
+            pass
+    by_t.update({int(c["t"]): c for c in candles})
+    rows = [by_t[t] for t in sorted(by_t)]
     pq.write_table(pa.table({
-        "t": [int(c["t"]) for c in candles], "o": [float(c["o"]) for c in candles], "h": [float(c["h"]) for c in candles],
-        "l": [float(c["l"]) for c in candles], "c": [float(c["c"]) for c in candles], "v": [float(c["v"]) for c in candles],
-        "fetched_at": [int(time.time() * 1000)] * len(candles)}), p)
+        "t": [int(c["t"]) for c in rows], "o": [float(c["o"]) for c in rows], "h": [float(c["h"]) for c in rows],
+        "l": [float(c["l"]) for c in rows], "c": [float(c["c"]) for c in rows], "v": [float(c["v"]) for c in rows],
+        "fetched_at": [int(time.time() * 1000)] * len(rows)}), p)
     return p
+
+
+def load_cache_iv(settings, coin: str, interval: str) -> tuple[list[dict], int] | None:
+    """指定周期的缓存 → (candles, fetched_at_ms)；没有 → None。"""
+    p = cache_path(settings, coin, interval)
+    if not p.exists():
+        return None
+    return _read_cache(p)
 
 
 def load_cache(settings, coin: str) -> tuple[list[dict], str] | None:
     """按偏好顺序找本地缓存（含周末 backfill 存的 1h 文件）。"""
-    import pyarrow.parquet as pq
     for iv in INTERVAL_PREF:
-        p = cache_path(settings, coin, iv)
-        if p.exists():
-            tb = pq.read_table(p).to_pylist()
-            return [{"t": r["t"], "o": r["o"], "h": r["h"], "l": r["l"], "c": r["c"], "v": r["v"]} for r in tb], iv
+        got = load_cache_iv(settings, coin, iv)
+        if got:
+            return got[0], iv
     return None
 
 
-def get_candles(settings, coin: str, days: int) -> tuple[list[dict], str, str]:
-    """返回 (candles, interval, 来源说明)。网络失败 → 本地缓存；都没有 → 抛异常。"""
+def get_candles(settings, coin: str, days: int, max_cache_age_h: float | None = None, post=None,
+                pacer: Pacer | None = None) -> tuple[list[dict], str, str]:
+    """返回 (candles, interval, 来源说明)。网络失败 → 本地缓存；都没有 → 抛异常。
+
+    max_cache_age_h：缓存（任一偏好周期）在这么多小时内抓过就直接用、不打网络（universe 扫描 45 个名字时省权重）。
+    被限速（429）时由 info_post 退避重试；重试用完也不换周期（换周期一样被限速，只会更糟）。
+    """
+    if max_cache_age_h is not None:
+        for iv in INTERVAL_PREF:
+            got = load_cache_iv(settings, coin, iv)
+            if got and got[0] and (time.time() * 1000 - got[1]) < max_cache_age_h * 3600 * 1000:
+                return got[0], iv, f"本地缓存 {cache_path(settings, coin, iv).name}（{len(got[0])} 根，{max_cache_age_h:g} 小时内抓过，未重抓）"
     errs = []
     for iv in INTERVAL_PREF:
         try:
-            cs = fetch_candles_paged(coin, iv, days)
+            cs = fetch_candles_paged(coin, iv, days) if post is None and pacer is None else \
+                fetch_candles_paged(coin, iv, days, post=post, pacer=pacer)
             if cs:
                 save_cache(settings, coin, iv, cs)
-                return cs, iv, f"Hyperliquid API（{iv} K 线，{len(cs)} 根）"
+                merged = load_cache_iv(settings, coin, iv)
+                cs_all = merged[0] if merged else cs
+                return cs_all, iv, f"Hyperliquid API（{iv} K 线，本次 {len(cs)} 根，合并缓存后 {len(cs_all)} 根）"
             errs.append(f"{iv}: 空")
         except Exception as e:  # noqa: BLE001
             errs.append(f"{iv}: {type(e).__name__} {e}")
-            if is_blocked_error(e) or "Proxy" in type(e).__name__:
-                break  # 整个主机被拦，换周期也没用
+            if is_blocked_error(e) or "Proxy" in type(e).__name__ or is_rate_limited(e):
+                break  # 整个主机被拦 / 被限速，换周期也没用
     cached = load_cache(settings, coin)
     if cached:
         cs, iv = cached
@@ -149,16 +276,12 @@ def get_candles(settings, coin: str, days: int) -> tuple[list[dict], str, str]:
 # ---------------------------------------------------------------- 资金费率历史
 def fetch_funding_history(coin: str, start_ms: int, end_ms: int | None = None) -> list[dict]:
     """Hyperliquid `fundingHistory`：每小时一条 {coin, fundingRate, premium, time}，一次最多约 500 条，往后翻页。"""
-    from . import backfill
-    import httpx
     end_ms = end_ms or int(time.time() * 1000)
     out: dict[int, float] = {}
     cur = start_ms
     for _ in range(200):
-        r = httpx.post(backfill.INFO_URL, json={"type": "fundingHistory", "coin": coin, "startTime": cur, "endTime": end_ms},
-                       timeout=60)
-        r.raise_for_status()
-        rows = r.json()
+        rows = info_post({"type": "fundingHistory", "coin": coin, "startTime": cur, "endTime": end_ms},
+                         weight=CANDLE_BASE_WEIGHT + 500 // 20, items_per_weight=20)
         if not rows:
             break
         for x in rows:

@@ -382,6 +382,15 @@ def overview(req: Request):
     card = evaluate.scorecard(recs, S)
     follow = evaluate.shadow_scorecard(recs, S, "follow")
     try:
+        shadow_rows = evaluate.shadow_table(recs, S)
+    except Exception:  # noqa: BLE001
+        shadow_rows = []
+    shadow_html = "".join(
+        f"<tr><td>{E(r['label'])}</td><td class='n {_cls(r['pnl_net_fullfee_usd_total'])}'>{_n(r['pnl_net_fullfee_usd_total'], 2, sign=True)}</td>"
+        f"<td class='n'>{r['n_trades']}</td><td class='n'>{r['n_weekends']}</td>"
+        f"<td class='n'>{_n(r['hit_rate'] * 100, 0, '%') if r['hit_rate'] is not None else '—'}</td></tr>"
+        for r in shadow_rows)
+    try:
         hs = headline_shadow.headline_scorecard(S)
     except Exception as e:  # noqa: BLE001
         hs = {"n_new": 0, "n_repeat": 0, "by_horizon": {}, "by_status": {}, "verdict": f"成绩单暂时算不出来：{e}"}
@@ -496,6 +505,13 @@ def overview(req: Request):
   <div class="v s {_cls(follow['pnl_net_usd_total'])}" style="font-size:18px">模拟 ${_n(follow['pnl_net_usd_total'], 2, sign=True)}
     <span class="ev">（全额手续费 ${_n(follow['pnl_net_fullfee_usd_total'], 2, sign=True)}）· {follow['n_weekends']} 个信息周末样本{(' · 方向命中 ' + _n(follow['hit_rate']*100, 0, '%')) if follow.get('hit_rate') is not None else ''}</span></div>
   <div class="ev">信息周末时顺着偏离做多/做空的"如果"账：真钱此时站一边，这里只记录会赚多少。{E(follow['verdict'])}</div>
+</div>
+
+<div class="card" style="margin-top:12px">
+  <div class="k">影子策略对照（同口径 · 全额手续费 · 只记账）</div>
+  <div class="tw" style="margin-top:8px"><table style="font-size:13px"><tr><th>策略</th><th class="n">累计 USD</th><th class="n">笔数</th><th class="n">周末数</th><th class="n">命中率</th></tr>
+  {shadow_html or '<tr><td colspan=5 class="mut">还没有完成的周末。</td></tr>'}</table></div>
+  <div class="ev">主策略照旧（本周末演习）。最近 7 个周末回测里反向亏、大偏离顺势赚，但样本太少，换主策略前先在这里同口径攒样本；样本外回测见 data/reports/strategy_lab.md。</div>
 </div>
 
 {_positions_card()}

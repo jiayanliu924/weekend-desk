@@ -71,7 +71,7 @@ def job_lock(settings, w: Weekend, push: bool = True) -> dict:
         pred = model.predict(feats, history, settings)
         fees = model.fee_bps(settings, to_ns(w.decision), w.coin or None)
         action = model.decide_action(feats, pred, fees, settings)
-        shadow = model.shadow_actions(feats, fees, settings)
+        shadow = model.shadow_actions(feats, fees, settings, regime_history(settings, led, w))
     else:
         void_reasons += feats["problems"]
         pred, fees, action = {"pred_bps": None}, {}, {"side": 0, "notional_usd": 0, "reason": "数据不全，不出手"}
@@ -84,6 +84,26 @@ def job_lock(settings, w: Weekend, push: bool = True) -> dict:
     if push:
         notify.push(settings, f"已锁定预测 {w.wid}", report.lock_text(rec), priority="high")
     return rec
+
+
+def regime_history(settings, led: Ledger, w: Weekend) -> list[dict]:
+    """这个合约、严格早于本周末的已完成周末 [{weekend, dev_bps, move_bps}]，按时间顺序（regime 影子用）。
+
+    不要求 official：因规则改动作废的周末价格本身是对的，照样能说明"顺势还是反向赚"；但特征/结果必须完整。
+    """
+    from .clock import friday_of, name_of
+    default = settings.instruments[0]["name"]
+    me = w.name or default
+    out = []
+    for r in led.completed():
+        if name_of(r["weekend"], default) != me or friday_of(r["weekend"]) >= w.friday.isoformat():
+            continue
+        mv = model.outcome_move_bps(r["lock"], r["outcome"])
+        if mv is None:
+            continue
+        out.append({"weekend": r["weekend"], "dev_bps": r["lock"]["features"]["dev_bps"], "move_bps": mv})
+    out.sort(key=lambda h: h["weekend"])
+    return out
 
 
 def job_outcome(settings, w: Weekend, push: bool = True) -> dict:

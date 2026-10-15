@@ -1,0 +1,528 @@
+"""策略实验室：用全部可得的周末历史，按"走前（walk-forward）"口径比较 反向 / 顺向 / 新闻条件 / 走前切换。
+
+为什么要有它（2026-10-15）：最近 ~7 个周末（15m K 线只回到 08-23）反向亏、|偏离| 大时顺向赚；而更早的 28 周末回补
+显示反向 +$205、胜率 59%。像是行情切换（战争 / 高波动），但 7 个周末太少，直接换主策略 = 对 7 个点过拟合。
+这里把两段数据合起来，只用"严格早于交易那个周末"的信息做选择，样本外（OOS）结果才是头条。
+
+数据（全部来自 data/backfill/ 的缓存，能连 Hyperliquid 时先刷新再合并；备忘 7.2：回补 K 线只供探索，不计入正式成绩）：
+  - 1h K 线 candles_<coin>_1h.parquet —— `python -m desk backfill` 存的（Hyperliquid 只保留最近 5000 根 ≈ 208 天 ≈ 28 个周末）
+  - 15m K 线 candles_<coin>_15m.parquet —— windows_backtest / universe 存的（≈ 52 天）；save_cache 现在会合并累积
+  同一个周末两种都有时用 15m；只有 1h 时用 1h，误差见"口径说明"。
+  - 新闻标签：账本 lock 记录里的 features.news_weekend（只有上线后的周末有；没有的不进"新闻条件"变体）
+
+变体（全额手续费：挂单 3 + 吃单 9 + 半点差 2 = 14 bps；门槛 16 = 成本 + buffer 2）：
+  fadeT / followT    T ∈ {16, 50, 100, 150}：|dev| > T 时逆 / 顺偏离方向。固定规则，没有要拟合的参数。
+  news16             有新闻标签的周末：信息周末顺向、安静周末反向（|dev| > 16）
+  regimeK            K ∈ {4, 6, 8}：这个合约过去 K 个周末"顺势 − 反向"实际盈亏之和的符号决定今天顺/反（model.regime_pick，
+                     和实盘影子同一个函数）；不足 K 个默认顺势
+  wf_select          每个品种族、每个周末：在 8 个固定变体里挑"过去所有周末累计净收益最高"的那个；最高的也 ≤ 0 → 不做
+样本外 = 全局第 warmup 个日历周末之后（默认 8）。所有选择只看严格更早的周末（_past 构造；测试里用"改未来数据、
+过去的决定不变"和"偷看会改答案"的夹具锁死）。有效样本按日历周末数算（同一周末的合约高度相关）。
+
+用法：python3 -m desk.strategy_lab [--since 2026-03-01] [--warmup 8] [--offline] [--out data/reports/strategy_lab.md]
+"""
+from __future__ import annotations
+
+import argparse
+import math
+import statistics
+import sys
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
+
+from . import backtest_lib as bl
+from .backtest_lib import INTERVAL_MS, price_at_or_after, price_at_or_before
+from .clock import friday_of, name_of, weekend_for_friday
+from .model import regime_pick
+
+UTC = timezone.utc
+THRESHOLDS = (16, 50, 100, 150)
+KS = (4, 6, 8)
+BASE_T = 16
+RECENT_FROM = "2026-08-21"   # 15m K 线从 08-23 起；这之后的周末 = "最近 7 个周末"
+FAMILY_ORDER = ("美指", "美股单票", "Brent", "韩股", "全部")
+NAME_FAMILY = {"XYZ100": "美指", "SP500": "美指", "NVDA": "美股单票", "TSLA": "美股单票", "INTC": "美股单票",
+               "BRENTOIL": "Brent", "SMSN": "韩股"}
+SCHED_FAMILY = {"us_index": "美指", "us_equity": "美股单票", "metals_energy": "Brent", "kr_equity": "韩股"}
+FETCH_DAYS = {"15m": 60, "1h": 215}
+
+
+def fixed_variants() -> list[str]:
+    return [f"{m}{t}" for m in ("fade", "follow") for t in THRESHOLDS]
+
+
+def all_variants() -> list[str]:
+    return fixed_variants() + [f"news{BASE_T}"] + [f"regime{k}" for k in KS] + ["wf_select"]
+
+
+# 标签里不能有 "|"（会把 markdown 表格切开）；"偏离>50" 指 |dev| > 50 bps
+VARIANT_CN = {**{f"fade{t}": f"反向 偏离>{t}" for t in THRESHOLDS}, **{f"follow{t}": f"顺向 偏离>{t}" for t in THRESHOLDS},
+              f"news{BASE_T}": "新闻条件（信息→顺，安静→反）", **{f"regime{k}": f"走前切换 K={k}" for k in KS},
+              "wf_select": "走前挑最优固定变体"}
+
+
+def family_of(inst: dict) -> str:
+    if inst["name"] in NAME_FAMILY:
+        return NAME_FAMILY[inst["name"]]
+    from .universe import classify
+    key, _ = classify(inst["coin"], inst["coin"].split(":")[0] if ":" in inst["coin"] else "")
+    return SCHED_FAMILY.get(key, "其他")
+
+
+def _sgn(x: float) -> int:
+    return 1 if x > 0 else -1 if x < 0 else 0
+
+
+# ---------------------------------------------------------------- 数据
+def load_candles(settings, coin: str, fetch: bool) -> tuple[dict[str, list[dict]], list[str]]:
+    """{interval: candles}；fetch=True 时先抓（节流 + 退避）再和缓存合并。"""
+    out, notes = {}, []
+    for iv in ("15m", "1h"):
+        if fetch:
+            try:
+                cs = bl.fetch_candles_paged(coin, iv, FETCH_DAYS[iv])
+                if cs:
+                    bl.save_cache(settings, coin, iv, cs)
+            except Exception as e:  # noqa: BLE001
+                notes.append(f"{iv} 抓取失败：{type(e).__name__} {e}")
+        got = bl.load_cache_iv(settings, coin, iv)
+        if got and got[0]:
+            out[iv] = got[0]
+    return out, notes
+
+
+def _skip_holiday(family: str, fri: date) -> bool:
+    from .overnight_backtest import NYSE_HOLIDAYS
+    from .windows_backtest import KRX_HOLIDAYS
+    if family in ("美股单票", "美指"):
+        return fri in NYSE_HOLIDAYS or (family == "美股单票" and fri + timedelta(days=3) in NYSE_HOLIDAYS)
+    if family == "韩股":
+        return fri in KRX_HOLIDAYS or fri + timedelta(days=3) in KRX_HOLIDAYS
+    return False
+
+
+def weekend_rows(settings, inst: dict, candles_by_iv: dict[str, list[dict]], now: datetime,
+                 since: date | None = None) -> list[dict]:
+    """每个已完成周末一行：dev（决策/关门）、move（平仓/决策）、y（平仓/关门），粒度优先 15m、退回 1h。"""
+    fam = family_of(inst)
+    idx = {iv: {int(c["t"]): c for c in cs} for iv, cs in candles_by_iv.items() if cs}
+    if not idx:
+        return []
+    t0 = min(min(b) for b in idx.values())
+    first = datetime.fromtimestamp(t0 / 1000, tz=UTC).date()
+    fri = first + timedelta(days=(4 - first.weekday()) % 7)
+    if since:
+        fri = max(fri, since + timedelta(days=(4 - since.weekday()) % 7))
+    rows = []
+    while True:
+        w = weekend_for_friday(fri, settings, inst)
+        if w.exit > now:
+            break
+        if not _skip_holiday(fam, fri):
+            for iv in ("15m", "1h"):
+                by_t = idx.get(iv)
+                if not by_t:
+                    continue
+                ivm = INTERVAL_MS[iv]
+                p_c = price_at_or_before(by_t, ivm, w.close)
+                p_d = price_at_or_before(by_t, ivm, w.decision, max_back=max(2, 7_200_000 // ivm))
+                p_x = price_at_or_after(by_t, ivm, w.exit)
+                if p_c and p_d and p_x:
+                    rows.append({"fri": fri.isoformat(), "name": inst["name"], "family": fam, "gran": iv,
+                                 "dev_bps": (p_d / p_c - 1) * 1e4, "move_bps": (p_x / p_d - 1) * 1e4,
+                                 "y_bps": (p_x / p_c - 1) * 1e4, "news": None})
+                    break
+        fri += timedelta(days=7)
+    return rows
+
+
+def ledger_news(settings) -> dict[str, bool]:
+    """{"周五日期|合约": news_weekend}，来自账本 lock 记录（只有上线后的周末有）。"""
+    from .ledger import Ledger
+    out = {}
+    default = settings.instruments[0]["name"]
+    for r in Ledger(settings.data).all():
+        if r.get("kind") != "lock":
+            continue
+        f = r.get("features") or {}
+        if "news_weekend" in f:
+            out[f"{friday_of(r['weekend'])}|{name_of(r['weekend'], default)}"] = bool(f["news_weekend"])
+    return out
+
+
+# ---------------------------------------------------------------- 走前引擎
+def _past(rows: list[dict], fri: str) -> list[dict]:
+    """严格早于 fri 的行——走前引擎里所有"选择"只能看这个。"""
+    return [r for r in rows if r["fri"] < fri]
+
+
+def _net(side: int, r: dict, fee: float) -> float:
+    return side * r["move_bps"] - fee
+
+
+def fixed_side(variant: str, r: dict) -> int:
+    mode = "fade" if variant.startswith("fade") else "follow"
+    t = float(variant[len(mode):])
+    if abs(r["dev_bps"]) <= t:
+        return 0
+    return (-1 if mode == "fade" else 1) * _sgn(r["dev_bps"])
+
+
+def wf_choice(past: list[dict], family: str, fee: float, min_weekends: int) -> str | None:
+    """走前挑选：过去（同族）累计净 bps 最高的固定变体；过去不足 min_weekends 个周末或最高 ≤ 0 → None（不做）。"""
+    fam_rows = [r for r in past if family == "全部" or r["family"] == family]
+    if len({r["fri"] for r in fam_rows}) < min_weekends:
+        return None
+    best, best_v = None, 0.0
+    for v in fixed_variants():
+        tot = sum(_net(s, r, fee) for r in fam_rows if (s := fixed_side(v, r)))
+        if tot > best_v:
+            best, best_v = v, tot
+    return best
+
+
+def decide(variant: str, r: dict, past: list[dict], fee: float, wf_pick: str | None = None) -> int:
+    """单行在某变体下的方向（+1 多 / −1 空 / 0 不做）。past 只含严格早于 r 的周末。"""
+    if variant in fixed_variants():
+        return fixed_side(variant, r)
+    if abs(r["dev_bps"]) <= BASE_T:
+        return 0
+    if variant.startswith("news"):
+        if r.get("news") is None:
+            return 0
+        return (1 if r["news"] else -1) * _sgn(r["dev_bps"])
+    if variant.startswith("regime"):
+        k = int(variant[len("regime"):])
+        hist = [{"dev_bps": p["dev_bps"], "move_bps": p["move_bps"]}
+                for p in sorted((p for p in past if p["name"] == r["name"]), key=lambda p: p["fri"])]
+        pick = regime_pick(hist, k)["pick"]
+        return (1 if pick == "follow" else -1) * _sgn(r["dev_bps"])
+    if variant == "wf_select":
+        return fixed_side(wf_pick, r) if wf_pick else 0
+    raise ValueError(variant)
+
+
+def decisions(rows: list[dict], fee: float, min_weekends: int) -> dict[tuple[str, str, str], int]:
+    """{(variant, fri, name): side} —— 每个周末只把 _past(rows, fri) 交给决策函数。"""
+    out = {}
+    for fri in sorted({r["fri"] for r in rows}):
+        past = _past(rows, fri)
+        today = [r for r in rows if r["fri"] == fri]
+        picks = {fam: wf_choice(past, fam, fee, min_weekends) for fam in {r["family"] for r in today}}
+        for r in today:
+            for v in all_variants():
+                out[(v, fri, r["name"])] = decide(v, r, past, fee, picks.get(r["family"]))
+    return out
+
+
+def wf_picks(rows: list[dict], fee: float, min_weekends: int) -> dict[tuple[str, str], str | None]:
+    """{(family, fri): 走前选中的固定变体}，报告用。"""
+    out = {}
+    for fri in sorted({r["fri"] for r in rows}):
+        past = _past(rows, fri)
+        for fam in sorted({r["family"] for r in rows if r["fri"] == fri}):
+            out[(fam, fri)] = wf_choice(past, fam, fee, min_weekends)
+    return out
+
+
+# ---------------------------------------------------------------- 统计
+def stats(trades: list[dict], notional: float) -> dict:
+    n = len(trades)
+    if not n:
+        return {"n": 0, "n_weekends": 0}
+    by_wk: dict[str, float] = {}
+    for t in trades:
+        by_wk[t["fri"]] = by_wk.get(t["fri"], 0.0) + t["net_usd"]
+    wk_series = [by_wk[k] for k in sorted(by_wk)]
+    eq = peak = dd = 0.0
+    for x in wk_series:
+        eq += x
+        peak = max(peak, eq)
+        dd = min(dd, eq - peak)
+    total = sum(t["net_usd"] for t in trades)
+    top2 = sum(sorted((x for x in wk_series if x > 0), reverse=True)[:2])
+    nw = len(wk_series)
+    m = statistics.mean(wk_series)
+    sd = statistics.stdev(wk_series) if nw > 1 else 0.0
+    t_wk = (m / (sd / math.sqrt(nw))) if sd > 0 else float("nan")
+    worst = min(trades, key=lambda t: t["net_bps"])
+    return {"n": n, "n_weekends": nw, "hit_rate": sum(1 for t in trades if t["gross_bps"] > 0) / n,
+            "avg_net_bps": statistics.mean(t["net_bps"] for t in trades), "total_usd": total,
+            "worst_bps": worst["net_bps"], "worst_label": f"{worst['fri']} {worst['name']}", "max_dd_usd": dd,
+            "ex_top2_usd": total - top2, "t_weekend": t_wk}
+
+
+MIN_OOS_WEEKENDS = 5
+
+
+def verdict(st: dict) -> str:
+    if not st.get("n"):
+        return "没有出手"
+    if st["n_weekends"] < MIN_OOS_WEEKENDS:
+        return f"样本太少（{st['n_weekends']} 个周末 < {MIN_OOS_WEEKENDS}）"
+    if st["total_usd"] <= 0:
+        return "样本外为负"
+    if st["ex_top2_usd"] <= 0:
+        return "样本外为正，但靠 1–2 个周末"
+    return "通过：样本外为正且不是靠 1–2 个周末"
+
+
+def evaluate_rows(rows: list[dict], cfg, warmup: int = 8, notional: float = 1000.0, half_spread: float = 2.0) -> dict:
+    c = cfg["costs"]
+    fee = c["maker_bps"] + c["taker_bps"] + half_spread
+    weekends = sorted({r["fri"] for r in rows})
+    oos_from = weekends[warmup] if len(weekends) > warmup else None
+    dec = decisions(rows, fee, warmup)
+    by_key = {(r["fri"], r["name"]): r for r in rows}
+    trades: dict[str, list[dict]] = {v: [] for v in all_variants()}
+    for (v, fri, name), side in dec.items():
+        if not side:
+            continue
+        r = by_key[(fri, name)]
+        gross = side * r["move_bps"]
+        net = gross - fee
+        trades[v].append({"fri": fri, "name": name, "family": r["family"], "gran": r["gran"], "side": side,
+                          "dev_bps": r["dev_bps"], "gross_bps": gross, "net_bps": net, "net_usd": net / 1e4 * notional,
+                          "oos": oos_from is not None and fri >= oos_from})
+    res: dict = {"fee_bps": fee, "weekends": weekends, "oos_from": oos_from, "warmup": warmup, "notional": notional,
+                 "oos": {}, "ins": {}, "recent": {}, "early": {}, "picks": wf_picks(rows, fee, warmup)}
+    for fam in FAMILY_ORDER:
+        for v in all_variants():
+            ts = [t for t in trades[v] if fam == "全部" or t["family"] == fam]
+            res["ins"][(fam, v)] = stats(ts, notional)
+            res["oos"][(fam, v)] = stats([t for t in ts if t["oos"]], notional)
+            res["recent"][(fam, v)] = stats([t for t in ts if t["fri"] >= RECENT_FROM], notional)
+            res["early"][(fam, v)] = stats([t for t in ts if t["fri"] < RECENT_FROM], notional)
+    # 事后诸葛亮：全样本上最好的固定变体（这就是过拟合会给你的数字），对照走前挑选的样本外
+    res["hindsight"] = {}
+    for fam in FAMILY_ORDER:
+        best = max(fixed_variants(), key=lambda v: res["ins"][(fam, v)].get("total_usd", float("-inf")))
+        res["hindsight"][fam] = best
+    res["trades"] = trades
+    return res
+
+
+# ---------------------------------------------------------------- 旧口径复算（仪表盘"过去 28 个周末 $+204.90"）
+def legacy_check(settings, candles_1h: dict[str, list[dict]]) -> dict | None:
+    """复算 sim._history_weekend_trades 的口径：1h K 线，"决策价" = 重开那一刻的 K 线收盘，出场 = 重开后 1 小时，
+    手续费按 growthMode 打一折（挂单 0.3 + 吃单 0.9 + 半点差 0.5 = 1.7 bps），门槛 3.7 bps；再按全额手续费重算一遍。"""
+    from . import backfill
+    rows = []
+    for inst in settings.instruments:
+        cs = candles_1h.get(inst["coin"])
+        if cs:
+            rows += backfill.weekend_table(settings, sorted(cs, key=lambda c: int(c["t"])), inst)
+    if not rows:
+        return None
+    c = settings["costs"]
+    disc = 1 - c["growth_discount"]
+    legacy_cost = c["maker_bps"] * disc + c["taker_bps"] * disc + 0.5
+    full_cost = c["maker_bps"] + c["taker_bps"] + 2.0
+
+    def run(cost: float, thr: float) -> dict:
+        nets = []
+        for r in rows:
+            if abs(r["dev_bps"]) <= thr:
+                continue
+            side = -_sgn(r["dev_bps"])
+            nets.append((r["weekend"], side * (r["y_bps"] - r["dev_bps"]) - cost))
+        n = len(nets)
+        return {"n": n, "n_weekends": len({w for w, _ in nets}), "win": (sum(1 for _, x in nets if x > 0) / n) if n else None,
+                "avg": (sum(x for _, x in nets) / n) if n else None, "total_1000": sum(x for _, x in nets) / 1e4 * 1000}
+    return {"n_rows": len(rows), "n_weekends": len({r["weekend"] for r in rows}),
+            "first": min(r["weekend"] for r in rows), "last": max(r["weekend"] for r in rows),
+            "legacy_cost": legacy_cost, "full_cost": full_cost,
+            "legacy": run(legacy_cost, legacy_cost + c["edge_buffer_bps"]),
+            "full": run(full_cost, full_cost + c["edge_buffer_bps"])}
+
+
+# ---------------------------------------------------------------- 报告
+def _f(x, fmt="+.1f", dash="—"):
+    return dash if x is None or (isinstance(x, float) and math.isnan(x)) else format(x, fmt)
+
+
+def _row(v: str, st: dict) -> str:
+    if not st.get("n"):
+        return f"| {VARIANT_CN[v]} | 0 | 0 | — | — | — | — | — | — | — | 没有出手 |"
+    return (f"| {VARIANT_CN[v]} | {st['n']} | {st['n_weekends']} | {st['hit_rate'] * 100:.0f}% | {st['avg_net_bps']:+.1f} | "
+            f"{st['total_usd']:+.2f} | {st['worst_bps']:+.0f} ({st['worst_label']}) | {st['max_dd_usd']:.2f} | "
+            f"{st['ex_top2_usd']:+.2f} | {_f(st['t_weekend'], '+.2f')} | {verdict(st)} |")
+
+
+HEAD = ("| 变体 | 笔数 | 周末数 | 命中率 | 平均净 bps | 累计 $（$1000/笔） | 最差一笔 | 最大回撤 $ | 去掉最好 2 周末 $ | t(按周末) | 判定 |",
+        "|---|---|---|---|---|---|---|---|---|---|---|")
+
+
+def summary_cn(res: dict, rows: list[dict]) -> list[str]:
+    L = []
+    if not rows:
+        return ["没有任何周末样本（没有 K 线缓存）。到服务器上跑：`cd ~/weekend-desk && python3 -m desk.strategy_lab`。"]
+    nw = len(res["weekends"])
+    L.append(f"- 共 {len(rows)} 个（合约 × 周末）样本、{nw} 个日历周末（{res['weekends'][0]} → {res['weekends'][-1]}）；"
+             f"前 {res['warmup']} 个周末只做训练，样本外从 {res['oos_from'] or '—'} 起，共 "
+             f"{len([w for w in res['weekends'] if res['oos_from'] and w >= res['oos_from']])} 个周末。全额成本 {res['fee_bps']:.0f} bps/笔。")
+    passed = [(fam, v) for fam in FAMILY_ORDER for v in all_variants() if verdict(res["oos"][(fam, v)]).startswith("通过")]
+    if passed:
+        L.append("- **样本外通过（为正且不是靠 1–2 个周末）的组合：** " +
+                 "；".join(f"{fam} / {VARIANT_CN[v]}（{res['oos'][(fam, v)]['total_usd']:+.0f} $，"
+                           f"{res['oos'][(fam, v)]['n_weekends']} 个周末）" for fam, v in passed))
+    else:
+        L.append("- **没有任何（品种族 × 变体）在样本外同时做到：为正、去掉最好 2 个周末仍为正、≥ 5 个周末。**")
+    n_tests = len(FAMILY_ORDER) * len(all_variants())
+    L.append(f"- 注意多重比较：{n_tests} 个组合里，就算全是噪音，也会有几个碰巧为正。一两个通过不等于找到了钱；"
+             "同一结论要在多个品种族、走前选择（wf_select / regime）里都站得住才算。")
+    for fam in FAMILY_ORDER:
+        o = res["oos"]
+        bits = []
+        for v in ("fade16", "fade50", "follow50", "follow100", f"news{BASE_T}", "regime6", "wf_select"):
+            st = o[(fam, v)]
+            bits.append(f"{VARIANT_CN[v]} {_f(st.get('total_usd'), '+.0f')}$/{st.get('n_weekends', 0)}周末")
+        hb = res["hindsight"][fam]
+        L.append(f"- {fam}（样本外）：" + "；".join(bits) +
+                 f"。事后看全样本最好的是「{VARIANT_CN[hb]}」（样本内 {_f(res['ins'][(fam, hb)].get('total_usd'), '+.0f')} $），"
+                 f"走前挑选在样本外拿到 {_f(o[(fam, 'wf_select')].get('total_usd'), '+.0f')} $——两者之差就是过拟合的代价。")
+    fr, fe = res["recent"][("全部", "fade16")], res["early"][("全部", "fade16")]
+    wr, we = res["recent"][("全部", "follow50")], res["early"][("全部", "follow50")]
+    flipped = (fe.get("avg_net_bps") is not None and fr.get("avg_net_bps") is not None
+               and _sgn(fe["avg_net_bps"]) != _sgn(fr["avg_net_bps"]))
+    n_recent = len([w for w in res["weekends"] if w >= RECENT_FROM])
+    L.append(f"- 分时段（全部品种，样本内口径）：反向 偏离>16 在 {RECENT_FROM} 之前 {_f(fe.get('avg_net_bps'))} bps/笔（{fe.get('n', 0)} 笔），"
+             f"之后 {_f(fr.get('avg_net_bps'))} bps/笔（{fr.get('n', 0)} 笔）；顺向 偏离>50 之前 {_f(we.get('avg_net_bps'))}，"
+             f"之后 {_f(wr.get('avg_net_bps'))}。"
+             + (f"反向的符号翻转了，像行情切换；但之后那段只有 {n_recent} 个周末，切换本身也可能是噪音。" if flipped
+                else "反向前后没有翻转符号。"))
+    wf_ok = [v for v in [f"regime{k}" for k in KS] + ["wf_select"] if verdict(res["oos"][("全部", v)]).startswith("通过")]
+    if wf_ok:
+        ok_names = "、".join(VARIANT_CN[v] for v in wf_ok)
+        L.append("- **结论：** 只看过去的规则里「" + ok_names + "」在全部品种的样本外通过。"
+                 "这是能用的证据，但仍是回补 K 线；先让实盘影子（看板「影子策略对照」）同口径攒够样本再考虑换主策略，不要直接切。")
+    else:
+        L.append("- **结论：主策略不盲目换。** 只看过去的规则（regime K=4/6/8、wf_select）在全部品种的样本外都没有通过；"
+                 + ("固定的顺向 偏离>50 在最近这段好看，但那正是让我们注意到它的数据，拿它当证据就是过拟合。" if (wr.get("avg_net_bps") or 0) > 0 else "")
+                 + "实盘先把 follow50 / fade50 / regime 三条影子同口径攒样本（看板「影子策略对照」）。")
+    return L
+
+
+def report_md(settings, res: dict, rows: list[dict], sources: dict[str, str], legacy: dict | None,
+              since: date | None) -> str:
+    L = [f"# 策略实验室：走前比较 反向 / 顺向 / 新闻条件 / 切换（{datetime.now(UTC):%Y-%m-%d %H:%M} UTC）", "",
+         "回补 K 线，**只供探索、不计入正式成绩**（备忘 7.2）。头条是**样本外**（走前：每个周末的选择只看严格更早的周末）。", "",
+         "## 结论（中文）", "", *summary_cn(res, rows), "", "## 数据", ""]
+    for name, src in sources.items():
+        rs = [r for r in rows if r["name"] == name]
+        g = {iv: sum(1 for r in rs if r["gran"] == iv) for iv in ("15m", "1h")}
+        span = f"{rs[0]['fri']} → {rs[-1]['fri']}" if rs else "—"
+        L.append(f"- {name}（{family_of(settings.inst(name) or {'name': name, 'coin': name})}）：{len(rs)} 个周末（15m {g['15m']}，1h {g['1h']}），{span}；{src}")
+    n_news = sum(1 for r in rows if r.get("news") is not None)
+    L.append(f"- 新闻标签（账本 lock 的 news_weekend）：{n_news} 行有标签" + ("，新闻条件变体样本极少，只能看方向。" if n_news < 20 else "。"))
+    if since:
+        L.append(f"- 只用 {since} 之后的周末（--since）。")
+    if not rows:
+        L += ["", "**没有任何样本。** 本机连不上 Hyperliquid 时需要 data/backfill/ 的缓存；到服务器上跑一次即可。", "",
+              bl.RUN_ON_HOST_HINT.replace("desk.windows_backtest --since 2026-04-01", "desk.strategy_lab")]
+        return "\n".join(L)
+    for title, key in (("样本外（头条）", "oos"), ("样本内（全样本，对照用；固定变体在这里挑 = 过拟合）", "ins")):
+        L += ["", f"## {title}", ""]
+        for fam in FAMILY_ORDER:
+            L += [f"### {fam}", "", *HEAD]
+            L += [_row(v, res[key][(fam, v)]) for v in all_variants()]
+            L.append("")
+    L += ["## 走前挑选每个周末选了什么", "", "| 周末 | " + " | ".join(f for f in FAMILY_ORDER if f != "全部") + " |",
+          "|---|" + "---|" * (len(FAMILY_ORDER) - 1)]
+    for fri in res["weekends"]:
+        cells = [VARIANT_CN.get(res["picks"].get((f, fri)) or "", "不做" if (f, fri) in res["picks"] else "—")
+                 for f in FAMILY_ORDER if f != "全部"]
+        L.append(f"| {fri}{' (样本外)' if res['oos_from'] and fri >= res['oos_from'] else ''} | " + " | ".join(cells) + " |")
+    L += ["", f"## 分时段：{RECENT_FROM} 之前 vs 之后（全部变体，样本内口径）", "",
+          "| 变体 | 之前 笔数/周末 | 之前 平均净 bps | 之前 累计 $ | 之后 笔数/周末 | 之后 平均净 bps | 之后 累计 $ |", "|---|---|---|---|---|---|---|"]
+    for v in all_variants():
+        e, r = res["early"][("全部", v)], res["recent"][("全部", v)]
+        L.append(f"| {VARIANT_CN[v]} | {e.get('n', 0)}/{e.get('n_weekends', 0)} | {_f(e.get('avg_net_bps'))} | {_f(e.get('total_usd'), '+.2f')} | "
+                 f"{r.get('n', 0)}/{r.get('n_weekends', 0)} | {_f(r.get('avg_net_bps'))} | {_f(r.get('total_usd'), '+.2f')} |")
+    L += ["", "## 仪表盘\"过去 28 个周末\"那个数是怎么来的（旧口径复算）", ""]
+    if legacy:
+        lg, fu = legacy["legacy"], legacy["full"]
+        L += [f"来源：`python -m desk backfill` → `backfill.fetch_candles(coin, '1h', 200 天)` → `backfill.weekend_table` → "
+              f"`data/reports/history_weekends.json` → `sim._history_weekend_trades`。这里用同一份 1h K 线复算："
+              f"{legacy['n_rows']} 行、{legacy['n_weekends']} 个周末（{legacy['first']} → {legacy['last']}）。", "",
+              "| 口径 | 成本 bps/笔 | 出手 | 周末数 | 胜率 | 平均净 bps | $1000/笔累计 |", "|---|---|---|---|---|---|---|",
+              f"| 旧口径（growthMode 打一折 + 半点差 0.5） | {legacy['legacy_cost']:.1f} | {lg['n']} | {lg['n_weekends']} | "
+              f"{_f(lg['win'] and lg['win'] * 100, '.0f')}% | {_f(lg['avg'])} | {lg['total_1000']:+.2f} |",
+              f"| 全额手续费（挂 3 + 吃 9 + 半点差 2） | {legacy['full_cost']:.1f} | {fu['n']} | {fu['n_weekends']} | "
+              f"{_f(fu['win'] and fu['win'] * 100, '.0f')}% | {_f(fu['avg'])} | {fu['total_1000']:+.2f} |", "",
+              "旧口径三处偏乐观：(1) 手续费按 growthMode 打一折（1.7 bps，全额是 14）；(2) \"决策价\"取的是**重开那一刻**收盘的 1h K 线，"
+              "出场是重开后 1 小时——吃的是「重开跳动 + 重开后一小时的漂移」，不是实盘的\"重开前 15 分钟进、重开后 5 分钟出\"；(3) 仪表盘按 $2,000×2 倍÷7 "
+              "≈ $571/笔，不是 $1000。"]
+    else:
+        L.append("没有 1h K 线缓存，复算不了。")
+    L += ["", "## 口径说明", "",
+          f"- 每笔：|dev| 过门槛时开仓，净 = 方向·move − 全额成本 {res['fee_bps']:.0f} bps（挂单 3 + 吃单 9 + 半点差 2）；门槛 16 = 成本 + buffer 2。"
+          "不含资金费率 carry（决策→平仓只有 20 分钟 / 1h 粒度约 2 小时，carry ≈ 0）、不含滑点。",
+          "- 15m 粒度：关门价 = 关门前最后一根收盘；决策价 = 重开前 15 分钟之前最后一根（周末成交稀时最多往前找 2 小时）；"
+          "平仓价 = 重开后 5 分钟之后第一根收盘（≈ 重开 +15 分钟）。",
+          "- **1h 粒度（较早的周末）误差**：决策价是重开前 15 分钟之前最后一根**整点**收盘，实际 ≈ 重开前 60–75 分钟；"
+          "平仓价 ≈ 重开后 60 分钟。也就是说 1h 行比实盘早进场约 1 小时、晚出场约 55 分钟——多吃了重开后第一小时的漂移；"
+          "韩股 09:01 重开时决策价 ≈ 08:00、平仓 ≈ 10:00。所以早期（1h）和近期（15m）的差别里有一部分是口径，不全是行情。",
+          "- 假日：美股单票跳过周五或周一是 NYSE 假日的周末，美指跳过周五假日，韩股跳过周五/周一 KRX 假日；Brent 不跳。",
+          "- 走前：样本外 = 全局第 warmup 个日历周末之后；regime 和 wf_select 每个周末只看严格更早的周末；"
+          "wf_select 至少要有 warmup 个过去周末才出手。固定变体没有要拟合的参数，但\"挑哪一个\"本身就是拟合——所以看 wf_select。",
+          "- 有效样本按日历周末算：同一周末的 7 个合约会被同一个周一事件推同向；t(按周末) = 每个周末合计盈亏的均值 / 标准误。",
+          "- 判定：通过 = 样本外累计 > 0、去掉最好的 2 个周末仍 > 0、且 ≥ 5 个周末。"]
+    return "\n".join(L)
+
+
+# ---------------------------------------------------------------- 入口
+def build_rows(settings, now: datetime, since: date | None, fetch: bool, names=None) -> tuple[list[dict], dict, dict]:
+    rows, sources, c1h = [], {}, {}
+    for inst in settings.instruments:
+        if names and inst["name"] not in names:
+            continue
+        cbi, notes = load_candles(settings, inst["coin"], fetch)
+        if "1h" in cbi:
+            c1h[inst["coin"]] = cbi["1h"]
+        src = "，".join(f"{iv} 缓存 {len(cs)} 根" for iv, cs in cbi.items()) or "没有缓存"
+        sources[inst["name"]] = src + (f"（{'；'.join(notes)}）" if notes else "")
+        rows += weekend_rows(settings, inst, cbi, now, since)
+    news = ledger_news(settings)
+    for r in rows:
+        r["news"] = news.get(f"{r['fri']}|{r['name']}")
+    rows.sort(key=lambda r: (r["fri"], r["name"]))
+    return rows, sources, c1h
+
+
+def run(settings, since: date | None = None, warmup: int = 8, notional: float = 1000.0, half_spread: float = 2.0,
+        fetch: bool = True, out: Path | None = None, now: datetime | None = None, names=None) -> str:
+    now = now or datetime.now(UTC)
+    rows, sources, c1h = build_rows(settings, now, since, fetch, names)
+    res = evaluate_rows(rows, settings, warmup, notional, half_spread)
+    legacy = legacy_check(settings, c1h)
+    md = report_md(settings, res, rows, sources, legacy, since)
+    out = out or Path(settings.data) / "reports" / "strategy_lab.md"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(md)
+    return md
+
+
+def main(argv=None) -> int:
+    from . import config
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--since", type=date.fromisoformat, default=None, help="只用这天之后的周末")
+    ap.add_argument("--warmup", type=int, default=8, help="前多少个日历周末只做训练（默认 8）")
+    ap.add_argument("--notional", type=float, default=1000.0)
+    ap.add_argument("--half-spread", type=float, default=2.0)
+    ap.add_argument("--offline", action="store_true", help="不连网络，只用 data/backfill/ 缓存")
+    ap.add_argument("--out", type=Path, default=None)
+    a = ap.parse_args(argv)
+    s = config.load()
+    fetch = not a.offline
+    if fetch:
+        ok, why = bl.hyperliquid_reachable()
+        if not ok:
+            print(f"[strategy_lab] Hyperliquid 不可达（{why}），只用本地缓存。", file=sys.stderr)
+            fetch = False
+    print(run(s, a.since, a.warmup, a.notional, a.half_spread, fetch, a.out))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -57,19 +57,95 @@ def _worst_adverse_bps(features: dict, risk) -> float:
     return max(floor, seen)
 
 
-def shadow_actions(features: dict, fees: dict, cfg) -> dict:
-    """并行影子策略：不下真单，只记录"如果这么做、会赚多少"，用来攒证据。
+# 影子策略的固定参数（写死在代码里，改动 = 规则哈希变 = 新实验）。2026-10-15 加：最近 7 个周末反向亏、顺向在大偏离时赚，
+# 但 7 个周末太少，不能直接换主策略（过拟合），所以三条一起影子跑、同口径攒样本，见 knowledge/lessons.md 同日条目。
+SHADOW_DEV_BPS = 50.0        # follow50 / fade50：|dev| 超过它才出手
+REGIME_K = 6                 # regime：看最近 K 个已完成周末"顺势减反向"的实际盈亏符号
+SHADOW_LABELS = {
+    "follow": "顺势（只在信息周末）",
+    "follow50": "顺势 |偏离|>50",
+    "fade50": "反向 |偏离|>50",
+    "regime": f"切换（近 {REGIME_K} 周末谁赚跟谁）",
+}
+
+
+def _sgn(x: float) -> int:
+    return 1 if x > 0 else -1 if x < 0 else 0
+
+
+def outcome_move_bps(lock: dict, outcome: dict) -> float | None:
+    """一个已完成周末"从决策价到重开价"走了多少 bps（顺势为正 = 沿偏离方向继续走）。
+
+    优先用决策中间价 → 重开价；缺中间价时用 y − dev 近似（都相对周五收盘价，差一个 (1+dev) 因子，可忽略）。
+    """
+    f = lock.get("features") or {}
+    if not f.get("ok") or not outcome.get("ok"):
+        return None
+    dec, reopen = f.get("dec_mid"), outcome.get("reopen_px")
+    if dec and reopen:
+        return (reopen / dec - 1) * 1e4
+    if outcome.get("y_bps") is not None and f.get("dev_bps") is not None:
+        return outcome["y_bps"] - f["dev_bps"]
+    return None
+
+
+def regime_pick(history: list[dict], k: int = REGIME_K) -> dict:
+    """走前切换：用"严格早于本周末"的最近 k 个周末，算 顺势 − 反向 的实际盈亏之和，正 → 顺势，负 → 反向。
+
+    同一笔偏离上顺势和反向互为镜像、手续费相同，所以 顺势净 − 反向净 = 2·sign(dev)·move，只看符号：
+    signal = Σ sign(dev_i)·move_i（i = 最近 k 个）。history 必须按时间顺序且只含过去（调用方负责，不许含本周末）。
+    历史不足 k 个 → 默认顺势（对应"最近这段大偏离是真信息"的观察；样本攒够后自动由数据决定）。
+    """
+    usable = [h for h in history if h.get("dev_bps") is not None and h.get("move_bps") is not None]
+    last = usable[-k:] if k > 0 else []
+    if len(last) < k:
+        return {"pick": "follow", "signal_bps": None, "n": len(last), "k": k,
+                "why": f"已完成周末 {len(last)} 个，少于 {k}，默认顺势"}
+    sig = sum(_sgn(h["dev_bps"]) * h["move_bps"] for h in last)
+    pick = "follow" if sig >= 0 else "fade"
+    return {"pick": pick, "signal_bps": sig, "n": len(last), "k": k,
+            "why": f"最近 {k} 个周末 顺势−反向 合计 {2 * sig:+.0f} bps → {'顺势' if pick == 'follow' else '反向'}"}
+
+
+def _no_trade(name: str, reason: str, **extra) -> dict:
+    return {"side": 0, "units": 0.0, "notional_usd": 0.0, "strategy": name, "reason": reason, **extra}
+
+
+def _shadow_trade(features: dict, fees: dict, cfg, name: str, direction: str, **extra) -> dict:
+    """direction = follow（pred = 2·dev → edge = +dev）或 fade（pred = 0 → edge = −dev）；仓位/否决/门槛全走 decide_action。"""
+    dev = features["dev_bps"]
+    a = decide_action(features, {"pred_bps": 2.0 * dev if direction == "follow" else 0.0}, fees, cfg)
+    a["strategy"] = name
+    a["direction"] = direction
+    a["reason"] = f"{SHADOW_LABELS.get(name, name)}：" + a.get("reason", "")
+    a.update(extra)
+    return a
+
+
+def shadow_actions(features: dict, fees: dict, cfg, history: list[dict] | None = None) -> dict:
+    """并行影子策略：不下真单，只记录"如果这么做、会赚多少"，用来攒证据。主策略 action 不受影响。
 
     follow（顺势/追涨）：只在"信息周末、偏离过线"时顺着偏离方向做（押这波真新闻继续到重开），
-    恰好补上真钱反向套利在信息周末"站一边"的那块。用和反向同等幅度(edge=dev)定仓位，便于同口径对比。
-    插针/脱节照样否决（decide_action 内已处理）。攒够信息周末样本、全额手续费下也稳定为正，才谈上真钱。
+      恰好补上真钱反向套利在信息周末"站一边"的那块。用和反向同等幅度(edge=dev)定仓位，便于同口径对比。
+    follow50 / fade50（每个周末都记）：|dev| > 50 bps 才出手，分别顺着 / 逆着偏离。
+    regime（每个周末都记）：regime_pick 用这个合约过去 K=6 个已完成周末决定今天顺势还是反向；不足 K 个默认顺势。
+      history = 这个合约严格早于本周末的已完成周末 [{dev_bps, move_bps}]，按时间顺序（jobs.job_lock 从账本构造）。
+    插针/脱节照样否决（decide_action 内已处理）。攒够样本、全额手续费下也稳定为正，才谈上真钱。
     """
     out: dict = {}
     dev = features.get("dev_bps")
-    if dev is not None and features.get("news_weekend"):
+    if dev is None:
+        return out
+    if features.get("news_weekend"):
         a = decide_action(features, {"pred_bps": 2.0 * dev}, fees, cfg)  # edge = pred - dev = dev，顺着偏离
         a["strategy"] = "follow"
         out["follow"] = a
+    big = abs(dev) > SHADOW_DEV_BPS
+    for name, direction in (("follow50", "follow"), ("fade50", "fade")):
+        out[name] = (_shadow_trade(features, fees, cfg, name, direction) if big else
+                     _no_trade(name, f"{SHADOW_LABELS[name]}：|偏离| {abs(dev):.0f} ≤ {SHADOW_DEV_BPS:.0f} bps，不出手"))
+    rp = regime_pick(history or [], REGIME_K)
+    out["regime"] = _shadow_trade(features, fees, cfg, "regime", rp["pick"], regime=rp)
     return out
 
 

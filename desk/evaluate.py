@@ -40,10 +40,13 @@ def outcome(settings, w: Weekend, lock: dict) -> dict:
         if a.get("side") and exit_px is not None:
             p = _sim_pnl(a["side"], a["notional_usd"], a["entry_px"], exit_px, f, fees, costs, y, dev)
             sh[sname] = {"side": a["side"], "notional_usd": a["notional_usd"], "pnl_net_usd": p["pnl_net_usd"],
-                         "pnl_net_fullfee_usd": p["pnl_net_fullfee_usd"], "direction_hit": p["direction_hit"]}
+                         "pnl_net_fullfee_usd": p["pnl_net_fullfee_usd"], "pnl_net_fullfee_bps": p["pnl_net_fullfee_bps"],
+                         "direction_hit": p["direction_hit"]}
         else:
             sh[sname] = {"side": a.get("side", 0), "notional_usd": a.get("notional_usd", 0.0),
-                         "pnl_net_usd": 0.0, "pnl_net_fullfee_usd": 0.0, "direction_hit": None}
+                         "pnl_net_usd": 0.0, "pnl_net_fullfee_usd": 0.0, "pnl_net_fullfee_bps": 0.0, "direction_hit": None}
+        if a.get("direction"):
+            sh[sname]["direction"] = a["direction"]
     if sh:
         out["shadow"] = sh
     return out
@@ -159,6 +162,18 @@ def shadow_scorecard(records: list[dict], cfg, strat: str = "follow") -> dict:
     need = cfg["risk"]["eval_after_weekends"]
     res = {"strategy": strat, "n_trades": len(traded), "n_weekends": n_wk,
            "pnl_net_usd_total": pnl, "pnl_net_fullfee_usd_total": pnl_full, "hit_rate": hit_rate}
+    if strat != "follow":
+        from .model import SHADOW_LABELS
+        lab = SHADOW_LABELS.get(strat, strat)
+        res["label"] = lab
+        hit_txt = f"、方向命中 {hit_rate * 100:.0f}%" if hit_rate is not None else ""
+        if n_wk >= need:
+            res["verdict"] = (f"影子「{lab}」已有 {n_wk} 个日历周末样本，全额手续费累计 ${pnl_full:+.2f}{hit_txt}。"
+                              + ("为正，可以讨论小仓上真钱。" if pnl_full > 0 else "不为正，不上真钱。"))
+        else:
+            res["verdict"] = (f"影子「{lab}」：{n_wk} 个日历周末、{len(traded)} 笔，全额手续费累计 ${pnl_full:+.2f}{hit_txt}；"
+                              f"还差 {max(0, need - n_wk)} 个周末才有资格下结论。")
+        return res
     if n_wk >= need:
         hit_txt = f"、方向命中 {hit_rate * 100:.0f}%" if hit_rate is not None else ""
         tail = ("全额手续费下为正，可考虑把顺势策略转真钱（仍建议先小仓）。" if pnl_full > 0
@@ -170,6 +185,31 @@ def shadow_scorecard(records: list[dict], cfg, strat: str = "follow") -> dict:
                           f"（全额手续费 ${pnl_full:+.2f}）。还需 {max(0, need - n_wk)} 个信息周末样本才有资格下结论，"
                           f"现在只算'值得继续看'，不动真钱。")
     return res
+
+
+SHADOW_ORDER = ("follow", "follow50", "fade50", "regime")
+
+
+def shadow_table(records: list[dict], cfg) -> list[dict]:
+    """"影子策略对照"表：主策略（实际 action）+ 每条影子，同口径（全额手续费）累计盈亏、笔数、日历周末数、命中率。
+
+    只算正式记录（official）。影子在旧记录里没有的（10/15 之前锁定的周末没有 follow50/fade50/regime）就是 0 笔。
+    """
+    from .model import SHADOW_LABELS
+    off = [r for r in records if official(r, cfg)]
+    rows = []
+    traded = [r for r in off if (r["lock"].get("action") or {}).get("side")]
+    hits = [r["outcome"].get("direction_hit") for r in traded if r["outcome"].get("direction_hit") is not None]
+    rows.append({"strategy": "primary", "label": "主策略（实际 action）", "n_trades": len(traded),
+                 "n_weekends": len({r["weekend"][:10] for r in traded}),
+                 "pnl_net_fullfee_usd_total": sum(r["outcome"].get("pnl_net_fullfee_usd", 0.0) for r in traded),
+                 "hit_rate": (sum(1 for h in hits if h) / len(hits)) if hits else None})
+    seen = {k for r in off for k in (r["outcome"].get("shadow") or {})}
+    for k in list(SHADOW_ORDER) + sorted(seen - set(SHADOW_ORDER)):
+        sc = shadow_scorecard(records, cfg, k)
+        rows.append({"strategy": k, "label": SHADOW_LABELS.get(k, k), "n_trades": sc["n_trades"], "n_weekends": sc["n_weekends"],
+                     "pnl_net_fullfee_usd_total": sc["pnl_net_fullfee_usd_total"], "hit_rate": sc["hit_rate"]})
+    return rows
 
 
 def scorecard_by_coin(records: list[dict], cfg) -> dict[str, dict]:

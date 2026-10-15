@@ -127,7 +127,15 @@ def test_quiet_weekend_fade(s):
     assert not lock["features"]["news_weekend"]
     assert lock["prediction"]["pred_bps"] == 0.0               # quiet → deviation erased
     assert lock["action"]["side"] == -1                         # fade: sell
-    assert not lock.get("shadow")                               # 安静周末没有顺势影子单（顺势只在信息周末跑）
+    assert "follow" not in lock["shadow"]                       # 安静周末没有"信息周末顺势"影子单（它只在信息周末跑）
+    # 10/15 起每个周末都记 follow50 / fade50 / regime：+60 偏离 > 50 → follow50 做多、fade50 做空；regime 无历史 → 默认顺势
+    assert lock["shadow"]["follow50"]["side"] == 1 and lock["shadow"]["fade50"]["side"] == -1
+    assert lock["shadow"]["regime"]["side"] == 1 and lock["shadow"]["regime"]["regime"]["pick"] == "follow"
+    assert lock["action"]["side"] == lock["shadow"]["fade50"]["side"]          # 主策略不受影子影响，仍反向
+    for k in ("follow50", "fade50", "regime"):
+        assert "pnl_net_fullfee_usd" in out["shadow"][k]
+    # reopen +5 而决策 +60：价格往回走 → 反向赚、顺势亏
+    assert out["shadow"]["fade50"]["pnl_net_fullfee_usd"] > 0 > out["shadow"]["follow50"]["pnl_net_fullfee_usd"]
     assert out["pnl_net_bps"] > 0
 
 

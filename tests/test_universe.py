@@ -330,3 +330,131 @@ def test_cli_add_top_idempotent_and_weekday_guard(s, monkeypatch, capsys):
     assert len(config.load(s.root).instruments) == 7 + 5
     # 周四 23:30 美东还是周四；周五 00:30 美东就不行
     assert u.config_change_allowed(utc(2026, 10, 16, 3, 30), s) and not u.config_change_allowed(utc(2026, 10, 16, 4, 30), s)
+
+
+# ---------------------------------------------------------------- 2026-10-15 修复：45 个候选只有 6 个拿到回测
+US45 = sorted(next(n for lab, n, k in u._SYMBOL_RULES if k == "us_equity") - {"NVDA", "TSLA", "INTC"})[:45]
+
+
+def raw45() -> dict:
+    """45 个都过门槛的美股单票候选 + config 里的 7 个。"""
+    def ctx(px=100.0):
+        return {"funding": "0.00001", "openInterest": "50000", "dayNtlVlm": "5000000", "oraclePx": str(px), "markPx": str(px),
+                "midPx": str(px), "impactPxs": [str(px * 0.9998), str(px * 1.0002)]}
+    names = [f"xyz:{n}" for n in US45] + ["xyz:XYZ100", "xyz:SP500", "xyz:BRENTOIL", "xyz:NVDA", "xyz:TSLA", "xyz:INTC", "xyz:SMSN"]
+    return {"fetched_at": "2026-10-12T12:00:00+00:00", "perp_dexs": [None, {"name": "xyz"}],
+            "dexs": {"xyz": [{"universe": [{"name": n, "szDecimals": 2, "maxLeverage": 10} for n in names]}, [ctx() for _ in names]]},
+            "main": [{"universe": []}, []], "errors": {}}
+
+
+class FakeHL:
+    """仿 Hyperliquid info：每 60 秒（假时钟）1200 权重；candleSnapshot 20 + 每 60 根 +1，最多返回 endTime 前 5000 根；超了就 429。
+    另有一个"收集器"一直占着 300 权重（同 IP 的其他程序）。"""
+
+    def __init__(self, candles):
+        self.t = 0.0
+        self.log: list[tuple[float, float]] = []
+        self.candles = candles
+        self.n429 = 0
+        self.calls = 0
+
+    def clock(self):
+        return self.t
+
+    def sleep(self, dt):
+        self.t += dt
+
+    def used(self):
+        return sum(w for t, w in self.log if self.t - t < 60) + 300
+
+    def post(self, payload):
+        self.calls += 1
+        self.t += 0.2
+        if self.used() + 20 > 1200:
+            self.n429 += 1
+            self.log.append((self.t, 20))
+            raise RuntimeError("Client error '429 Too Many Requests' for url 'https://api.hyperliquid.xyz/info'")
+        end = payload["req"]["endTime"]
+        cs = [c for c in self.candles if c["t"] <= end][-5000:]
+        self.log.append((self.t, 20 + len(cs) // 60))
+        return cs
+
+
+def test_scan_backtests_every_candidate_under_rate_limit(s, monkeypatch):
+    cs = synth_candles(utc(2026, 8, 1), NOW, wavy)
+    hl = FakeHL(cs)
+    pacer = bl.Pacer(clock=hl.clock, sleep=hl.sleep)
+    monkeypatch.setattr(bl, "PACER", pacer)
+
+    def gc(settings, coin, days):
+        return bl.get_candles(settings, coin, days, max_cache_age_h=6, post=hl.post, pacer=pacer)
+    res = u.scan(s, raw45(), 6, NOW, get_candles=gc, overrides={})
+    by = {m["coin"]: m for m in res["markets"]}
+    cands = [m for m in res["markets"] if m["status"] == "candidate"]
+    assert len(cands) == 45
+    assert all(m["backtest"]["n"] > 0 for m in cands), [m["coin"] for m in cands if not m["backtest"]["n"]]
+    assert all(by[c]["backtest"]["n"] > 0 for c in ("xyz:NVDA", "xyz:SMSN"))
+    assert pacer.slept > 0                                                    # 真的等过（没有节流时 ~6 个之后全 429）
+    for t0, _ in hl.log:                                                      # 服务端窗口内权重从未超限
+        assert sum(w for t, w in hl.log if t0 - 60 < t <= t0) + 300 <= 1200
+    assert "回测覆盖：52 / 52" in u.report_md(res)
+    calls = hl.calls                                                          # 第二次扫描：6 小时内的缓存直接用
+    u.scan(s, raw45(), 6, NOW, get_candles=gc, overrides={})
+    assert hl.calls == calls
+
+
+def test_old_behaviour_reproduced_without_pacing_and_retry_then_report_explains(s, monkeypatch):
+    """不节流、不重试时复现服务器上的现象：前几个有样本，之后"没有 K 线"（429）。报告必须列出原因，不能只写 0。"""
+    import functools
+    cs = synth_candles(utc(2026, 8, 1), NOW, wavy)
+    hl = FakeHL(cs)
+    nopace = bl.Pacer(budget=1e12, clock=hl.clock, sleep=hl.sleep)
+    monkeypatch.setattr(bl, "PACER", nopace)
+    monkeypatch.setattr(bl, "info_post", functools.partial(bl.info_post, retries=0))
+
+    def gc(settings, coin, days):
+        return bl.get_candles(settings, coin, days, post=hl.post, pacer=nopace)
+    res = u.scan(s, raw45(), 6, NOW, get_candles=gc, overrides={})
+    cands = [m for m in res["markets"] if m["status"] == "candidate"]
+    ok = [m for m in cands if m["backtest"]["n"]]
+    assert 0 < len(ok) < 45 and hl.n429 > 0
+    md = u.report_md(res)
+    assert "## 回测失败 / 样本为 0（原因）" in md and "429" in md and "回测覆盖：" in md
+
+
+def test_why_empty_explains_missing_prices(s):
+    inst = u.stanza_for("xyz:AAPL", "us_equity")
+    # 只有周五的 K 线 → 关门价有、决策价（周日）没有
+    cs = [c for c in synth_candles(utc(2026, 9, 1), NOW, wavy)
+          if datetime.fromtimestamp(c["t"] / 1000, tz=UTC).weekday() == 4]
+    b = u.backtest_candidate(s, inst, 4, NOW, 1000.0, 2.0, None, lambda st, coin, days: (cs, "15m", "合成"))
+    assert b["n"] == 0 and "缺决策价" in b["error"] and b["missing"]["no_decision"] == 4
+
+
+def test_save_cache_merges_history(s):
+    a = synth_candles(utc(2026, 9, 1), utc(2026, 9, 3), wavy)
+    b = synth_candles(utc(2026, 9, 2), utc(2026, 9, 5), wavy)
+    bl.save_cache(s, "xyz:AAPL", "15m", a)
+    bl.save_cache(s, "xyz:AAPL", "15m", b)
+    got, _ = bl.load_cache_iv(s, "xyz:AAPL", "15m")
+    assert [c["t"] for c in got] == sorted({c["t"] for c in a + b})
+
+
+def test_info_post_retries_429_but_not_proxy_403():
+    calls = []
+
+    def post403(p):
+        calls.append(p)
+        raise RuntimeError("ProxyError 403 Forbidden")
+    pacer = bl.Pacer(clock=lambda: 0.0, sleep=lambda dt: None)
+    with pytest.raises(RuntimeError, match="403"):
+        bl.info_post({"type": "meta"}, post=post403, pacer=pacer)
+    assert len(calls) == 1
+    n = []
+
+    def post429(p):
+        n.append(p)
+        if len(n) < 3:
+            raise RuntimeError("429 Too Many Requests")
+        return [1, 2]
+    assert bl.info_post({"type": "meta"}, post=post429, pacer=pacer) == [1, 2] and len(n) == 3 and pacer.slept > 0
