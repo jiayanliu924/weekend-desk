@@ -369,6 +369,17 @@ def _headline_rows(hs: dict) -> str:
     return "".join(f"<tr><td>{E(lab)}</td>{''.join(cell(bh.get(h)) for h in hz)}</tr>" for lab, bh in rows)
 
 
+def strategy_line(settings) -> str:
+    """概览上的"当前主策略"一行（读 config.toml [strategy]）。"""
+    from .model import FAMILY_CN, strategy_cfg
+    sc = strategy_cfg(settings)
+    if sc["version"] == "v2":
+        fams = "、".join(FAMILY_CN.get(f, f) for f in sc["families_enabled"]) or "—"
+        return (f"当前主策略：v2（只做{fams}、偏离>{float(sc['fade_threshold_bps']):.0f} 反向、全额成本、"
+                f"近 {int(sc['stop_lookback_weekends'])} 周末为负就停）")
+    return "当前主策略：v1（H1 规则：安静周末反向、信息周末顺向，门槛按链上费率）"
+
+
 # ------------------------------------------------------------------ pages
 @app.get("/", response_class=HTMLResponse)
 def overview(req: Request):
@@ -490,6 +501,7 @@ def overview(req: Request):
 </section>
 
 <h2>成绩</h2>
+<p class="sub" style="margin-bottom:10px"><b>{E(strategy_line(S))}</b></p>
 <div class="strip">
   <div><div class="k">实时模拟盈亏（$2,000 本金，2 倍）</div><div class="v {_cls(live['total_usd'])}">${_n(live['total_usd'], 2, sign=True)}</div>
        <div class="ev">{live['n']} 个合约周末，出手 {live['n_traded']} 次</div></div>
@@ -511,7 +523,7 @@ def overview(req: Request):
   <div class="k">影子策略对照（同口径 · 全额手续费 · 只记账）</div>
   <div class="tw" style="margin-top:8px"><table style="font-size:13px"><tr><th>策略</th><th class="n">累计 USD</th><th class="n">笔数</th><th class="n">周末数</th><th class="n">命中率</th></tr>
   {shadow_html or '<tr><td colspan=5 class="mut">还没有完成的周末。</td></tr>'}</table></div>
-  <div class="ev">主策略照旧（本周末演习）。最近 7 个周末回测里反向亏、大偏离顺势赚，但样本太少，换主策略前先在这里同口径攒样本；样本外回测见 data/reports/strategy_lab.md。</div>
+  <div class="ev">{E(strategy_line(S))}。v2 = 实验室走前挑选在美股单票上自己选中、样本外通过的规则；「单票反向>50（不停手）」和 v2 之差 = 停手规则的效果。上真钱的门槛：影子 v2 在 ≥ 8 个日历周末上全额手续费为正，且实验室样本外仍通过。样本外回测见 data/reports/strategy_lab.md。</div>
 </div>
 
 {_positions_card()}

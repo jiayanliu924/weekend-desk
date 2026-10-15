@@ -134,6 +134,20 @@ min_train = 24
 materiality_threshold = 2
 feature_version = "f1"
 
+[strategy]
+# 主策略版本（2026-10-15，见 knowledge/lessons.md「实验室结果与 v2」）。
+# v1 = 原 H1 规则（安静周末反向 / 信息周末顺向，门槛按链上 growthMode 费率）。
+# v2 = 实验室走前挑选（wf_select）自己在美股单票上选中、样本外通过的那条：
+#      只做 families_enabled 里的品种族；|偏离| > fade_threshold_bps 才反向；出手门槛按全额手续费；
+#      停手：该品种族最近 stop_lookback_weekends 个已完成周末、按 v2 规则算的全额手续费盈亏之和 < 0 → 本周末不出手
+#      （不足这么多周末 → 照常出手）。K=4 是事先写死的，不按回测结果调。
+# 品种族：XYZ100/SP500 → us_index，BRENTOIL → metals_energy，SMSN → kr_equity，NVDA/TSLA/INTC → us_equity（desk/universe.classify）。
+# 不管这里选哪个版本，v2 和 fade50_stocks（v2 去掉停手）两条影子每个周末都记。
+version = "v2"
+families_enabled = ["us_equity"]
+fade_threshold_bps = 50
+stop_lookback_weekends = 4
+
 [costs]
 # 7.5 trade.xyz 基础费率（bps）。系统会读取链上 growthMode；开启时按 growth_discount 打折。
 taker_bps = 9.0

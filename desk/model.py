@@ -66,7 +66,118 @@ SHADOW_LABELS = {
     "follow50": "顺势 |偏离|>50",
     "fade50": "反向 |偏离|>50",
     "regime": f"切换（近 {REGIME_K} 周末谁赚跟谁）",
+    "v2": "v2（单票反向>50 + 近 4 周末为负停手）",
+    "fade50_stocks": "单票反向>50（不停手，对照 v2 的停手效果）",
 }
+
+# ---------------------------------------------------------------- 策略版本（2026-10-15，见 knowledge/lessons.md 同日条目）
+# v1 = 原来的 H1 规则（安静反向 / 信息顺向，门槛按链上 growthMode 费率）。
+# v2 = 实验室走前挑选（wf_select）自己在美股单票上选中、且样本外通过的那条：|偏离| > 50 反向；只做 families_enabled 里的
+#      品种族；出手门槛按全额手续费；再加一条事先写死（不按结果调）的停手规则：这个品种族最近 K=4 个已完成周末、
+#      按 v2 规则算的全额手续费盈亏之和 < 0 → 本周末不出手；历史不足 K 个周末 → 照常出手。
+STRATEGY_DEFAULTS = {"version": "v1", "families_enabled": ["us_equity"], "fade_threshold_bps": 50.0,
+                     "stop_lookback_weekends": 4}
+FAMILY_CN = {"us_equity": "美股单票", "us_index": "美指", "metals_energy": "Brent/金属能源", "kr_equity": "韩股"}
+
+
+def strategy_cfg(cfg) -> dict:
+    """[strategy] 段（缺省 = v1，旧配置/测试里的 dict 配置行为不变）。"""
+    try:
+        raw = cfg["strategy"]
+    except (KeyError, TypeError):
+        raw = None
+    return {**STRATEGY_DEFAULTS, **(raw or {})}
+
+
+def instrument_family(name_or_coin: str | None) -> str:
+    """合约 → 品种族（复用 universe 的分类：XYZ100/SP500 → us_index，BRENTOIL → metals_energy，SMSN → kr_equity，
+    NVDA/TSLA/INTC → us_equity）。认不出 → 'unknown'。"""
+    if not name_or_coin:
+        return "unknown"
+    from .universe import classify
+    key, _ = classify(name_or_coin, name_or_coin.split(":")[0] if ":" in name_or_coin else "")
+    return key
+
+
+def features_family(features: dict) -> str:
+    fam = instrument_family(features.get("coin"))
+    return fam if fam != "unknown" else instrument_family(features.get("name"))
+
+
+def full_fees(cfg) -> dict:
+    """全额手续费（不打 growthMode 折扣）：v2 的出手判断用它。"""
+    c = cfg["costs"]
+    return {"maker_bps": c["maker_bps"], "taker_bps": c["taker_bps"], "growth_mode": None, "full_fee": True}
+
+
+def v2_rule_net_bps(h: dict, cfg) -> float:
+    """一条已完成记录"如果当时按 v2 规则做"的全额手续费净 bps（不出手 = 0）。
+    h = {dev_bps, move_bps, spread_bps?, dislocated?, wick_ratio?}；成本 = 挂单 + 吃单 + 半点差（缺点差按 2 bps）。"""
+    sc = strategy_cfg(cfg)
+    dev, mv = h.get("dev_bps"), h.get("move_bps")
+    if dev is None or mv is None or abs(dev) <= sc["fade_threshold_bps"]:
+        return 0.0
+    if h.get("dislocated") or (h.get("wick_ratio") or 1.0) > cfg["risk"].get("wick_ratio_veto", 6.0):
+        return 0.0
+    c = cfg["costs"]
+    hs = h["spread_bps"] / 2 if h.get("spread_bps") is not None else 2.0
+    if abs(dev) <= c["maker_bps"] + c["taker_bps"] + hs + c["edge_buffer_bps"]:
+        return 0.0
+    return -_sgn(dev) * mv - (c["maker_bps"] + c["taker_bps"] + hs)
+
+
+def v2_stop(weekend_pnls: list[tuple[str, float]], k: int) -> dict:
+    """停手规则（事先写死，K 不按结果调）：weekend_pnls = [(周五日期, 这个品种族这个周末按 v2 规则的合计净 bps)]，
+    只含严格早于本周末的已完成周末（调用方负责）。最近 k 个之和 < 0 → 停手；不足 k 个 → 照常出手。"""
+    last = sorted(weekend_pnls)[-k:] if k > 0 else []
+    if len(last) < k:
+        return {"stop": False, "n": len(last), "k": k, "sum_bps": None,
+                "why": f"该品种族已完成周末 {len(last)} 个，少于 {k}，照常出手"}
+    tot = sum(x for _, x in last)
+    return {"stop": tot < 0, "n": len(last), "k": k, "sum_bps": tot,
+            "why": f"近 {k} 个周末按 v2 规则全额手续费合计 {tot:+.0f} bps"}
+
+
+def v2_weekend_pnls(history: list[dict], cfg) -> list[tuple[str, float]]:
+    """history = 这个品种族、严格早于本周末的已完成记录 [{weekend|fri, dev_bps, move_bps, ...}] → 每个日历周末的合计净 bps。"""
+    by: dict[str, float] = {}
+    for h in history:
+        fri = (h.get("fri") or h["weekend"])[:10]
+        by[fri] = by.get(fri, 0.0) + v2_rule_net_bps(h, cfg)
+    return sorted(by.items())
+
+
+def decide_v2(features: dict, cfg, history: list[dict] | None = None, use_stop: bool = True) -> dict:
+    """v2：只做 families_enabled 里的品种族；|偏离| > fade_threshold_bps 才反向；门槛按全额手续费（decide_action_core
+    里 cost = 挂单 + 吃单 + 半点差、再加 buffer）；use_stop 时近 K 个周末按 v2 规则为负就停手。仓位/插针否决照旧。"""
+    sc = strategy_cfg(cfg)
+    fam = features_family(features)
+    dev = features["dev_bps"]
+    if fam not in sc["families_enabled"]:
+        return {**_no_trade("v2", "v2：该品种族样本外未通过，不出手"), "edge_bps": -dev, "family": fam}
+    thr = float(sc["fade_threshold_bps"])
+    if abs(dev) <= thr:
+        return {**_no_trade("v2", f"v2：|偏离| {abs(dev):.0f} ≤ {thr:.0f} bps，不出手"), "edge_bps": -dev, "family": fam}
+    stop = None
+    if use_stop:
+        k = int(sc["stop_lookback_weekends"])
+        stop = v2_stop(v2_weekend_pnls(history or [], cfg), k)
+        if stop["stop"]:
+            return {**_no_trade("v2", f"v2：近 {k} 个周末该规则累计为负，停手一周（{stop['why']}）"),
+                    "edge_bps": -dev, "family": fam, "stop": stop}
+    a = decide_action_core(features, {"pred_bps": 0.0}, full_fees(cfg), cfg)
+    a["strategy"] = "v2"
+    a["family"] = fam
+    a["fee_basis"] = "full"
+    if stop is not None:
+        a["stop"] = stop
+    if a["side"]:
+        a["direction"] = "fade"
+        a["reason"] = (f"v2：{FAMILY_CN.get(fam, fam)} |偏离| {abs(dev):.0f} > {thr:.0f} bps，反向（全额成本门槛 "
+                       f"{a['threshold_bps']:.0f} bps）" + (f"；{stop['why']}" if stop else ""))
+    else:
+        a["reason"] = "v2：" + a.get("reason", "")
+    return a
 
 
 def _sgn(x: float) -> int:
@@ -112,9 +223,9 @@ def _no_trade(name: str, reason: str, **extra) -> dict:
 
 
 def _shadow_trade(features: dict, fees: dict, cfg, name: str, direction: str, **extra) -> dict:
-    """direction = follow（pred = 2·dev → edge = +dev）或 fade（pred = 0 → edge = −dev）；仓位/否决/门槛全走 decide_action。"""
+    """direction = follow（pred = 2·dev → edge = +dev）或 fade（pred = 0 → edge = −dev）；仓位/否决/门槛全走 decide_action_core。"""
     dev = features["dev_bps"]
-    a = decide_action(features, {"pred_bps": 2.0 * dev if direction == "follow" else 0.0}, fees, cfg)
+    a = decide_action_core(features, {"pred_bps": 2.0 * dev if direction == "follow" else 0.0}, fees, cfg)
     a["strategy"] = name
     a["direction"] = direction
     a["reason"] = f"{SHADOW_LABELS.get(name, name)}：" + a.get("reason", "")
@@ -122,7 +233,8 @@ def _shadow_trade(features: dict, fees: dict, cfg, name: str, direction: str, **
     return a
 
 
-def shadow_actions(features: dict, fees: dict, cfg, history: list[dict] | None = None) -> dict:
+def shadow_actions(features: dict, fees: dict, cfg, history: list[dict] | None = None,
+                   v2_history: list[dict] | None = None) -> dict:
     """并行影子策略：不下真单，只记录"如果这么做、会赚多少"，用来攒证据。主策略 action 不受影响。
 
     follow（顺势/追涨）：只在"信息周末、偏离过线"时顺着偏离方向做（押这波真新闻继续到重开），
@@ -130,14 +242,16 @@ def shadow_actions(features: dict, fees: dict, cfg, history: list[dict] | None =
     follow50 / fade50（每个周末都记）：|dev| > 50 bps 才出手，分别顺着 / 逆着偏离。
     regime（每个周末都记）：regime_pick 用这个合约过去 K=6 个已完成周末决定今天顺势还是反向；不足 K 个默认顺势。
       history = 这个合约严格早于本周末的已完成周末 [{dev_bps, move_bps}]，按时间顺序（jobs.job_lock 从账本构造）。
-    插针/脱节照样否决（decide_action 内已处理）。攒够样本、全额手续费下也稳定为正，才谈上真钱。
+    v2（每个周末都记，不管主策略是哪个版本）：decide_v2，含停手；v2_history = 同品种族严格早于本周末的已完成正式记录。
+    fade50_stocks（每个周末都记）：同 v2 但没有停手——两条之差就是停手规则的效果。
+    插针/脱节照样否决（decide_action_core 内已处理）。攒够样本、全额手续费下也稳定为正，才谈上真钱。
     """
     out: dict = {}
     dev = features.get("dev_bps")
     if dev is None:
         return out
     if features.get("news_weekend"):
-        a = decide_action(features, {"pred_bps": 2.0 * dev}, fees, cfg)  # edge = pred - dev = dev，顺着偏离
+        a = decide_action_core(features, {"pred_bps": 2.0 * dev}, fees, cfg)  # edge = pred - dev = dev，顺着偏离
         a["strategy"] = "follow"
         out["follow"] = a
     big = abs(dev) > SHADOW_DEV_BPS
@@ -146,10 +260,26 @@ def shadow_actions(features: dict, fees: dict, cfg, history: list[dict] | None =
                      _no_trade(name, f"{SHADOW_LABELS[name]}：|偏离| {abs(dev):.0f} ≤ {SHADOW_DEV_BPS:.0f} bps，不出手"))
     rp = regime_pick(history or [], REGIME_K)
     out["regime"] = _shadow_trade(features, fees, cfg, "regime", rp["pick"], regime=rp)
+    for name, use_stop in (("v2", True), ("fade50_stocks", False)):
+        a = decide_v2(features, cfg, v2_history, use_stop=use_stop)
+        a["strategy"] = name
+        if name != "v2":
+            a["reason"] = a["reason"].replace("v2：", f"{SHADOW_LABELS[name]}：", 1)
+        out[name] = a
     return out
 
 
-def decide_action(features: dict, pred: dict, fees: dict, cfg) -> dict:
+def decide_action(features: dict, pred: dict, fees: dict, cfg, v2_history: list[dict] | None = None) -> dict:
+    """主策略出手。[strategy].version = "v2" → decide_v2（只做通过的品种族、|偏离|>50 反向、全额成本、4 周末停手；
+    v2_history 见 decide_v2）；"v1"（或没有 [strategy] 段）→ 原 H1 规则 decide_action_core（fees 按链上费率）。"""
+    if strategy_cfg(cfg)["version"] == "v2":
+        a = decide_v2(features, cfg, v2_history, use_stop=True)
+        a["strategy_version"] = "v2"
+        return a
+    return decide_action_core(features, pred, fees, cfg)
+
+
+def decide_action_core(features: dict, pred: dict, fees: dict, cfg) -> dict:
     """模拟出手：预期收益（从当前价到重开价）超过成本 + 缓冲才出手；挂单进场、吃单离场。
 
     在原来的基础上加了三条（借鉴竞品 Meridian/Keel 文档，见 desk/mark.py）：

@@ -16,6 +16,9 @@
   regimeK            K ∈ {4, 6, 8}：这个合约过去 K 个周末"顺势 − 反向"实际盈亏之和的符号决定今天顺/反（model.regime_pick，
                      和实盘影子同一个函数）；不足 K 个默认顺势
   wf_select          每个品种族、每个周末：在 8 个固定变体里挑"过去所有周末累计净收益最高"的那个；最高的也 ≤ 0 → 不做
+  v2                 （2026-10-15）主策略 v2 的回测：只做 [strategy].families_enabled（默认美股单票）、|dev| > 50 反向；
+                     停手：同族严格更早的最近 K=4 个周末按同一规则的净 bps 之和 < 0 → 这周末不做（model.v2_stop，和实盘同一个函数）；
+                     不足 4 个周末照常做。和"美股单票 / 反向 偏离>50"那一行之差 = 停手规则的效果。
 样本外 = 全局第 warmup 个日历周末之后（默认 8）。所有选择只看严格更早的周末（_past 构造；测试里用"改未来数据、
 过去的决定不变"和"偷看会改答案"的夹具锁死）。有效样本按日历周末数算（同一周末的合约高度相关）。
 
@@ -33,7 +36,7 @@ from pathlib import Path
 from . import backtest_lib as bl
 from .backtest_lib import INTERVAL_MS, price_at_or_after, price_at_or_before
 from .clock import friday_of, name_of, weekend_for_friday
-from .model import regime_pick
+from .model import regime_pick, strategy_cfg, v2_stop
 
 UTC = timezone.utc
 THRESHOLDS = (16, 50, 100, 150)
@@ -52,13 +55,13 @@ def fixed_variants() -> list[str]:
 
 
 def all_variants() -> list[str]:
-    return fixed_variants() + [f"news{BASE_T}"] + [f"regime{k}" for k in KS] + ["wf_select"]
+    return fixed_variants() + [f"news{BASE_T}"] + [f"regime{k}" for k in KS] + ["wf_select", "v2"]
 
 
 # 标签里不能有 "|"（会把 markdown 表格切开）；"偏离>50" 指 |dev| > 50 bps
 VARIANT_CN = {**{f"fade{t}": f"反向 偏离>{t}" for t in THRESHOLDS}, **{f"follow{t}": f"顺向 偏离>{t}" for t in THRESHOLDS},
               f"news{BASE_T}": "新闻条件（信息→顺，安静→反）", **{f"regime{k}": f"走前切换 K={k}" for k in KS},
-              "wf_select": "走前挑最优固定变体"}
+              "wf_select": "走前挑最优固定变体", "v2": "v2（单票反向>50 + 4 周末停手）"}
 
 
 def family_of(inst: dict) -> str:
@@ -181,10 +184,38 @@ def wf_choice(past: list[dict], family: str, fee: float, min_weekends: int) -> s
     return best
 
 
-def decide(variant: str, r: dict, past: list[dict], fee: float, wf_pick: str | None = None) -> int:
+def v2_params(cfg=None) -> dict:
+    """v2 的参数（不管 [strategy].version 是哪个，实验室都按 v2 参数回测）：族名换成实验室的中文族名。"""
+    sc = strategy_cfg(cfg) if cfg is not None else strategy_cfg({})
+    return {"families": {SCHED_FAMILY.get(k, k) for k in sc["families_enabled"]},
+            "threshold": float(sc["fade_threshold_bps"]), "k": int(sc["stop_lookback_weekends"])}
+
+
+def v2_state(past: list[dict], family: str, fee: float, v2p: dict) -> dict:
+    """v2 停手状态：同族、严格早于本周末（past 由 _past 构造）的每个周末按"反向 |dev|>阈值"的净 bps 合计 → model.v2_stop。"""
+    by: dict[str, float] = {}
+    for p in past:
+        if p["family"] != family:
+            continue
+        net = (-_sgn(p["dev_bps"]) * p["move_bps"] - fee) if abs(p["dev_bps"]) > v2p["threshold"] else 0.0
+        by[p["fri"]] = by.get(p["fri"], 0.0) + net
+    return v2_stop(sorted(by.items()), v2p["k"])
+
+
+def v2_side(r: dict, past: list[dict], fee: float, v2p: dict, state: dict | None = None) -> int:
+    if r["family"] not in v2p["families"] or abs(r["dev_bps"]) <= max(v2p["threshold"], BASE_T):
+        return 0
+    st = state if state is not None else v2_state(past, r["family"], fee, v2p)
+    return 0 if st["stop"] else -_sgn(r["dev_bps"])
+
+
+def decide(variant: str, r: dict, past: list[dict], fee: float, wf_pick: str | None = None,
+           v2p: dict | None = None, v2st: dict | None = None) -> int:
     """单行在某变体下的方向（+1 多 / −1 空 / 0 不做）。past 只含严格早于 r 的周末。"""
     if variant in fixed_variants():
         return fixed_side(variant, r)
+    if variant == "v2":
+        return v2_side(r, past, fee, v2p or v2_params(), v2st)
     if abs(r["dev_bps"]) <= BASE_T:
         return 0
     if variant.startswith("news"):
@@ -202,16 +233,29 @@ def decide(variant: str, r: dict, past: list[dict], fee: float, wf_pick: str | N
     raise ValueError(variant)
 
 
-def decisions(rows: list[dict], fee: float, min_weekends: int) -> dict[tuple[str, str, str], int]:
+def decisions(rows: list[dict], fee: float, min_weekends: int, v2p: dict | None = None) -> dict[tuple[str, str, str], int]:
     """{(variant, fri, name): side} —— 每个周末只把 _past(rows, fri) 交给决策函数。"""
     out = {}
+    v2p = v2p or v2_params()
     for fri in sorted({r["fri"] for r in rows}):
         past = _past(rows, fri)
         today = [r for r in rows if r["fri"] == fri]
-        picks = {fam: wf_choice(past, fam, fee, min_weekends) for fam in {r["family"] for r in today}}
+        fams = {r["family"] for r in today}
+        picks = {fam: wf_choice(past, fam, fee, min_weekends) for fam in fams}
+        states = {fam: v2_state(past, fam, fee, v2p) for fam in fams}
         for r in today:
             for v in all_variants():
-                out[(v, fri, r["name"])] = decide(v, r, past, fee, picks.get(r["family"]))
+                out[(v, fri, r["name"])] = decide(v, r, past, fee, picks.get(r["family"]), v2p, states[r["family"]])
+    return out
+
+
+def v2_states(rows: list[dict], fee: float, v2p: dict) -> dict[tuple[str, str], dict]:
+    """{(family, fri): v2 停手状态}（只算启用的族），报告用。"""
+    out = {}
+    for fri in sorted({r["fri"] for r in rows}):
+        past = _past(rows, fri)
+        for fam in sorted({r["family"] for r in rows if r["fri"] == fri} & v2p["families"]):
+            out[(fam, fri)] = v2_state(past, fam, fee, v2p)
     return out
 
 
@@ -272,7 +316,8 @@ def evaluate_rows(rows: list[dict], cfg, warmup: int = 8, notional: float = 1000
     fee = c["maker_bps"] + c["taker_bps"] + half_spread
     weekends = sorted({r["fri"] for r in rows})
     oos_from = weekends[warmup] if len(weekends) > warmup else None
-    dec = decisions(rows, fee, warmup)
+    v2p = v2_params(cfg)
+    dec = decisions(rows, fee, warmup, v2p)
     by_key = {(r["fri"], r["name"]): r for r in rows}
     trades: dict[str, list[dict]] = {v: [] for v in all_variants()}
     for (v, fri, name), side in dec.items():
@@ -285,7 +330,8 @@ def evaluate_rows(rows: list[dict], cfg, warmup: int = 8, notional: float = 1000
                           "dev_bps": r["dev_bps"], "gross_bps": gross, "net_bps": net, "net_usd": net / 1e4 * notional,
                           "oos": oos_from is not None and fri >= oos_from})
     res: dict = {"fee_bps": fee, "weekends": weekends, "oos_from": oos_from, "warmup": warmup, "notional": notional,
-                 "oos": {}, "ins": {}, "recent": {}, "early": {}, "picks": wf_picks(rows, fee, warmup)}
+                 "oos": {}, "ins": {}, "recent": {}, "early": {}, "picks": wf_picks(rows, fee, warmup),
+                 "v2p": v2p, "v2_states": v2_states(rows, fee, v2p)}
     for fam in FAMILY_ORDER:
         for v in all_variants():
             ts = [t for t in trades[v] if fam == "全部" or t["family"] == fam]
@@ -341,10 +387,11 @@ def _f(x, fmt="+.1f", dash="—"):
     return dash if x is None or (isinstance(x, float) and math.isnan(x)) else format(x, fmt)
 
 
-def _row(v: str, st: dict) -> str:
+def _row(v: str, st: dict, label: str | None = None) -> str:
+    lab = label or VARIANT_CN[v]
     if not st.get("n"):
-        return f"| {VARIANT_CN[v]} | 0 | 0 | — | — | — | — | — | — | — | 没有出手 |"
-    return (f"| {VARIANT_CN[v]} | {st['n']} | {st['n_weekends']} | {st['hit_rate'] * 100:.0f}% | {st['avg_net_bps']:+.1f} | "
+        return f"| {lab} | 0 | 0 | — | — | — | — | — | — | — | 没有出手 |"
+    return (f"| {lab} | {st['n']} | {st['n_weekends']} | {st['hit_rate'] * 100:.0f}% | {st['avg_net_bps']:+.1f} | "
             f"{st['total_usd']:+.2f} | {st['worst_bps']:+.0f} ({st['worst_label']}) | {st['max_dd_usd']:.2f} | "
             f"{st['ex_top2_usd']:+.2f} | {_f(st['t_weekend'], '+.2f')} | {verdict(st)} |")
 
@@ -403,11 +450,52 @@ def summary_cn(res: dict, rows: list[dict]) -> list[str]:
     return L
 
 
+def v2_section_cn(res: dict) -> list[str]:
+    """"v2 和对照"：v2 vs 同族的固定反向>阈值（= v2 去掉停手）vs 走前挑选，样本外；停手省下/错过多少；分时段；$ 量级。"""
+    v2p = res["v2p"]
+    fams = [f for f in FAMILY_ORDER if f in v2p["families"]]
+    thr, k = v2p["threshold"], v2p["k"]
+    fade_v = f"fade{int(thr)}" if float(int(thr)) == thr and f"fade{int(thr)}" in fixed_variants() else None
+    L = [f"v2 = 走前挑选（wf_select）在{'、'.join(fams) or '—'}上自己选中的「反向 偏离>{thr:.0f}」，只做这些族，"
+         f"再加一条事先写死的停手：同族最近 {k} 个已完成周末按同一规则的全额成本净值之和 < 0 → 停一周（不足 {k} 个照做）。"
+         f"成本 {res['fee_bps']:.0f} bps/笔。停手只看严格更早的周末。", ""]
+    L += [*HEAD]
+    for fam in fams:
+        L.append(_row("v2", res["oos"][(fam, "v2")], f"{fam} · {VARIANT_CN['v2']}"))
+        if fade_v:
+            L.append(_row(fade_v, res["oos"][(fam, fade_v)], f"{fam} · {VARIANT_CN[fade_v]}（不停手）"))
+        L.append(_row("wf_select", res["oos"][(fam, "wf_select")], f"{fam} · {VARIANT_CN['wf_select']}"))
+    L.append(_row("v2", res["oos"][("全部", "v2")], f"全部 · {VARIANT_CN['v2']}"))
+    L.append("")
+    for fam in fams:
+        oos_w = [w for w in res["weekends"] if res["oos_from"] and w >= res["oos_from"]]
+        stopped = [w for w in oos_w if (res["v2_states"].get((fam, w)) or {}).get("stop")]
+        if fade_v:
+            skipped = sum(t["net_usd"] for t in res["trades"][fade_v] if t["family"] == fam and t["fri"] in stopped)
+            L.append(f"- {fam}：样本外 {len(oos_w)} 个周末里停手 {len(stopped)} 个"
+                     + (f"（{', '.join(stopped)}）" if 0 < len(stopped) <= 8 else "")
+                     + (f"；这些周末不停手的话会是 {skipped:+.2f} $（负 = 停手省下，正 = 停手错过）。" if stopped else "。"))
+        st, e, r = res["oos"][(fam, "v2")], res["early"][(fam, "v2")], res["recent"][(fam, "v2")]
+        L.append(f"- {fam} 分时段（样本内口径）：v2 在 {RECENT_FROM} 之前 {_f(e.get('avg_net_bps'))} bps/笔（{e.get('n', 0)} 笔），"
+                 f"之后 {_f(r.get('avg_net_bps'))} bps/笔（{r.get('n', 0)} 笔）"
+                 + (f"；不停手的 {VARIANT_CN[fade_v]} 之前 {_f(res['early'][(fam, fade_v)].get('avg_net_bps'))}、"
+                    f"之后 {_f(res['recent'][(fam, fade_v)].get('avg_net_bps'))}。" if fade_v else "。"))
+        if st.get("n"):
+            per_wk = st["total_usd"] / max(1, len(oos_w))
+            L.append(f"- 量级：样本外每笔 ${res['notional']:,.0f} 名义，v2 合计 {st['total_usd']:+.2f} $ / {len(oos_w)} 个周末 ≈ "
+                     f"{per_wk:+.2f} $/周末（按每 ${res['notional']:,.0f} 名义）。判定：{verdict(st)}。")
+    L.append("- 上线门槛：实盘影子 v2 在 ≥ 8 个日历周末上全额手续费为正，**且**这里样本外仍通过；只满足一个不动真钱。")
+    return L
+
+
 def report_md(settings, res: dict, rows: list[dict], sources: dict[str, str], legacy: dict | None,
               since: date | None) -> str:
-    L = [f"# 策略实验室：走前比较 反向 / 顺向 / 新闻条件 / 切换（{datetime.now(UTC):%Y-%m-%d %H:%M} UTC）", "",
+    L = [f"# 策略实验室：走前比较 反向 / 顺向 / 新闻条件 / 切换 / v2（{datetime.now(UTC):%Y-%m-%d %H:%M} UTC）", "",
          "回补 K 线，**只供探索、不计入正式成绩**（备忘 7.2）。头条是**样本外**（走前：每个周末的选择只看严格更早的周末）。", "",
-         "## 结论（中文）", "", *summary_cn(res, rows), "", "## 数据", ""]
+         "## 结论（中文）", "", *summary_cn(res, rows), ""]
+    if rows:
+        L += ["## v2 和对照", "", *v2_section_cn(res), ""]
+    L += ["## 数据", ""]
     for name, src in sources.items():
         rs = [r for r in rows if r["name"] == name]
         g = {iv: sum(1 for r in rs if r["gran"] == iv) for iv in ("15m", "1h")}

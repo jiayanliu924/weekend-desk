@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.conftest import as_v1
 from desk import config, evaluate, mark, model
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -13,6 +14,7 @@ ROOT = Path(__file__).resolve().parent.parent
 @pytest.fixture
 def s(tmp_path):
     shutil.copy(ROOT / "config.toml", tmp_path / "config.toml")
+    as_v1(tmp_path / "config.toml")   # decide_action 的 v1 引擎（插针否决/首损仓位）
     return config.load(tmp_path)
 
 

@@ -159,7 +159,7 @@ def test_run_offline_merges_1h_and_15m_and_writes_report(s):
     md = sl.run(s, fetch=False, now=now)
     out = Path(s.data) / "reports" / "strategy_lab.md"
     assert out.exists() and out.read_text() == md
-    for sec in ("## 结论（中文）", "## 样本外（头条）", "## 样本内", "### 美指", "### 韩股", "## 走前挑选每个周末选了什么",
+    for sec in ("## 结论（中文）", "## v2 和对照", "v2（单票反向>50 + 4 周末停手）", "## 样本外（头条）", "## 样本内", "### 美指", "### 韩股", "## 走前挑选每个周末选了什么",
                 "## 分时段", "旧口径复算", "1h 粒度（较早的周末）误差", "新闻标签（账本 lock 的 news_weekend）：1 行有标签"):
         assert sec in md, sec
     rows, _, _ = sl.build_rows(s, now, None, False)

@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.conftest import as_v1
 from desk import config, evaluate, extract, jobs, model
 from desk.clock import to_ns, weekend_for_friday
 from desk.ledger import Ledger
@@ -29,6 +30,7 @@ def book(coin, mid):
 @pytest.fixture
 def s(tmp_path):
     shutil.copy(ROOT / "config.toml", tmp_path / "config.toml")
+    as_v1(tmp_path / "config.toml")   # 这些测试断言的是 v1（H1 规则）的行为
     st = config.load(tmp_path)
     return st
 

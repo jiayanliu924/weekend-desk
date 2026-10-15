@@ -187,7 +187,7 @@ def shadow_scorecard(records: list[dict], cfg, strat: str = "follow") -> dict:
     return res
 
 
-SHADOW_ORDER = ("follow", "follow50", "fade50", "regime")
+SHADOW_ORDER = ("follow", "follow50", "fade50", "regime", "v2", "fade50_stocks")
 
 
 def shadow_table(records: list[dict], cfg) -> list[dict]:

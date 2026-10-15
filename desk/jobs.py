@@ -70,8 +70,9 @@ def job_lock(settings, w: Weekend, push: bool = True) -> dict:
     if feats["ok"]:
         pred = model.predict(feats, history, settings)
         fees = model.fee_bps(settings, to_ns(w.decision), w.coin or None)
-        action = model.decide_action(feats, pred, fees, settings)
-        shadow = model.shadow_actions(feats, fees, settings, regime_history(settings, led, w))
+        v2h = v2_history(settings, led, w)
+        action = model.decide_action(feats, pred, fees, settings, v2_history=v2h)
+        shadow = model.shadow_actions(feats, fees, settings, regime_history(settings, led, w), v2_history=v2h)
     else:
         void_reasons += feats["problems"]
         pred, fees, action = {"pred_bps": None}, {}, {"side": 0, "notional_usd": 0, "reason": "数据不全，不出手"}
@@ -102,6 +103,32 @@ def regime_history(settings, led: Ledger, w: Weekend) -> list[dict]:
         if mv is None:
             continue
         out.append({"weekend": r["weekend"], "dev_bps": r["lock"]["features"]["dev_bps"], "move_bps": mv})
+    out.sort(key=lambda h: h["weekend"])
+    return out
+
+
+def v2_history(settings, led: Ledger, w: Weekend) -> list[dict]:
+    """v2 停手规则用的历史：和本合约同一品种族、严格早于本周末、已完成的**正式**记录（evaluate.official），
+    每条 {weekend, name, dev_bps, move_bps, spread_bps, dislocated, wick_ratio}，按时间顺序。
+    盈亏由 model.v2_rule_net_bps 按"如果当时按 v2 做"、全额手续费重算——不看当时主策略实际做了什么。"""
+    from .clock import friday_of, name_of
+    default = settings.instruments[0]["name"]
+    me = w.name or default
+    fam = model.instrument_family((settings.inst(me) or {}).get("coin") or w.coin or me)
+    out = []
+    for r in led.completed():
+        if friday_of(r["weekend"]) >= w.friday.isoformat() or not evaluate.official(r, settings):
+            continue
+        nm = name_of(r["weekend"], default)
+        coin = (settings.inst(nm) or {}).get("coin") or r["lock"].get("coin") or nm
+        if model.instrument_family(coin) != fam:
+            continue
+        mv = model.outcome_move_bps(r["lock"], r["outcome"])
+        if mv is None:
+            continue
+        f = r["lock"]["features"]
+        out.append({"weekend": r["weekend"], "name": nm, "dev_bps": f["dev_bps"], "move_bps": mv,
+                    "spread_bps": f.get("spread_bps"), "dislocated": f.get("dislocated"), "wick_ratio": f.get("wick_ratio")})
     out.sort(key=lambda h: h["weekend"])
     return out
 

@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
+from tests.conftest import as_v1
 from desk import config, sim
 from desk.clock import weekend_for_friday
 
@@ -18,6 +19,7 @@ ROOT = Path(__file__).resolve().parent.parent
 def env(tmp_path, monkeypatch):
     for f in ("config.toml", "events.toml"):
         shutil.copy(ROOT / f, tmp_path / f)
+    as_v1(tmp_path / "config.toml")   # 看板测试按 v1 的已完成周末断言
     monkeypatch.setenv("DESK_ROOT", str(tmp_path))
     monkeypatch.setenv("DESK_DATA", str(tmp_path / "data"))
     monkeypatch.setenv("WEB_INSECURE", "1")

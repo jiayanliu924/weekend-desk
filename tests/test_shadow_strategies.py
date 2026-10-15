@@ -42,7 +42,7 @@ def test_follow50_fade50_regime_sides(s, dev, f50, d50, reg):
 
 def test_news_weekend_keeps_original_follow_shadow(s):
     sh = model.shadow_actions(feats(-70, news=True), FEES, s)
-    assert sh["follow"]["side"] == -1 and set(sh) == {"follow", "follow50", "fade50", "regime"}
+    assert sh["follow"]["side"] == -1 and set(sh) == {"follow", "follow50", "fade50", "regime", "v2", "fade50_stocks"}
 
 
 def test_primary_action_unchanged_by_shadows(s):
@@ -100,7 +100,7 @@ def test_shadow_table_and_scorecard_for_new_strategies(s):
                                                  "regime": {"side": -1, "pnl_net_fullfee_usd": 3.0, "pnl_net_usd": 3.5, "direction_hit": True}}),
             _official("2026-10-09|NVDA", 1, -2.0, {})]                     # 旧记录：没有新影子
     rows = {r["strategy"]: r for r in evaluate.shadow_table(recs, s)}
-    assert list(rows) == ["primary", "follow", "follow50", "fade50", "regime"]
+    assert list(rows) == ["primary", "follow", "follow50", "fade50", "regime", "v2", "fade50_stocks"]
     assert rows["primary"]["n_trades"] == 2 and rows["primary"]["pnl_net_fullfee_usd_total"] == pytest.approx(3.0)
     assert rows["primary"]["n_weekends"] == 2 and rows["primary"]["hit_rate"] == pytest.approx(0.5)
     assert rows["follow50"]["n_trades"] == 1 and rows["follow50"]["pnl_net_fullfee_usd_total"] == pytest.approx(-8.0)
@@ -121,6 +121,7 @@ def test_overview_shows_shadow_comparison_table(env):  # noqa: F811
     c.post("/login", data={"username": "kea", "password": "correct horse battery"})
     r = c.get("/")
     assert r.status_code == 200 and "影子策略对照" in r.text
-    for lab in ("主策略（实际 action）", model.SHADOW_LABELS["follow50"], model.SHADOW_LABELS["fade50"], model.SHADOW_LABELS["regime"]):
+    for lab in ("主策略（实际 action）", model.SHADOW_LABELS["follow50"], model.SHADOW_LABELS["fade50"], model.SHADOW_LABELS["regime"],
+                model.SHADOW_LABELS["v2"], model.SHADOW_LABELS["fade50_stocks"], "当前主策略："):
         import html
         assert html.escape(lab) in r.text, lab
