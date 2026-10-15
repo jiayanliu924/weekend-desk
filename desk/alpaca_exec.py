@@ -9,7 +9,12 @@
   1. config [alpaca] enabled = true 且 live = true
   2. 服务器上是真钱账户的 key（ALPACA_PAPER=0）
   3. data/state/approvals.json 里 kea 和 boss 都批准过，且批准时的风险上限 ≥ 现在配置的
-  4. 回测门 data/reports/options_gate.json：事件 ≥ 60 个、净盈利 > 0、去掉最好 3 笔仍 > 0、最差一笔 ≥ −3 × 单笔风险上限、不是合成数据
+  4. 回测门要两道都过：
+     4a. 近似回测门 data/reports/options_gate.json（DVOL/VIX 近似，**只算 CPI/FOMC/NFP，不含周末**）：事件 ≥ 60 个、净盈利 > 0、
+         去掉最好 3 笔仍 > 0、最差一笔 ≥ −3 × 单笔风险上限、不是合成数据、是新版（method=dvol_proxy、events_only）
+     4b. 真实报价门（options.real_chain_stats，结果也写到 data/reports/options_real_gate.json）：用本机存的 Deribit 真实期权链
+         结算过的事件/突发样本 ≥ 10 个、纸面卖跨式或买跨式累计净盈亏 > 0（全额手续费）、最差一笔 ≥ −3 × 单笔风险上限
+     为什么要两道：2026-10-15 发现 DVOL 回测的卖方盈利几乎全是周末样本——DVOL 近似在周末系统性高估卖方（周末真实期权已按安静定价）
   5. 纸面门：已结算的事件/突发样本（不算每日对照）≥ paper_events_required 个，且按规则选边的纸面累计盈亏 ≥ 0
   6. 现在没有未平的真钱仓位（最多同时 1 个事件仓位）
   7. 今天（美东）真钱已实现亏损没到 daily_loss_stop_usd
@@ -395,7 +400,7 @@ def clock_ok(clk: dict) -> tuple[bool, str]:
 
 
 def gate_checks(settings, now: datetime | None = None, transport=None, check_clock: bool = True) -> list[dict]:
-    """逐条检查真钱条件。前 7 条都过了才去问真钱端点的时钟（否则根本不碰真钱 URL）。"""
+    """逐条检查真钱条件。前面几条都过了才去问真钱端点的时钟（否则根本不碰真钱 URL）。"""
     c = cfg(settings)
     risk = float(c["max_risk_usd"])
     out = []
@@ -421,11 +426,13 @@ def gate_checks(settings, now: datetime | None = None, transport=None, check_clo
     except (OSError, ValueError):
         g = None
     if g is None:
-        add("backtest", "回测门", False, "还没有 data/reports/options_gate.json（先跑 python3 -m desk.options_backtest --market us --underlying SPY）")
+        add("backtest", "近似回测门（只算事件）", False, "还没有 data/reports/options_gate.json（先跑 python3 -m desk.options_backtest --market us --underlying SPY）")
     else:
         need = int(c["gate_min_events"])
         floor = -float(c["gate_worst_multiple"]) * risk
         fails = []
+        if g.get("method") != "dvol_proxy" or not g.get("events_only"):
+            fails.append("是旧版回测门（可能把周末样本算进去了，周末是 DVOL 近似的假象），要重跑 options_backtest")
         if g.get("synthetic"):
             fails.append("是合成数据")
         if int(g.get("n_events", 0)) < need:
@@ -436,9 +443,22 @@ def gate_checks(settings, now: datetime | None = None, transport=None, check_clo
             fails.append(f"去掉最好 3 笔 {float(g.get('net_ex_best3_usd', 0)):+.2f} 不 > 0")
         if float(g.get("worst_usd", -1e18)) < floor:
             fails.append(f"最差一笔 {float(g.get('worst_usd', 0)):+.2f} < {floor:+.0f}")
-        add("backtest", "回测门", not fails,
-            ("；".join(fails) if fails else f"{g['n_events']} 个事件，净 {g['net_usd']:+.2f}，去掉最好 3 笔 {g['net_ex_best3_usd']:+.2f}，最差 {g['worst_usd']:+.2f}")
-            + f"（{g.get('underlying', '?')}，{g.get('side', '?')}）")
+        add("backtest", "近似回测门（只算事件）", not fails,
+            ("；".join(fails) if fails else f"{g['n_events']} 个 CPI/FOMC/NFP 事件，净 {g['net_usd']:+.2f}，去掉最好 3 笔 {g['net_ex_best3_usd']:+.2f}，最差 {g['worst_usd']:+.2f}")
+            + f"（{g.get('underlying', '?')}，{g.get('side', '?')}；周末样本不算，DVOL 近似在周末系统性高估卖方）")
+    try:
+        from .options import real_chain_stats
+        rg = real_chain_stats(settings)
+    except Exception as e:  # noqa: BLE001
+        rg = {"pass": False, "reasons": [f"算不出来：{str(e)[:120]}"]}
+    if rg["pass"]:
+        el = rg["groups"]["event_like"]
+        rdetail = (f"真实期权链结算的事件/突发样本 {el['n']} 个，实际/隐含 {el['geo_ratio']:.2f}，"
+                   f"纸面卖跨式 {el['A_net']:+.2f}、买跨式 {el['B_net']:+.2f} 美元（全额手续费），最差 {el['worst']:+.2f}")
+    else:
+        rdetail = "；".join(rg["reasons"])
+    add("real_chain", "真实报价门", rg["pass"],
+        rdetail + "（近似回测只是参考，真钱前必须有真实报价的证据）")
     pt = paper_track(settings)
     need_p = int(c["paper_events_required"])
     add("paper", "纸面成绩", pt["n"] >= need_p and pt["chosen_pnl"] >= 0,

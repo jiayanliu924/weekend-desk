@@ -234,7 +234,7 @@ slippage_pct = 1.0
 [alpaca]
 # 11d 美股期权执行层（desk/alpaca_exec.py；说明见 knowledge/alpaca_exec_README.md）。
 # enabled=false：完全不动。enabled=true、live=false：有纸面 key 就发到 Alpaca 纸面账户，否则只演练记账。
-# 真钱要 live=true 且其余 7 条门全过（两人批准、回测门、纸面成绩、1 个仓位、当日止损、开盘），少一条就退回纸面/演练。
+# 真钱要 live=true 且其余 8 条门全过（两人批准、近似回测门〔只算事件〕、真实报价门、纸面成绩、1 个仓位、当日止损、开盘），少一条就退回纸面/演练。
 enabled = false
 live = false
 # 单笔最多亏多少美元（张数 = floor(这个 / 每张最大亏损)；不够 1 张就不下）

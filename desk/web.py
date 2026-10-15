@@ -712,9 +712,11 @@ def options_page(req: Request):
 <div class="card"><div class="k">最差一笔</div><div class="v bad">{_n(worst['pnl'], 2, sign=True) if worst else '—'}</div><div class="k">{E(worst['sid'] + ' ' + options_paper.NAMES[worst['structure'][0]]) if worst else '还没有'}</div></div></div>
 <div class="tw"><table><tr><th>分组</th><th>样本</th><th>A 未对冲</th><th>A 对冲后</th><th>B</th><th>按规则选边</th></tr>{by_type or '<tr><td colspan=6 class="mut">第一个样本结算后出现。</td></tr>'}</table></div>"""
     alp = _alpaca_rows()
+    real_box = _real_vs_proxy_html()
     body = f"""<h1>期权研究</h1><p class="sub">问题：CPI、美联储议息这类事件前，期权价格里预期的波动，和实际走出来的波动谁大？<br>
 实际/隐含 &lt; 1：期权定价偏贵（买期权的人吃亏）；&gt; 1：偏便宜。这部分只研究，不交易。</p>
 <div class="note">{E(options.card_text(oc)).replace(chr(10), '<br>')}</div>
+{real_box}
 {paper_card}
 {shock_rows}
 <h2>样本</h2>
@@ -722,6 +724,38 @@ def options_page(req: Request):
 {''.join(rows) or '<tr><td colspan=11 class="mut">每天凌晨 1 点（加州时间）锁一次对照样本，24 小时后出结果；第一个事件样本是 10/14 CPI。历史粗看见"历史回测"。</td></tr>'}</table></div>
 {alp}"""
     return page(req, "/options", "期权研究", body)
+
+
+def _real_vs_proxy_html() -> str:
+    """"真实报价 vs 近似回测"小框：真实期权链的 实际/隐含（按组）放在 DVOL 回测的同类数字旁边。"""
+    try:
+        rc = options.real_chain_stats(S)
+    except Exception as e:  # noqa: BLE001
+        return f'<div class="note">真实报价统计出错：{E(str(e)[:120])}</div>'
+    try:
+        bt = json.loads((Path(S.data) / "reports" / f"options_backtest_{options.currencies(S)[0]}_summary.json").read_text()).get("by_kind") or {}
+    except (OSError, ValueError):
+        bt = {}
+    g = rc["groups"]
+
+    def bcell(*kinds):
+        for k in kinds:
+            if k in bt:
+                return f"{_n(bt[k].get('geo_ratio'), 2)}<span class='mut'>（{bt[k].get('n', 0)} 个，{k}）</span>"
+        return "<span class='mut'>—</span>"
+
+    def rcell(d):
+        return f"{_n(d.get('geo_ratio'), 2)}<span class='mut'>（{d['n']} 个）</span>" if d["n"] else "<span class='mut'>还没有</span>"
+    rows = (f"<tr><td>每日对照 / 周末</td><td>{rcell(g['daily'])}</td><td>{bcell('WEEKEND')}</td></tr>"
+            f"<tr><td>排期事件（CPI/FOMC/NFP…）</td><td>{rcell(g['event'])}</td><td>{bcell('EVENTS')}</td></tr>"
+            f"<tr><td>突发冲击</td><td>{rcell(g['shock'])}</td><td><span class='mut'>回测没有</span></td></tr>")
+    el = g["event_like"]
+    verdict = ("通过" if rc["pass"] else "没通过：" + "；".join(rc["reasons"]))
+    return f"""<h2>真实报价 vs 近似回测</h2>
+<p class="sub">实际/隐含（几何均值）。左边是本机存下的 Deribit 真实期权链，右边是 DVOL 指数近似的 5 年回测。
+<b>周末两边差很多是口径问题</b>：DVOL 是含工作日的 30 天指数，周末真实到期的期权早就按"安静"定价了，拿 DVOL 当周末的隐含会把卖方赚的钱算多——所以周末不进回测门。</p>
+<div class="tw"><table><tr><th>分组</th><th>真实期权链</th><th>DVOL 近似回测</th></tr>{rows}</table></div>
+<p class="sub">真实报价门（事件+突发 {el['n']} 个，纸面卖跨式 {_n(el['A_net'], 2, sign=True)}、买跨式 {_n(el['B_net'], 2, sign=True)} 美元，全额手续费）：<b class="{'good' if rc['pass'] else 'bad'}">{E(verdict)}</b></p>"""
 
 
 def _alpaca_rows() -> str:
@@ -1160,7 +1194,9 @@ def _alpaca_html() -> str:
 <div class="card" style="margin-top:18px" id="alpaca"><h2 style="margin-top:0">美股期权执行（Alpaca）</h2>
 <p>key：<b class="{'good' if kid else 'bad'}">{E(_mask(kid)) if kid else '未填'}</b>（{'纸面账户' if paper_flag else '真钱账户'}）·
 现在下单会走：<b>{E(mode_cn)}</b> · enabled={str(c['enabled']).lower()} · live={str(c['live']).lower()} · 单笔最多亏 ${c['max_risk_usd']:.0f} · 当日止损 ${c['daily_loss_stop_usd']:.0f}</p>
-<p class="sub">期权研究选了 A（卖波动）就做铁蝶式、选了 B（买波动）就做买跨式，标的是 SPY / IBIT / 财报个股。下面 8 条全部打勾才会动真钱，少一条就退回纸面账户或演练。说明见 knowledge/alpaca_exec_README.md。</p>
+<p class="sub">期权研究选了 A（卖波动）就做铁蝶式、选了 B（买波动）就做买跨式，标的是 SPY / IBIT / 财报个股。下面 9 条全部打勾才会动真钱，少一条就退回纸面账户或演练。说明见 knowledge/alpaca_exec_README.md。</p>
+<p class="sub">回测分两道门，都要过：<b>近似回测门</b>用 DVOL/VIX 指数当隐含，只算 CPI/FOMC/NFP（周末不算——DVOL 近似在周末系统性高估卖方，周末真实期权已按安静定价）；
+<b>真实报价门</b>只用本机存下的 Deribit 真实期权链结算过的样本（事件/突发 ≥ 10 个、纸面 A 或 B 累计赚钱、最差一笔可控）。</p>
 <div class="tw"><table><tr><th></th><th>条件</th><th>现在</th></tr>{gates}</table></div>
 <p class="sub">批准：{appr}。批准要在服务器上跑 <code>python -m desk.alpaca_exec approve --who kea</code>（老板跑 <code>--who boss</code>）。</p>
 <form method="post" action="/settings/alpaca" style="display:grid;gap:10px;max-width:560px">
