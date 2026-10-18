@@ -108,7 +108,7 @@ def due_jobs(now: datetime, settings, done: set) -> list[tuple[str, object]]:
             done.discard(k)
     # 跨 dex 配对自动下单：只有模式不是 off 才每分钟评估一次（off 时这里什么都不加）
     from . import pairs_exec
-    if pairs_exec.get(settings)["mode"] != "off":
+    if pairs_exec.get(settings)["mode"] != "off" or pairs_exec.has_open(settings):   # off 也要继续管理没平的仓位
         slot = int(now.timestamp() // 60)
         if f"pairs:{slot}" not in done:
             out.append((f"pairs:{slot}", None))

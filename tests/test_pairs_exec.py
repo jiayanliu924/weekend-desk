@@ -76,8 +76,17 @@ class FakeClient:
         self.raise_on = set()      # 这些 coin 下单直接抛异常（超时），但"其实没成交"
         self.raise_filled = set()  # 抛异常，但其实成交了
         self.avail = 350.0
+        self.wide = set()          # 这些 coin 的盘口买卖价差极宽（中间价不可信）
+        self.marks = {}            # coin -> mark_px（没设置 → mark_px 返回 None）
+        self.funding = []          # funding_rows 返回的行
+        self.cloid_fills = {}      # cloid_hex -> (sz, px)：fill_for_cloid 查得到的真实成交
+        self.lev_resp = None
+        self.lev_calls = []
+        self.balance_raises = False
 
     def balance(self):
+        if self.balance_raises:
+            raise ConnectionError("balance down")
         return {"main": 0.0, "xyz": 0.0, "spot": self.avail, "available": self.avail, "withdrawable_xyz": 0.0}
 
     def sz_decimals(self, coin):
@@ -88,11 +97,23 @@ class FakeClient:
 
     def book(self, coin):
         m = self.mids[coin]
-        bid, ask = m * 0.9995, m * 1.0005
+        w = 0.3 if coin in self.wide else 0.0005
+        bid, ask = m * (1 - w), m * (1 + w)
         return {"bid": bid, "ask": ask, "bid_depth_usd": self.depth[coin], "ask_depth_usd": self.depth[coin]}
 
     def set_leverage(self, coin, lev):
+        self.lev_calls.append((coin, lev))
         self.leverage[coin] = lev
+        return self.lev_resp
+
+    def mark_px(self, coin):
+        return self.marks.get(coin)
+
+    def funding_rows(self, since_ms):
+        return list(self.funding)
+
+    def fill_for_cloid(self, coin, cloid_hex_, since_ms):
+        return self.cloid_fills.get(cloid_hex_)
 
     def _match(self, coin, is_buy, sz, px_, reduce_only):
         b = self.book(coin)
@@ -262,12 +283,19 @@ def test_partial_first_leg_sizes_second_leg_to_actual_fill(s):
     assert abs(-fc.pos[A] * bk["bid"] - fc.pos[B] * fc.book(B)["ask"]) <= 5.0
 
 
-def test_exception_after_fill_is_detected_by_position_delta_and_balanced(s):
+def test_exception_after_fill_without_price_is_unknown_then_adopted_by_reconcile(s):
     fc = FakeClient()
-    fc.raise_filled = {B}                       # 第二腿其实成交了但回包超时
-    out, _, _ = live_entry(s, fc)
-    assert out["entries"][0]["balanced"] is True
-    assert fc.pos[A] < 0 < fc.pos[B]
+    fc.raise_filled = {B}                       # 第二腿其实成交了但回包超时，且查不到真实成交价
+    out, data, now = live_entry(s, fc)
+    assert out["entries"][0].get("error") == "unknown_order_state"
+    fills = [r for r in Ledger(s.data, "pairs").all() if r["kind"] == "fill" and r["coin"] == B]
+    assert fills[-1].get("unknown") is True and fills[-1].get("px") is None      # 绝不把限价当成交价记账
+    assert px.get(s)["halt_entries"] is True
+    out2 = px.step(s, datetime.fromtimestamp(now.timestamp() + 60, timezone.utc), client=fc, data=data)
+    p = next(iter(pairs_state(s).values()))
+    assert not p["unknown"] and p["net"][B] == pytest.approx(fc.pos[B]) and p["closed"] is None     # 按交易所观察到的数量认领
+    assert any(r["kind"] == "fill" and r.get("resolves") and r["px_est"] for r in Ledger(s.data, "pairs").all())
+    assert out2["entries"] == []                # 仍然停开新仓，直到手动清除
 
 
 def test_exception_without_fill_unwinds_first_leg(s):
@@ -280,10 +308,16 @@ def test_exception_without_fill_unwinds_first_leg(s):
 
 def test_unknown_order_state_halts_entries_and_never_blind_reverses(s):
     class Blind(FakeClient):
+        down = False
+
         def position(self, coin):
-            if coin == B:
+            if coin == B and self.down:
                 raise ConnectionError("down")
             return super().position(coin)
+
+        def ioc(self, coin, *a, **k):
+            self.down = self.down or coin == B      # 发第二腿的同时，B 的持仓查询开始失败
+            return super().ioc(coin, *a, **k)
     fc = Blind()
     fc.raise_on = {B}
     out, _, _ = live_entry(s, fc)
@@ -298,9 +332,10 @@ def test_unknown_order_state_halts_entries_and_never_blind_reverses(s):
 # ---------------------------------------------------------------- 平仓
 def test_exit_is_reduce_only_our_size_only_manual_untouched(s):
     fc = FakeClient()
-    fc.pos = {A: -5.0, B: 3.0}                  # 手动仓位，与我们同向
     live_entry(s, fc)
     ours = {c: q for c, q in next(iter(pairs_state(s).values()))["net"].items()}
+    fc.pos[A] += -5.0                            # 开仓之后又手动加了与我们同向的仓位
+    fc.pos[B] += 3.0
     assert ours[A] < 0 < ours[B]
     n_before = len(fc.orders)
     data, now = make_data(tail=(0.0, 0.0))      # 价差收敛
@@ -516,3 +551,300 @@ def test_pairs_client_parses_ioc_response_and_hashes_cloid():
     c.ex.resp = {"status": "ok", "response": {"type": "order", "data": {"statuses": [{"error": "Order could not immediately match"}]}}}
     r = c.ioc("io:SNDK", True, 0.5, 121.0, False, "pairs-SNDK-1-2")
     assert r["filled_sz"] == 0.0 and "immediately" in r["error"]
+
+
+# ================================================================ 第 1 轮评审修复（每条一个测试）
+def ms(dt):
+    return int(dt.timestamp() * 1000)
+
+
+def later(now, seconds):
+    return datetime.fromtimestamp(now.timestamp() + seconds, timezone.utc)
+
+
+def pushes(monkeypatch):
+    got = []
+    monkeypatch.setattr(px.notify, "push", lambda settings, title, body, priority="default": got.append((title, body)) or True)
+    return got
+
+
+def seed_single_leg(s, fc, now):
+    """手工写账本：只有 A 腿成交（模拟两腿之间崩溃）。"""
+    led = Ledger(s.data, "pairs")
+    pid = "io_SNDK_xyz_SNDK-1-1"
+    led.append("open", pid, {"pair_id": pid, "pair_key": f"{A}|{B}", "a": A, "b": B, "sg": 1, "s0": 80.0, "thr": 40.0, "variant": "+5/conv0",
+                             "exit_mode": "conv0", "t_ms": ms(now) - 60_000, "bar_t": 1, "notional_target": 100.0,
+                             "rich_short": A, "cheap_long": B})
+    led.append("order", pid, {"pair_id": pid, "coin": A, "cloid": "pairs-x-1", "cloid_hex": px.cloid_hex("pairs-x-1"), "is_buy": False,
+                              "sz": 0.82, "px": 120.5, "reduce_only": False, "purpose": "entry", "pos_before": 0.0})
+    led.append("fill", pid, {"pair_id": pid, "coin": A, "cloid": "pairs-x-1", "signed_sz": -0.82, "px": 120.9, "fee_usd": 0.0})
+    fc.pos[A] = -0.82
+    return pid
+
+
+# 1. 对账：结果不明的配对绝不自动收尾；限频告警；认领交易所数量；交易所已无仓位 → 了结记亏
+def test_reconcile_unknown_pair_never_closed_as_no_position_and_alerts_are_rate_limited(s):
+    class Blind(FakeClient):
+        down = False
+
+        def position(self, coin):
+            if coin == B and self.down:
+                raise ConnectionError("down")
+            return super().position(coin)
+
+        def ioc(self, coin, *a, **k):
+            self.down = self.down or coin == B
+            return super().ioc(coin, *a, **k)
+    fc = Blind()
+    fc.raise_on = {B}
+    out, data, now = live_entry(s, fc)
+    pid = next(iter(pairs_state(s)))
+    for k in (1, 2, 3):
+        px.step(s, later(now, 60 * k + 600), client=fc, data=data)       # 都超过 5 分钟：旧逻辑会按 no_position 收尾
+    assert pairs_state(s)[pid]["closed"] is None and pairs_state(s)[pid]["unknown"]
+
+    def n_alerts():
+        return sum(1 for r in Ledger(s.data, "pairs").all() if r["kind"] == "alert" and "结果不明" in r["title"])
+    assert n_alerts() == 1                                                # 1 小时内只告警一次
+    px.step(s, later(now, 4400), client=fc, data=data)
+    assert n_alerts() == 2
+    assert px.get(s)["halt_entries"] is True
+
+
+def test_reconcile_exchange_flat_for_n_minutes_settles_books_loss_alerts_once(s):
+    fc = FakeClient()
+    out, data, now = live_entry(s, fc)
+    pid = next(iter(pairs_state(s)))
+    fc.pos = {}                                   # 被强平 / 手动平掉了
+    fc.mids[A] *= 1.01
+    px.step(s, later(now, 60), client=fc, data=data)
+    assert pairs_state(s)[pid]["closed"] is None  # 还没到 N 分钟：先观察
+    px.step(s, later(now, 60 * 7), client=fc, data=data)
+    p = pairs_state(s)[pid]
+    assert p["closed"]["reason"] == "no_position" and p["closed"]["pnl_usd"] < 0
+    n_settle = lambda: sum(1 for r in Ledger(s.data, "pairs").all() if r["kind"] == "alert" and "已了结" in r["title"])   # noqa: E731
+    assert n_settle() == 2                        # 两条腿各一次
+    px.step(s, later(now, 60 * 9), client=fc, data=data)
+    assert n_settle() == 2
+    assert len(fc.orders) == 2                    # 交易所没有仓位，除了开仓那两张什么都没发
+
+
+# 2. 单腿检测（含两腿之间崩溃）
+def test_single_leg_pair_is_unwound_immediately(s):
+    fc = FakeClient()
+    set_mode(s, "live")
+    data, now = make_data()
+    pid = seed_single_leg(s, fc, now)
+    out = px.step(s, now, client=fc, data=data)
+    assert out["exits"][0]["reason"] == "imbalance" and out["exits"][0]["closed"]
+    assert abs(fc.pos[A]) < 1e-9 and fc.orders[0]["reduce_only"] and fc.orders[0]["is_buy"]
+    assert pairs_state(s)[pid]["closed"] is not None
+
+
+# 3. 客户端 dex = 发现的 ∪ 账本里已有仓位；先管仓位再抓数据；抓数据失败仍然平仓
+def test_client_dexs_from_open_pairs_and_exits_managed_when_data_fails(s, monkeypatch):
+    fc = FakeClient()
+    out, data, now = live_entry(s, fc)
+    seen = []
+    monkeypatch.setattr(px, "_make_client", lambda settings, dexs: seen.append(sorted(dexs)) or fc)
+
+    def boom(*a, **k):
+        raise RuntimeError("data down")
+    monkeypatch.setattr(px, "load_data_limited", boom)
+    out = px.step(s, later(now, 25 * 3600), data=None)
+    assert seen and seen[0] == ["io", "xyz"]
+    assert out["exits"] and out["exits"][0]["reason"] == "max_hold" and "数据不可用" in out["error"]
+    assert abs(fc.pos[A]) < 1e-9 and abs(fc.pos[B]) < 1e-9
+
+
+# 4. 估值：盘口太宽不用中间价；退回最近成交价（stale）；有 mark 就用 mark
+def test_wide_book_mid_ignored_falls_back_to_last_fill_then_uses_mark(s, monkeypatch):
+    got = pushes(monkeypatch)
+    fc = FakeClient()
+    out, data, now = live_entry(s, fc)
+    fc.wide = {A}
+    fc.mids[A] *= 1.2                              # 要是用了这个中间价，空腿亏 20% → 触发止损
+    out = px.step(s, later(now, 60), client=fc, data=data)
+    assert out["exits"] == []
+    assert any("最近成交价" in t for t, _ in got)  # stale 告警
+    fc.marks[A] = fc.mids[A]                       # 交易所 mark 可用 → 用 mark，真实亏损显现
+    out = px.step(s, later(now, 120), client=fc, data=data)
+    assert out["exits"] and out["exits"][0]["reason"] == "per_pair_loss"
+
+
+# 5. 杠杆
+def test_leverage_error_response_aborts_entry(s):
+    fc = FakeClient()
+    fc.lev_resp = {"status": "err", "response": "nope"}
+    out, _, _ = live_entry(s, fc)
+    assert fc.orders == [] and out["entries"] == [] and not px.open_pairs(px.load_state(s))
+
+
+def test_entry_refused_when_exchange_already_has_position_on_coin(s):
+    fc = FakeClient()
+    fc.pos = {B: 3.0}                              # 手动仓位
+    out, _, _ = live_entry(s, fc)
+    assert fc.orders == [] and fc.lev_calls == [] and out["entries"] == []
+
+
+def test_one_live_pair_per_coin_even_if_exchange_shows_flat(s):
+    fc = FakeClient()
+    cfg_set(s, max_concurrent=2, max_total_gross_usd=400.0, cooldown_min=0)
+    out, data, now = live_entry(s, fc)
+    assert len(out["entries"]) == 1
+    fc.pos[A] = fc.pos[B] = 0.0                    # 交易所上看起来是 0，账本里该币仍被占用
+    n = len(fc.orders)
+    px.step(s, later(now, 400), client=fc, data=data)
+    assert [o for o in fc.orders[n:] if not o["reduce_only"]] == []
+
+
+# 6. pair_id 不撞
+def test_pair_id_contains_pair_key_and_counter(s):
+    cfg_set(s, allow=[], max_concurrent=2, max_total_gross_usd=400.0)
+    fc = FakeClient()
+    set_mode(s, "live")
+    data, now = make_data(allow_second=True)
+    px.step(s, now, client=fc, data=data)
+    ids = sorted(pairs_state(s))
+    assert len(ids) == 2 and len(set(ids)) == 2
+    assert any(i.startswith("io_NBIS_xyz_NBIS-") for i in ids) and any(i.startswith("io_SNDK_xyz_SNDK-") for i in ids)
+    assert sorted(i.rsplit("-", 1)[1] for i in ids) == ["1", "2"]
+
+
+# 7. 异常路径的成交价
+def test_exception_path_uses_actual_fill_px_when_queryable(s):
+    fc = FakeClient()
+    fc.raise_filled = {B}
+    fc.fill_for_cloid = lambda coin, h, t: (abs(fc.pos.get(coin, 0.0)), 120.77) if coin == B else None
+    out, _, _ = live_entry(s, fc)
+    assert out["entries"][0]["balanced"] is True
+    p = next(iter(pairs_state(s).values()))
+    assert p["last_px"][B] == 120.77 and not p["unknown"]
+    assert px.get(s)["halt_entries"] is False
+
+
+# 8. off / shadow + 有未平仓位：照常管理；切模式推送告警
+def test_off_mode_with_open_pairs_still_manages_exits_and_put_alerts(s, monkeypatch):
+    got = pushes(monkeypatch)
+    fc = FakeClient()
+    out, data, now = live_entry(s, fc)
+    px.put(s, mode="off")
+    assert any("还有 1 对没平" in t for t, _ in got)
+    n = len(fc.orders)
+    out = px.step(s, later(now, 25 * 3600), client=fc, data=data)
+    assert out["exits"] and out["exits"][0]["reason"] == "max_hold" and out["entries"] == []
+    assert abs(fc.pos[A]) < 1e-9 and abs(fc.pos[B]) < 1e-9
+    assert all(o["reduce_only"] for o in fc.orders[n:])
+
+
+def test_scheduler_keeps_job_while_pairs_open_even_if_mode_off(s):
+    from desk import scheduler
+    fc = FakeClient()
+    out, data, now = live_entry(s, fc)
+    px.put(s, mode="off")
+    t = datetime(2026, 10, 17, 12, 0, tzinfo=timezone.utc)
+    assert [k for k, _ in scheduler.due_jobs(t, s, set()) if k.startswith("pairs:")]
+
+
+# 9. 止损 / 超时出场后锁定
+def test_stop_out_writes_24h_lock(s):
+    fc = FakeClient()
+    out, data, now = live_entry(s, fc)
+    fc.mids[A] *= 1.06
+    px.step(s, later(now, 60), client=fc, data=data)
+    lk = px.load_state(s)["locks"][f"{A}|{B}"]
+    assert lk["reason"] == "per_pair_loss" and lk["until_ms"] - lk["t_ms"] == 24 * 3600_000
+
+
+def test_lock_blocks_reentry_until_spread_below_threshold(s):
+    fc = FakeClient()
+    set_mode(s, "live")
+    data, now = make_data()
+    key = f"{A}|{B}"
+    Ledger(s.data, "pairs").append("lock", key, {"pair_key": key, "reason": "max_hold", "t_ms": ms(now), "until_ms": ms(now) + 10 * 3600_000})
+    px.step(s, now, client=fc, data=data)
+    assert fc.orders == []                          # 尖峰信号还在，但被锁挡住
+    data3, now3 = make_data(tail=(0.0,))            # 价差回到门槛以内 → 解除
+    px.step(s, now3, client=fc, data=data3)
+    assert key not in px.load_state(s)["locks"]
+    assert fc.orders == []
+
+
+# 10. flock / 抓数据超时
+def test_step_is_serialized_by_flock(s):
+    import fcntl
+    fc = FakeClient()
+    set_mode(s, "live")
+    data, now = make_data()
+    with open(Path(s.data) / "state" / "pairs_step.lock", "a+") as lf:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        out = px.step(s, now, client=fc, data=data)
+    assert out.get("locked") is True and fc.orders == []
+    assert px.step(s, now, client=fc, data=data)["entries"]       # 锁放开后正常
+
+
+def test_data_timeout_does_not_block_exits(s, monkeypatch):
+    import time as _t
+    px._FUT.clear()
+    fc = FakeClient()
+    out, data, now = live_entry(s, fc)
+    monkeypatch.setattr(px, "load_data", lambda *a, **k: _t.sleep(1.0))
+    cfg_set(s, data_timeout_s=0.1)
+    t0 = _t.time()
+    out = px.step(s, later(now, 25 * 3600), client=fc, data=None)
+    assert _t.time() - t0 < 0.8 and "数据不可用" in out["error"]
+    assert out["exits"] and out["exits"][0]["reason"] == "max_hold"
+    _t.sleep(1.0)
+    px._FUT.clear()
+
+
+# 11. 资金费计入盈亏和止损
+def test_funding_paid_counts_toward_pair_loss(s):
+    fc = FakeClient()
+    out, data, now = live_entry(s, fc)
+    fc.funding = [{"coin": A, "usdc": -6.0, "szi": fc.pos[A], "time": ms(now) + 1000}]
+    out = px.step(s, later(now, 60), client=fc, data=data)
+    assert out["exits"] and out["exits"][0]["reason"] == "per_pair_loss"
+    assert next(iter(pairs_state(s).values()))["closed"]["pnl_usd"] < -4.0
+
+
+def test_funding_of_manual_position_is_not_charged_to_us(s):
+    fc = FakeClient()
+    out, data, now = live_entry(s, fc)
+    big = fc.pos[A] * 100                             # 交易所持仓是我们的 100 倍（几乎全是手动仓位）
+    fc.funding = [{"coin": A, "usdc": -60.0, "szi": big, "time": ms(now) + 1000}]
+    out = px.step(s, later(now, 60), client=fc, data=data)
+    assert out["exits"] == []                         # 我们那一份只分摊到约 −0.6，远小于止损
+    assert next(iter(pairs_state(s).values()))["closed"] is None
+
+
+# 12. 杂项
+def test_balance_failure_skips_entry(s):
+    fc = FakeClient()
+    fc.balance_raises = True
+    out, _, _ = live_entry(s, fc)
+    assert fc.orders == [] and out["entries"] == []
+
+
+def test_min_notional_checked_after_flooring_with_margin(s):
+    cfg_set(s, max_leg_notional_usd=10.2)             # 取整到 0.08 张 × 120 = 9.6 < 10.5
+    fc = FakeClient()
+    out, _, _ = live_entry(s, fc)
+    assert fc.orders == [] and out["entries"] == []
+
+
+def test_halt_realerts_daily_and_clear_halt_cli(s, monkeypatch):
+    got = pushes(monkeypatch)
+    px.put(s, halt_entries=True, halt_alert_ts=0, halt_reason="test")
+    fc = FakeClient()
+    set_mode(s, "live")
+    data, now = make_data()
+    px.step(s, now, client=fc, data=data)
+    assert sum("停开新仓" in t for t, _ in got) == 1
+    px.step(s, later(now, 60), client=fc, data=data)
+    assert sum("停开新仓" in t for t, _ in got) == 1
+    px.step(s, later(now, 25 * 3600), client=fc, data=data)
+    assert sum("停开新仓" in t for t, _ in got) == 2
+    assert fc.orders == []
+    assert px.main(["--clear-halt"]) == 0
+    assert px.get(s)["halt_entries"] is False
