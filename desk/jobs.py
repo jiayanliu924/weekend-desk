@@ -151,8 +151,25 @@ def v2_history(settings, led: Ledger, w: Weekend, backfill_rows: list[dict] | No
     return out
 
 
+_BACKFILL_MEMO: dict[tuple, list[dict]] = {}
+
+
 def _v2_backfill_rows(settings, fam: str, w: Weekend) -> list[dict]:
-    """同族每个合约的回补周末行（strategy_lab 同一套：只读本地缓存，15m 优先、退回 1h），只取在本周末决策前已平仓的。"""
+    """同族每个合约的回补周末行（strategy_lab 同一套：只读本地缓存，15m 优先、退回 1h），只取在本周末决策前已平仓的。
+
+    2026-10-18：同一族、同一决策时刻的结果只算一次（以前每锁一个合约就把全族 17 个合约的 K 线缓存重读一遍，
+    17 个合约串行锁要 ~1 分钟/个，锁完已过下单窗口）。结果只依赖本地缓存和决策时刻，同一周末内不会变。"""
+    key = (str(settings.data), fam, w.decision.isoformat())
+    if key in _BACKFILL_MEMO:
+        return [dict(r) for r in _BACKFILL_MEMO[key]]
+    out = _v2_backfill_rows_uncached(settings, fam, w)
+    if len(_BACKFILL_MEMO) > 16:
+        _BACKFILL_MEMO.clear()
+    _BACKFILL_MEMO[key] = [dict(r) for r in out]
+    return out
+
+
+def _v2_backfill_rows_uncached(settings, fam: str, w: Weekend) -> list[dict]:
     from . import strategy_lab as sl
     out = []
     for inst in settings.instruments:

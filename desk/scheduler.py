@@ -220,6 +220,26 @@ def _safe_meeting(settings, reason):
         notify.push(settings, "Agent 会议出错", str(e)[:300])
 
 
+def entry_due_now(wk, now: datetime) -> bool:
+    """和 due_jobs 里 live_entry 的窗口一模一样：决策时刻 ≤ now < 重开前 2 分钟。"""
+    return wk is not None and wk.decision <= now < wk.resume - timedelta(minutes=2)
+
+
+async def _entry_right_after_lock(lock_key: str, wk, settings, done: set) -> None:
+    ek = lock_key[: -len(":lock")] + ":live_entry"
+    if ek in done or not entry_due_now(wk, datetime.now(timezone.utc)):
+        return
+    done.add(lock_key)          # live_entry 的前提（和 due_jobs 一致）：先记 lock 已完成，再下单
+    try:
+        log.info("run job %s (right after lock)", ek)
+        await asyncio.to_thread(run_job, ek, wk, settings)
+    except Exception as e:  # noqa: BLE001
+        log.exception("job %s failed: %s", ek, e)
+        notify.push(settings, "任务出错", f"{ek}: {e}", priority="high")
+    done.add(ek)
+    jobs.save_state(settings, done)
+
+
 async def job_loop(settings):
     done = jobs.load_state(settings)
     while True:
@@ -235,6 +255,8 @@ async def job_loop(settings):
                 rec = await asyncio.to_thread(fn, key, wk, settings)
                 if key.endswith(":lock") and not key.startswith("opt:") and isinstance(rec, dict):
                     locks.append(rec)
+                    # 2026-10-18：锁完这一个合约就立刻下它的单，不等全部合约锁完（以前要等下一轮循环，锁得慢就错过窗口）
+                    await _entry_right_after_lock(key, wk, settings, done)
                 elif key.endswith(":outcome") and isinstance(rec, dict) and not key.startswith("opt:"):
                     outs.append((wk, rec))
             except Exception as e:  # noqa: BLE001
