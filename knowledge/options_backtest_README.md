@@ -110,6 +110,22 @@
 
 一句话：**DVOL 回测只能当方向参考；真钱前必须有真实报价的证据。**
 
+## 真实成交价回测（`desk/options_real_backtest.py`，2026-10-18）
+
+DVOL 口径的问题（上一节）的正解：用 Deribit 历史接口（history.deribit.com，`get_last_trades_by_currency_and_time` /
+`get_last_trades_by_instrument_and_time`，`include_old=true`）拿已到期周期权的**真实成交**。
+
+- 周五 08:00 UTC 到期；入场 周五 08:00（7DTE）/ 周一 08:00（4DTE），报价 = 入场前 60 分钟成交 VWAP（不含入场后），没成交就跳过。
+- 有限风险结构：卖铁鹰（15Δ/5Δ、10Δ/5Δ）、卖铁蝶（平值/10Δ 翼）、买跨式；卖宽跨式 15Δ 只作参考。持有到期 + 50% 止盈两个变体。
+- 费用每腿 0.03% 标的封顶 12.5% 权利金 + 滑点 2/5/10%（默认 5%）+ 交割费。
+- 报告：按结构 × 年份、事件周 vs 安静周、滑点敏感性；含「历史最大回撤 ≤ 20% 的每周风险占比」和 bootstrap 52 周跌穿 −50% 的概率。
+- 输出 `data/reports/options_real_backtest_BTC.md` + `_summary.json`（`method = deribit_real_trades`）；缓存 `data/options_cache/real/`。
+- **没有合成模式**。沙箱连不上（代理 403）→ 退出码 2 并提示在服务器上跑；之后 `--offline` 只用缓存重算。
+
+```bash
+python3 -m desk.options_real_backtest --currency BTC --since 2023-01-01
+```
+
 ## 怎么跑
 
 **沙箱 / 本机连不上 deribit.com**（代理 403）：程序会检测到，打印"请到 bot 服务器上跑"并退出码 2。不会偷偷用合成数据。
