@@ -25,3 +25,4 @@ bash /opt/weekend-desk/setup_web.sh
 (cd /opt/weekend-desk && ./venv/bin/python -m desk refreeze || true)
 sleep 30
 ./venv/bin/python -m desk status
+(cd /opt/weekend-desk && nohup ./venv/bin/python -m desk.labs_auto > /opt/weekend-desk/data/labs_auto.log 2>&1 &)

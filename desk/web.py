@@ -195,7 +195,7 @@ canvas{max-width:100%}
 @media (prefers-reduced-motion:reduce){*{transition:none!important}}
 """
 
-TABS = [("/", "概览"), ("/agents", "Agent 讨论室"), ("/day", "每日记录"), ("/weekends", "周末预测"), ("/options", "期权研究"),
+TABS = [("/", "概览"), ("/agents", "Agent 讨论室"), ("/day", "每日记录"), ("/weekends", "周末预测"), ("/options", "期权研究"), ("/labs", "赚钱排行"),
         ("/money", "放真钱会怎样"), ("/history", "历史回测"), ("/guide", "这是什么"), ("/qa", "测试"), ("/settings", "设置")]
 
 
@@ -1480,6 +1480,48 @@ def settings_key(req: Request, key: str = Form(...)):
         else:
             msg = "没保存：" + msg
     return RedirectResponse("/settings?" + urlencode({"msg": msg}), status_code=303)
+
+
+@app.get("/labs", response_class=HTMLResponse)
+def labs_page(req: Request):
+    if (r := _guard(req)):
+        return r
+    from . import labs_auto as la
+    d = la.load_latest(S)
+    body = """<h1>赚钱排行</h1>
+<p class="sub">三条思路用历史数据各自回测一遍，按“同样风险下谁赚得多”排名。服务器每周一自动跑，不用手动操作。都是回测，不是真钱，也不保证未来。</p>"""
+    if not d:
+        body += '<div class="card"><p>还没跑过。服务器每周一会自动跑一次；更新代码后也会跑一次。</p></div>'
+        return page(req, "/labs", "赚钱排行", body)
+
+    def c(x, nd=1, sign=False):
+        return "—" if not isinstance(x, (int, float)) else (f"{x:+.{nd}f}" if sign else f"{x:.{nd}f}")
+    rows = ""
+    for r in d.get("ranking", []):
+        g = r.get
+        cap = _n(g("capacity_usd"), 0) if g("capacity_usd") else "—"
+        ub = g("unit") == "risk_budget"
+        lev = c(g("leverage"), 2) + ("（占每周最大亏损预算的比例）" if ub else "")
+        ret = c(g("ret_at_lev_pct"), 2, True) + ("（占预算，非本金）" if ub else "")
+        ok = bool(g("passes"))
+        rows += (f"<tr><td>第{E(str(g('rank', '')))}名 {E(str(g('line', '')))}<br><span class='ev'>{E(str(g('variant', '')))}</span></td>"
+                 f"<td>{E(str(g('n_weeks', '—')))}</td><td>{c(g('mean_wk_pct'), 2, True)}</td><td>{c(g('sd_wk_pct'), 2)}</td>"
+                 f"<td>{c(g('ratio'), 2)}</td><td>{c(g('max_dd_pct'), 1)}</td><td>{lev}</td>"
+                 f"<td>{ret}</td><td>{c(g('p_ruin_pct'), 1)}</td>"
+                 f"<td>{cap}</td>"
+                 f"<td class='{'good' if ok else 'bad'}'>{'过' if ok else '没过'}</td></tr>")
+    errs = "".join(f"<li>{E(la.LINES.get(k, k))}：{E(v)}</li>" for k, v in (d.get("errors") or {}).items())
+    heads = "".join(f"<th>{E(h)}</th>" for h, _ in la.COLUMNS)
+    empty = "<tr><td colspan=11>三条线这次都没跑出结果</td></tr>"
+    when = E(str(d.get("generated_at", ""))[:16].replace("T", " "))
+    body += (f'<p class="ev">更新于 {when} UTC</p>'
+             f'<div class="card" style="overflow-x:auto"><table><tr>{heads}</tr>{rows or empty}</table></div>')
+    if errs:
+        body += f'<h2>这次没跑出来的</h2><ul>{errs}</ul>'
+    body += ('<h2>每一列是什么意思</h2><ul>'
+             + "".join(f"<li><b>{E(h)}</b>：{E(t)}</li>" for h, t in la.COLUMNS)
+             + '</ul><p class="sub">杠杆和“样本外”都是在同一段历史里挑的，实际几乎一定比这里差；没过门槛的不要放真钱。</p>')
+    return page(req, "/labs", "赚钱排行", body)
 
 
 @app.get("/qa", response_class=HTMLResponse)

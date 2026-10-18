@@ -923,11 +923,15 @@ def build_rows(settings, now: datetime, since: date | None, fetch: bool, names=N
 
 
 def run(settings, since: date | None = None, warmup: int = 8, notional: float = 1000.0, half_spread: float = 2.0,
-        fetch: bool = True, out: Path | None = None, now: datetime | None = None, names=None) -> str:
+        fetch: bool = True, out: Path | None = None, now: datetime | None = None, names=None,
+        capture: dict | None = None) -> str:
+    """capture：传一个空 dict，会把 v3 结果放进 capture["r3"]（给 labs_auto 用，不影响报告）。"""
     now = now or datetime.now(UTC)
     rows, sources, c1h = build_rows(settings, now, since, fetch, names)
     res = evaluate_rows(rows, settings, warmup, notional, half_spread)
     r3 = evaluate_v3(rows, settings, warmup, half_spread) if rows else None
+    if capture is not None:
+        capture["r3"] = r3
     legacy = legacy_check(settings, c1h)
     md = report_md(settings, res, rows, sources, legacy, since, r3)
     out = out or Path(settings.data) / "reports" / "strategy_lab.md"
