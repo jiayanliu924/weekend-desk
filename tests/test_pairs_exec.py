@@ -30,6 +30,16 @@ def s(tmp_path, monkeypatch):
     return st
 
 
+@pytest.fixture(autouse=True)
+def _fast(monkeypatch):
+    sleeps = []
+    monkeypatch.setattr(px, "_sleep", lambda x: sleeps.append(x))
+    px._FUT.clear()
+    px._CLIENT.clear()
+    px._DEXSET.clear()
+    return sleeps
+
+
 def set_mode(s, mode):
     px.put(s, mode=mode)
 
@@ -298,12 +308,14 @@ def test_exception_after_fill_without_price_is_unknown_then_adopted_by_reconcile
     assert out2["entries"] == []                # 仍然停开新仓，直到手动清除
 
 
-def test_exception_without_fill_unwinds_first_leg(s):
+def test_exception_without_fill_is_unknown_not_confirmed_nofill_then_single_leg_unwound(s):
     fc = FakeClient()
-    fc.raise_on = {B}                           # 第二腿超时且没成交
-    out, _, _ = live_entry(s, fc)
-    assert out["entries"][0]["unwound"] is True
-    assert abs(fc.pos.get(A, 0.0)) < 1e-9
+    fc.raise_on = {B}                           # 第二腿回包超时，持仓没变、查不到成交
+    out, data, now = live_entry(s, fc)
+    assert out["entries"][0].get("error") == "unknown_order_state"       # 不再当成"确认没成交"
+    assert px.get(s)["halt_entries"] is True and fc.pos[A] < 0
+    px.step(s, later(now, 60), client=fc, data=data)                      # 对账：持仓没变 → 认领为 0；单腿 → 立即回补
+    assert abs(fc.pos[A]) < 1e-9 and next(iter(pairs_state(s).values()))["closed"] is not None
 
 
 def test_unknown_order_state_halts_entries_and_never_blind_reverses(s):
@@ -848,3 +860,132 @@ def test_halt_realerts_daily_and_clear_halt_cli(s, monkeypatch):
     assert fc.orders == []
     assert px.main(["--clear-halt"]) == 0
     assert px.get(s)["halt_entries"] is False
+
+
+# ================================================================ 第 2 轮评审修复
+# 1. live 模式当日亏损止损无条件在开仓之前
+def test_daily_stop_runs_in_live_mode_even_with_no_open_pairs(s):
+    fc = FakeClient()
+    set_mode(s, "live")
+    data, now = make_data()
+    led = Ledger(s.data, "pairs")
+    led.append("open", "old-1", {"pair_id": "old-1", "pair_key": f"{A}|{B}", "a": A, "b": B, "sg": 1, "s0": 80.0, "thr": 40.0, "variant": "+5/conv0",
+                                 "exit_mode": "conv0", "t_ms": ms(now) - 3600_000, "bar_t": 1, "notional_target": 100.0, "rich_short": A, "cheap_long": B})
+    led.append("closed", "old-1", {"pair_id": "old-1", "reason": "per_pair_loss", "pnl_usd": -9.0, "t_ms": ms(now) - 1000})
+    out = px.step(s, now, client=fc, data=data)
+    assert out.get("daily_stop") is True and px.get(s)["mode"] == "off"
+    assert fc.orders == [] and out["entries"] == []
+
+
+# 2. 异常路径：有界重查
+def test_send_exception_repolls_bounded_and_picks_up_late_fill(s, _fast):
+    fc = FakeClient()
+    fc.raise_filled = {B}
+    calls = []
+
+    def late(coin, h, t):
+        calls.append(1)
+        return (abs(fc.pos.get(coin, 0.0)), 120.5) if len(calls) >= 2 and coin == B else None
+    fc.fill_for_cloid = late
+    # 持仓变了会提前跳出重查；这里让持仓读数保持不变来逼它重查：把 position 对 B 固定为 0
+    real_pos = fc.position
+    fc.position = lambda coin: 0.0 if (coin == B and len(calls) < 2) else real_pos(coin)
+    out, _, _ = live_entry(s, fc)
+    assert len(calls) == 2 and _fast == [2.0]                          # 第二次重查拿到真实成交，中间等了 2s
+    p = next(iter(pairs_state(s).values()))
+    assert p["last_px"][B] == 120.5 and not p["unknown"] and px.get(s)["halt_entries"] is False
+
+
+def test_send_exception_nothing_found_after_bounded_window_is_unknown(s, _fast):
+    fc = FakeClient()
+    fc.raise_on = {B}
+    out, _, _ = live_entry(s, fc)
+    assert _fast == [2.0, 2.0]                                          # 3 次尝试 = 2 次等待，有界
+    assert out["entries"][0]["error"] == "unknown_order_state" and px.get(s)["halt_entries"] is True
+
+
+def test_reconcile_alerts_and_halts_on_exposure_beyond_ledger_after_recent_order(s):
+    fc = FakeClient()
+    out, data, now = live_entry(s, fc)
+    fc.pos[B] += 7.0                                                     # 账本之外多出来的仓位
+    px.step(s, later(now, 60), client=fc, data=data)
+    assert px.get(s)["halt_entries"] is True
+    assert any(r["kind"] == "alert" and "超出账本" in r["title"] for r in Ledger(s.data, "pairs").all())
+    px.step(s, later(now, 120), client=fc, data=data)
+    assert sum(1 for r in Ledger(s.data, "pairs").all() if r["kind"] == "alert" and "超出账本" in r["title"]) == 1    # 限频
+
+
+# 3. 超时后才完成的抓数据结果会被复用
+def test_late_finished_load_is_reused_instead_of_erroring(s, monkeypatch):
+    import threading
+    data, now = make_data()
+    gate = threading.Event()
+
+    def slow(*a, **k):
+        gate.wait(2.0)
+        return data
+    monkeypatch.setattr(px, "load_data", slow)
+    cfg_set(s, data_timeout_s=0.05)
+    cf = px.cfg(s)
+    with pytest.raises(TimeoutError):
+        px.load_data_limited(s, ms(now), cf)
+    with pytest.raises(TimeoutError):                                    # 还没完成：不重复提交
+        px.load_data_limited(s, ms(now), cf)
+    gate.set()
+    px._FUT["f"].result(timeout=2.0)
+    assert px.load_data_limited(s, ms(now), cf) is data                 # 完成了：直接用，不再报错 / 重提交
+
+
+# 4. 客户端缓存：一次建好，shadow 同一个 dex 集合
+def test_pairs_client_built_once_for_same_dexs_and_shadow_uses_discovered(s, monkeypatch):
+    built = []
+
+    class FakePC(FakeClient):
+        def __init__(self, a, k, dexs):
+            super().__init__()
+            built.append(sorted(dexs))
+    monkeypatch.setattr(autotrade, "_client_factory", None)
+    monkeypatch.setattr(autotrade, "creds", lambda: ("0x" + "1" * 40, "2" * 64))
+    monkeypatch.setattr(px, "PairsClient", FakePC)
+    set_mode(s, "shadow")
+    data, now = make_data()
+    for k in range(3):
+        px.step(s, later(now, 60 * k), data=data)
+    assert built == [["io", "xyz"]]
+
+
+# 5. 一对出错不影响其他对和当日止损
+def test_one_pair_error_does_not_skip_others_or_daily_stop(s, monkeypatch):
+    cfg_set(s, allow=[], max_concurrent=2, max_total_gross_usd=400.0)
+    fc = FakeClient()
+    set_mode(s, "live")
+    data, now = make_data(allow_second=True)
+    px.step(s, now, client=fc, data=data)
+    assert len(pairs_state(s)) == 2
+    real = px._reconcile
+
+    def flaky(ctx, pid, out):
+        if "SNDK" in pid:
+            raise RuntimeError("boom")
+        return real(ctx, pid, out)
+    monkeypatch.setattr(px, "_reconcile", flaky)
+    out = px.step(s, later(now, 25 * 3600), client=fc, data=data)
+    assert [e["pair_id"] for e in out["exits"]] and all("NBIS" in e["pair_id"] for e in out["exits"])
+    assert "day_pnl_usd" in out                                          # _daily_stop 仍然执行了
+    assert any(r["kind"] == "alert" and "管理出错" in r["title"] for r in Ledger(s.data, "pairs").all())
+
+
+# 6. 当日止损告警限频
+def test_daily_stop_alert_rate_limited_while_unresolved(s, monkeypatch):
+    got = pushes(monkeypatch)
+    cfg_set(s, daily_loss_stop_usd=3.0, max_pair_loss_usd=100.0)
+    fc = FakeClient()
+    out, data, now = live_entry(s, fc)
+    fc.mids[A] *= 1.06
+    fc.reject = {A, B}                                                   # 平不掉
+    for k in (1, 2, 3):
+        px.step(s, later(now, 60 * k), client=fc, data=data)
+    n = lambda: sum("当日亏损止损触发" in t for t, _ in got)   # noqa: E731
+    assert n() == 1 and px.get(s)["mode"] == "live"
+    px.step(s, later(now, 3700), client=fc, data=data)
+    assert n() == 2

@@ -61,7 +61,11 @@ DEFAULTS = {
     "data_timeout_s": 45.0,           # 抓 K 线 / 发现数据的最长等待
     "lock_h": 24.0,                   # 止损 / 超时出场后锁定该配对多久
     "alert_every_min": 60.0,          # 同类告警的最短间隔
+    "repoll_tries": 3,                # 下单回包异常后，重查成交 / 持仓的次数
+    "repoll_s": 2.0,                  # 每次重查之间等多久
+    "data_reuse_s": 600.0,            # 超时后才完成的抓数据结果，多久之内还能用
 }
+_sleep = time.sleep                   # 测试里替换
 
 
 # ------------------------------------------------------------------ 模式开关（和 autotrade 的 live.json 分开）
@@ -202,6 +206,7 @@ class PairsClient(autotrade.Client):
 
 
 _CLIENT: dict = {}
+_DEXSET: set = set()      # 只增不减：客户端按它的排序结果缓存，dex 集合变了才重建（每次变化只建一次）
 
 
 def _make_client(settings, dexs: list[str]):
@@ -210,7 +215,8 @@ def _make_client(settings, dexs: list[str]):
     a, k = autotrade.creds()
     if not (autotrade.valid_address(a) and autotrade.valid_key(k)):
         raise RuntimeError("还没有在设置里填 Hyperliquid 钱包地址和 API 私钥")
-    key = (a, tuple(sorted(set(dexs))))
+    _DEXSET.update(d for d in dexs if d)
+    key = (a, tuple(sorted(_DEXSET)))
     if _CLIENT.get("key") != key:          # 每分钟调用一次，别每次都重建（重建会打一堆 meta 请求）
         _CLIENT.update(key=key, c=PairsClient(a, k, list(key[1])))
     return _CLIENT["c"]
@@ -435,34 +441,37 @@ def _send(ctx: Ctx, pair_id: str, coin: str, is_buy: bool, sz: float, px: float,
         before = None
     ctx.led.append("order", pair_id, {"pair_id": pair_id, "coin": coin, "cloid": cloid, "cloid_hex": cloid_hex(cloid),
                                       "is_buy": is_buy, "sz": sz, "px": px, "reduce_only": reduce_only, "purpose": purpose,
-                                      "pos_before": before})
+                                      "pos_before": before, "t_ms": ctx.now_ms})
     sgn = 1.0 if is_buy else -1.0
     fee = ctx.cf["fee_bps"] / 1e4
     try:
         r = ctx.c.ioc(coin, is_buy, sz, px, reduce_only, cloid)
     except Exception as e:  # noqa: BLE001
         log.exception("order exception")
-        after = None
-        try:
-            after = float(ctx.c.position(coin))
-        except Exception:  # noqa: BLE001
-            pass
-        got = None
-        fn = getattr(ctx.c, "fill_for_cloid", None)
-        if fn:
+        got, after = None, None
+        for attempt in range(max(1, int(ctx.cf["repoll_tries"]))):
+            if attempt:
+                _sleep(float(ctx.cf["repoll_s"]))
+            fn = getattr(ctx.c, "fill_for_cloid", None)
+            if fn:
+                try:
+                    got = fn(coin, cloid_hex(cloid), ctx.now_ms - HOUR_MS)
+                except Exception:  # noqa: BLE001
+                    got = None
+            if got and got[0] and got[1]:
+                break
             try:
-                got = fn(coin, cloid_hex(cloid), ctx.now_ms - HOUR_MS)
+                after = float(ctx.c.position(coin))
             except Exception:  # noqa: BLE001
-                got = None
+                after = None
+            if before is not None and after is not None and abs(after - before) > EPS:
+                break          # 持仓变了但查不到成交价：不再等，交给对账认领
         if got and got[0] and got[1]:
             f = min(float(got[0]), sz)
             ctx.led.append("fill", pair_id, {"pair_id": pair_id, "coin": coin, "cloid": cloid, "signed_sz": sgn * f, "px": float(got[1]),
                                              "purpose": purpose, "fee_usd": fee * f * float(got[1]), "error": f"异常后按 cloid 查到真实成交：{e}"[:200]})
             return f
-        if before is not None and after is not None and abs(after - before) < EPS:
-            ctx.led.append("fill", pair_id, {"pair_id": pair_id, "coin": coin, "cloid": cloid, "signed_sz": 0.0, "px": None,
-                                             "purpose": purpose, "fee_usd": 0.0, "error": f"异常后持仓前后不变，按没成交：{e}"[:200]})
-            return 0.0
+        # 持仓没变 + 查不到成交 ≠ 确认没成交（回包丢了、成交可能延迟可见）：一律记为"结果不明"，停开新仓，交给对账
         ctx.led.append("fill", pair_id, {"pair_id": pair_id, "coin": coin, "cloid": cloid, "signed_sz": 0.0, "unknown": True,
                                          "observed_delta": None if before is None or after is None else after - before,
                                          "error": str(e)[:200]})
@@ -623,16 +632,42 @@ _FUT: dict = {}
 _EXEC = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="pairs-data")
 
 
+def _run_load(settings, now_ms, cf):
+    d = load_data(settings, now_ms, cf)
+    if isinstance(d, dict):
+        _FUT["res"] = (time.time(), d)
+    return d
+
+
+def _fresh_result(cf):
+    r = _FUT.get("res")
+    return r[1] if r and time.time() - r[0] < float(cf["data_reuse_s"]) else None
+
+
 def load_data_limited(settings, now_ms: int, cf: dict) -> dict:
-    """抓数据放在后台线程，最多等 data_timeout_s。上一次还没结束就直接报错（不堆线程），已有仓位的管理不受影响。"""
+    """抓数据放在后台线程，最多等 data_timeout_s。上一次超时的抓取如果后来完成了（且不到 data_reuse_s），直接用它的结果；
+    还没完成就不再提交新的（不堆线程），有可用的旧结果就用旧的，否则报错。已有仓位的管理不受影响。"""
     f = _FUT.get("f")
-    if f is not None and not f.done():
-        raise TimeoutError("上一次数据抓取还没结束")
-    f = _EXEC.submit(load_data, settings, now_ms, cf)
+    if f is not None and _FUT.get("orphan"):
+        if f.done():
+            _FUT["orphan"] = False
+            d = _fresh_result(cf)
+            if d is not None and f.exception() is None:
+                return d
+        else:
+            d = _fresh_result(cf)
+            if d is not None:
+                return d
+            raise TimeoutError("上一次数据抓取还没结束")
+    f = _EXEC.submit(_run_load, settings, now_ms, cf)
     _FUT["f"] = f
     try:
         return f.result(timeout=float(cf["data_timeout_s"]))
     except concurrent.futures.TimeoutError as e:
+        _FUT["orphan"] = True
+        d = _fresh_result(cf)
+        if d is not None:
+            return d
         raise TimeoutError(f"抓数据超过 {cf['data_timeout_s']}s") from e
 
 
@@ -858,6 +893,18 @@ def _reconcile(ctx: Ctx, pid: str, out: dict) -> bool:
             _alert_limited(ctx, f"unknown-{pid}", f"配对有结果不明的订单，保持打开：{o['pair_key']}",
                            f"未解决 cloid：{p['unknown'][:5]}。账本净仓 {p['net']}，交易所 {E}。已停开新仓，不会自动收尾；请核对后手动处理。", pid)
             return False
+    for coin in coins:     # 交易所持仓超过"开仓前基线 + 账本净仓位"，且最近 1 小时我们在这个币上发过单 → 告警 + 停开新仓
+        e = E[coin]
+        mine = [od for od in st["orders"].values() if od["coin"] == coin and od.get("pair_id") == pid]
+        recent = [od for od in st["orders"].values() if od["coin"] == coin and ctx.now_ms - (od.get("t_ms") or 0) <= HOUR_MS]
+        if e is None or not mine or not recent or mine[0].get("pos_before") is None:
+            continue
+        excess = e - (mine[0]["pos_before"] + p["net"].get(coin, 0.0))
+        if abs(excess) > max(1e-6, 0.01 * p["peak"].get(coin, 0.0)):
+            _halt(ctx, f"{coin} 交易所持仓超出账本解释")
+            _alert_limited(ctx, f"excess-{pid}-{coin}", f"配对对账：{coin} 交易所持仓超出账本能解释的部分",
+                           f"交易所 {e:+.6g}，开仓前基线 {mine[0]['pos_before']:+.6g} + 账本 {p['net'].get(coin, 0.0):+.6g}，多出 {excess:+.6g}"
+                           "（手动单？还是我们有没记上的成交？）。已停开新仓，请核对。", pid)
     for coin in coins:
         L, e = p["net"].get(coin, 0.0), E[coin]
         if e is None or abs(L) < EPS:
@@ -884,11 +931,20 @@ def _reconcile(ctx: Ctx, pid: str, out: dict) -> bool:
 
 
 def _manage(ctx: Ctx, out: dict):
-    """阶段一（不需要行情数据）：对账 → 单腿 / 失衡 → 止损 / 超时。"""
-    cf, now_ms = ctx.cf, ctx.now_ms
+    """阶段一（不需要行情数据）：逐对管理。一对出错（异常）不影响其他对，也不影响后面的当日止损；出错告警（限频）。"""
     for pid in list(open_pairs(load_state(ctx.settings))):
+        try:
+            _manage_one(ctx, pid, out)
+        except Exception as e:  # noqa: BLE001
+            log.exception("manage %s failed", pid)
+            _alert_limited(ctx, f"manage-err-{pid}", f"配对管理出错（其他配对不受影响）：{pid}", f"{type(e).__name__}: {e}"[:300], pid)
+
+
+def _manage_one(ctx: Ctx, pid: str, out: dict):
+    cf, now_ms = ctx.cf, ctx.now_ms
+    if True:
         if not _reconcile(ctx, pid, out):
-            continue
+            return
         p = load_state(ctx.settings)["pairs"][pid]
         o = p["open"]
         legs = [c for c in _pair_coins(o) if abs(p["net"].get(c, 0.0)) > EPS]
@@ -896,7 +952,7 @@ def _manage(ctx: Ctx, out: dict):
         if not reason and not legs:
             pnl, _ = ctx.pair_pnl(p)
             ctx.led.append("closed", pid, {"pair_id": pid, "reason": "no_position", "pnl_usd": round(pnl, 4), "t_ms": now_ms})
-            continue
+            return
         pnl, stale = ctx.pair_pnl(p)
         if stale:
             _alert_limited(ctx, f"stale-{pid}", f"配对估值用了最近成交价（行情不可用 / 盘口太宽）：{o['pair_key']}",
@@ -952,8 +1008,9 @@ def _daily_stop(ctx: Ctx, out: dict) -> bool:
         put(ctx.settings, mode="off")
     else:
         _halt(ctx, "当日亏损止损，仍有仓位没平掉")
-    notify.push(ctx.settings, "配对自动下单：当日亏损止损触发" + ("，已全部平仓并切回 off" if not left else "，仍有仓位没平掉！"),
-                f"今日合计 ${realized + unreal:.2f}，上限 ${ctx.cf['daily_loss_stop_usd']:.0f}", priority="max")
+    if left == 0 or _rate_ok(ctx, "dailystop"):      # 还没平干净时每小时最多一次
+        notify.push(ctx.settings, "配对自动下单：当日亏损止损触发" + ("，已全部平仓并切回 off" if not left else "，仍有仓位没平掉！"),
+                    f"今日合计 ${realized + unreal:.2f}，上限 ${ctx.cf['daily_loss_stop_usd']:.0f}", priority="max")
     out["daily_stop"] = True
     return True
 
@@ -985,23 +1042,19 @@ def _step(settings, now: datetime, client, data) -> dict:
     cf = cfg(settings)
     now_ms = int(now.timestamp() * 1000)
     c = client
-    if c is None:
+    if c is None and has_pos:      # 有未平仓位才需要先连交易所；没有仓位的话等拿到发现的 dex 之后一次建好
         try:
-            c = _make_client(settings, sorted(open_dexs(st)))      # 先只用"已有仓位"涉及的 dex；开新仓前再按发现结果补全
+            c = _make_client(settings, sorted(open_dexs(st)))
         except Exception as e:  # noqa: BLE001
-            if mode == "live" or has_pos:
-                notify.push(settings, "配对自动下单无法连接交易所" + ("（还有未平仓位！）" if has_pos else ""), str(e)[:300], priority="max")
-                out["error"] = str(e)[:300]
-                return out
-            c = None
+            notify.push(settings, "配对自动下单无法连接交易所（还有未平仓位！）", str(e)[:300], priority="max")
+            out["error"] = str(e)[:300]
+            return out
     ctx = Ctx(settings, c, cf, now_ms, mode)
-    # ---- 阶段一：已有仓位的管理，先于任何行情数据
+    # ---- 阶段一：已有仓位的管理，先于任何行情数据；live 模式下当日亏损止损无条件在任何开仓之前检查
     if has_pos:
-        if c is None:
-            return out
         _manage(ctx, out)
-        if _daily_stop(ctx, out):
-            return out
+    if (has_pos or mode == "live") and _daily_stop(ctx, out):
+        return out
     # ---- 抓数据（有超时；失败不影响上面的管理）
     if data is None:
         try:
@@ -1016,17 +1069,18 @@ def _step(settings, now: datetime, client, data) -> dict:
             return out
     if mode == "off":
         return out
-    if mode == "shadow":
-        return _step_shadow(ctx, data, out)
-    # ---- 开新仓（live）：客户端补全发现到的 dex
+    # 客户端的 dex = 已有仓位 ∪ 发现到的（shadow 和 live 用同一个集合；集合不变就复用缓存的客户端）
     if client is None:
         try:
-            c = _make_client(settings, sorted(open_dexs(load_state(settings)) | {_dex_of(p[k]) for p in data["pairs"] for k in ("a", "b")}))
+            ctx.c = _make_client(settings, sorted(open_dexs(load_state(settings)) | {_dex_of(p[k]) for p in data["pairs"] for k in ("a", "b")}))
         except Exception as e:  # noqa: BLE001
-            notify.push(settings, "配对自动下单无法连接交易所", str(e)[:300], priority="high")
-            out["error"] = str(e)[:300]
-            return out
-        ctx.c = c
+            if mode == "live":
+                notify.push(settings, "配对自动下单无法连接交易所", str(e)[:300], priority="high")
+                out["error"] = str(e)[:300]
+                return out
+            ctx.c = None      # shadow 允许没有客户端
+    if mode == "shadow":
+        return _step_shadow(ctx, data, out)
     st = load_state(settings)
     h = get(settings)
     if h.get("halt_entries"):

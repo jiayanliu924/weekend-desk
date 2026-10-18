@@ -12,3 +12,6 @@ flock/超时→test_step_is_serialized_*、test_data_timeout_*；资金费→tes
 1. known_issues.md 仓库里不存在，未读到。2. 真实 PairsClient 的新方法（mark_px/funding_rows/fill_for_cloid/l2_snapshot）只用 stub 测过，上 live 前先 shadow 再最小额实测。
 3. 认领不明单的价格是估算（px_est），盈亏有偏差；同币多张不明单认领不了，需人工。4. 手动仓位与我们反向时 reduce-only 不下单只告警。
 5. 数据抓取在后台线程，超时后线程仍会跑完（不堆叠）；资金费按峰值仓位占比分摊，是近似。
+第 2 轮评审修复（最终轮，修复→测试）：当日止损在 live 无条件先于开仓→test_daily_stop_runs_in_live_mode_*；下单异常有界重查、查不到记"结果不明"、账本外超额持仓告警停开→test_send_exception_*、test_reconcile_alerts_and_halts_*；
+超时后完成的抓数据结果复用→test_late_finished_load_*；客户端按 dex 并集缓存一次、shadow 同集合→test_pairs_client_built_once_*；单对出错不影响其他→test_one_pair_error_*；当日止损告警每小时一次→test_daily_stop_alert_rate_limited_*。
+测试：test_pairs_exec.py 62 条，全仓库全过。
