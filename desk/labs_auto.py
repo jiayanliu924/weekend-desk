@@ -9,7 +9,8 @@
 - leverage：历史最大回撤 ≤ 20% 的最大杠杆（各 lab 自己算的；期权线里"杠杆"= 每周把多少比例的本金当最大亏损）
 - ret_at_lev_pct：在该杠杆下的周均收益
 - p_ruin_pct：52 周内净值跌到一半（腰斩）的概率（lab 自己的 bootstrap）
-- passes：样本 ≥ 20 周 且 样本外全额费用下周均 > 0 且 腰斩概率 < 5%
+- passes：样本 ≥ 20 周 且 样本外全额费用下周均 > 0 且 腰斩概率 < 5% 且 杠杆 > 0 且 该杠杆下周收益 > 0
+- unit：capital = 占本金；risk_budget（期权线）= 占"每周最大亏损预算"，不是占本金
 - note_optimistic：杠杆是在同一段历史里挑的 → 偏乐观（目前三条线都是 true）
 """
 from __future__ import annotations
@@ -60,16 +61,18 @@ def _pct(x):
 
 
 def make_record(line: str, variant: str, n: int, mean, sd, max_dd, lev, ret_at_lev, p_ruin, capacity,
-                oos_mean_pos: bool, note: str) -> dict:
+                oos_mean_pos: bool, note: str, unit: str = "capital") -> dict:
     """输入的收益都是"本金的小数"（0.015 = 1.5%）；输出 *_pct 是百分数。passes 在这里统一判断。"""
     mean, sd, p_ruin = _num(mean), _num(sd), _num(p_ruin)
     ratio = mean / sd if (mean is not None and sd) else None
-    passes = bool(n >= MIN_SAMPLES and oos_mean_pos and p_ruin is not None and p_ruin < MAX_RUIN)
+    lev_n, ret_n = _num(lev), _num(ret_at_lev)
+    passes = bool(n >= MIN_SAMPLES and oos_mean_pos and p_ruin is not None and p_ruin < MAX_RUIN
+                  and lev_n is not None and lev_n > 0 and ret_n is not None and ret_n > 0)
     return {"line": LINES[line], "key": line, "variant": variant, "n_weeks": int(n),
             "mean_wk_pct": _pct(mean), "sd_wk_pct": _pct(sd), "ratio": ratio, "max_dd_pct": _pct(max_dd),
             "leverage": _num(lev), "ret_at_lev_pct": _pct(ret_at_lev), "p_ruin_pct": _pct(p_ruin),
             "capacity_usd": _num(capacity), "passes": passes, "oos_mean_positive": bool(oos_mean_pos),
-            "note_optimistic": True, "note": note}
+            "note_optimistic": True, "note": note, "unit": unit}
 
 
 # ---------------------------------------------------------------- 各线归一化
@@ -96,12 +99,14 @@ def normalize_pairs(res: dict, notional: float = 1000.0) -> dict:
         raise RuntimeError("没有一对能在全额费用下算出结果")
     _, p, st, mean, sd = best
     lev = st.get("leverage") or 0.0
-    note = ("样本外（走前选参数）、吃单全额费用；杠杆在同一段历史里挑，偏乐观；"
+    note = ("样本外（走前选参数）、吃单全额费用、腿差压力下也要为正；杠杆在同一段历史里挑，偏乐观；"
+            "这一对是从很多对里挑出来最好的（选择偏差，真实表现更差）；"
             f"15 分钟 K 线只有约 {st.get('weeks', 0)} 周样本")
     return make_record("pairs", f"{p['a']} / {p['b']}", st.get("weeks", 0), mean, sd,
                        abs(st["max_dd_usd"]) / notional if st.get("max_dd_usd") is not None else None,
                        lev, (st.get("week_ret_at_lev") if lev else 0.0), st.get("p_minus50_52w"), st.get("capacity_usd"),
-                       (mean or 0) > 0 and (st.get("avg_net_bps") or 0) > 0, note)
+                       (mean or 0) > 0 and (st.get("avg_net_bps") or 0) > 0
+                       and ((p["result"].get("legging") or {}).get("avg_net_bps") or -1) > 0, note)
 
 
 def normalize_strategy(r3: dict | None) -> dict:
@@ -140,12 +145,12 @@ def normalize_options(rows: list[dict]) -> dict:
     f = ob.risk_fraction(rs) if mean > 0 else 0.0
     half = rs[len(rs) // 2:]                      # 时间上靠后的一半 = 近似样本外
     ruin = _num(ob.p_ruin(rs, f)) if (f > 0 and len(rs) >= 10) else None
-    note = ("真实 Deribit 成交价、含手续费和 5% 滑点；结构是固定规则没拟合参数，但最优结构是从多个里挑的，"
+    note = ("收益单位是占“每周最大亏损预算”的百分比，不是占本金；真实 Deribit 成交价、含手续费和 5% 滑点；结构是固定规则没拟合参数，但最优结构是从多个里挑的，"
             "杠杆在同一段历史里挑，偏乐观；\"样本外\"用的是时间上靠后的一半周数")
     kind, var, strat = g
     return make_record("options", f"{ob.NAMES.get(strat, strat)} · {kind} · {var}", len(rs), mean, sd,
                        ob.compound_dd(rs, 1.0), f, f * mean, ruin, None,
-                       statistics.fmean(half) > 0, note)
+                       statistics.fmean(half) > 0, note, unit="risk_budget")
 
 
 # ---------------------------------------------------------------- 各线运行（每条一个 runner，便于测试替换）
@@ -185,28 +190,78 @@ RUNNERS = {"pairs": run_pairs, "strategy": run_strategy, "options": run_options}
 
 # ---------------------------------------------------------------- 排名、输出
 def rank(records: list[dict]) -> list[dict]:
-    ordered = sorted(records, key=lambda r: (r["ratio"] is None, -(r["ratio"] or 0.0)))
+    ordered = sorted(records, key=lambda r: (not r["passes"], r["ratio"] is None, -(r["ratio"] or 0.0)))
     for i, r in enumerate(ordered, 1):
         r["rank"] = i
     return ordered
 
 
+def _row(r: dict) -> str:
+    ret = r.get("ret_at_lev_pct")
+    ret = 0.0 if ret is None else ret
+    lev = r.get("leverage") or 0.0
+    ruin = f"{r['p_ruin_pct']:.1f}%" if r.get("p_ruin_pct") is not None else "算不出"
+    rb = r.get("unit") == "risk_budget"
+    what = f"每周 {ret:+.1f}%" + ("（占每周最大亏损预算，不是占本金）" if rb else "")
+    lv = f"每周拿 {lev * 100:.0f}% 本金当最大亏损" if rb else f"杠杆 {lev:.1f} 倍"
+    return (f"第{r['rank']}名 {r['line']}：{what}（在最大回撤 20% 以内的{lv}），"
+            f"52 周腰斩概率 {ruin}，{'过' if r['passes'] else '没过'}门槛")
+
+
 def message(ranked: list[dict], errors: dict[str, str]) -> str:
+    ok = [_row(r) for r in ranked if r["passes"]]
+    bad = [_row(r) for r in ranked if not r["passes"]]
     rows = []
-    for r in ranked:
-        ret = r["ret_at_lev_pct"] if r["ret_at_lev_pct"] is not None else 0.0
-        lev = r["leverage"] or 0.0
-        ruin = f"{r['p_ruin_pct']:.1f}%" if r["p_ruin_pct"] is not None else "算不出"
-        rows.append(f"第{r['rank']}名 {r['line']}：每周 {ret:+.1f}%（在最大回撤 20% 以内的杠杆 {lev:.1f} 倍），"
-                    f"52 周腰斩概率 {ruin}，{'过' if r['passes'] else '没过'}门槛")
+    if ok:
+        rows += ["过门槛的：", *ok]
+    if bad:
+        rows += ["没过的：", *bad]
     for k, e in errors.items():
         rows.append(f"{LINES.get(k, k)}：这次没跑出来（{e[:40]}）")
     rows.append("杠杆是在历史里挑的，实际会更差；没过门槛的别放真钱。")
     return "\n".join(rows)
 
 
+LOCK_STALE_S = 6 * 3600
+
+
+def _acquire(d: Path):
+    """简单锁文件：已有别的运行在跑（且不超过 6 小时）→ 返回 None。"""
+    import os
+    import time
+    lock = d / "run.lock"
+    for _ in range(2):
+        try:
+            fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(fd, str(os.getpid()).encode())
+            os.close(fd)
+            return lock
+        except FileExistsError:
+            try:
+                if time.time() - lock.stat().st_mtime > LOCK_STALE_S:
+                    lock.unlink()
+                    continue
+            except OSError:
+                continue
+            return None
+    return None
+
+
 def run_all(settings, fetch: bool = True, runners: dict | None = None, push: bool = True) -> dict:
     runners = runners or RUNNERS
+    d = Path(settings.data) / "labs"
+    d.mkdir(parents=True, exist_ok=True)
+    lock = _acquire(d)
+    if lock is None:
+        log.warning("labs_auto 已有另一个运行在进行，本次退出")
+        return {"skipped": True, "ranking": [], "errors": {}}
+    try:
+        return _run_locked(settings, fetch, runners, push, d)
+    finally:
+        lock.unlink(missing_ok=True)
+
+
+def _run_locked(settings, fetch, runners, push, d) -> dict:
     records, errors = [], {}
     for key, fn in runners.items():
         try:
@@ -217,8 +272,6 @@ def run_all(settings, fetch: bool = True, runners: dict | None = None, push: boo
     ranked = rank(records)
     now = datetime.now(UTC)
     out = {"generated_at": now.isoformat(), "fetch": bool(fetch), "ranking": ranked, "errors": errors}
-    d = Path(settings.data) / "labs"
-    d.mkdir(parents=True, exist_ok=True)
     txt = json.dumps(out, ensure_ascii=False, indent=1)
     (d / "latest.json").write_text(txt)
     (d / f"{now:%Y-%m-%d}.json").write_text(txt)
@@ -245,7 +298,7 @@ def main(argv=None) -> int:
     a = ap.parse_args(argv)
     logging.basicConfig(level=logging.INFO)
     out = run_all(config.load(), fetch=not a.offline)
-    print(message(out["ranking"], out["errors"]))
+    print("已有另一个运行在进行，本次退出" if out.get("skipped") else message(out["ranking"], out["errors"]))
     return 0
 
 

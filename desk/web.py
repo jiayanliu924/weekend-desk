@@ -1495,16 +1495,21 @@ def labs_page(req: Request):
         return page(req, "/labs", "赚钱排行", body)
 
     def c(x, nd=1, sign=False):
-        return "—" if x is None else (f"{x:+.{nd}f}" if sign else f"{x:.{nd}f}")
+        return "—" if not isinstance(x, (int, float)) else (f"{x:+.{nd}f}" if sign else f"{x:.{nd}f}")
     rows = ""
     for r in d.get("ranking", []):
-        cap = _n(r["capacity_usd"], 0) if r.get("capacity_usd") else "—"
-        rows += (f"<tr><td>第{r['rank']}名 {E(r['line'])}<br><span class='ev'>{E(r.get('variant', ''))}</span></td>"
-                 f"<td>{r['n_weeks']}</td><td>{c(r['mean_wk_pct'], 2, True)}</td><td>{c(r['sd_wk_pct'], 2)}</td>"
-                 f"<td>{c(r['ratio'], 2)}</td><td>{c(r['max_dd_pct'], 1)}</td><td>{c(r['leverage'], 2)}</td>"
-                 f"<td>{c(r['ret_at_lev_pct'], 2, True)}</td><td>{c(r['p_ruin_pct'], 1)}</td>"
+        g = r.get
+        cap = _n(g("capacity_usd"), 0) if g("capacity_usd") else "—"
+        ub = g("unit") == "risk_budget"
+        lev = c(g("leverage"), 2) + ("（占每周最大亏损预算的比例）" if ub else "")
+        ret = c(g("ret_at_lev_pct"), 2, True) + ("（占预算，非本金）" if ub else "")
+        ok = bool(g("passes"))
+        rows += (f"<tr><td>第{E(str(g('rank', '')))}名 {E(str(g('line', '')))}<br><span class='ev'>{E(str(g('variant', '')))}</span></td>"
+                 f"<td>{E(str(g('n_weeks', '—')))}</td><td>{c(g('mean_wk_pct'), 2, True)}</td><td>{c(g('sd_wk_pct'), 2)}</td>"
+                 f"<td>{c(g('ratio'), 2)}</td><td>{c(g('max_dd_pct'), 1)}</td><td>{lev}</td>"
+                 f"<td>{ret}</td><td>{c(g('p_ruin_pct'), 1)}</td>"
                  f"<td>{cap}</td>"
-                 f"<td class='{'good' if r['passes'] else 'bad'}'>{'过' if r['passes'] else '没过'}</td></tr>")
+                 f"<td class='{'good' if ok else 'bad'}'>{'过' if ok else '没过'}</td></tr>")
     errs = "".join(f"<li>{E(la.LINES.get(k, k))}：{E(v)}</li>" for k, v in (d.get("errors") or {}).items())
     heads = "".join(f"<th>{E(h)}</th>" for h, _ in la.COLUMNS)
     empty = "<tr><td colspan=11>三条线这次都没跑出结果</td></tr>"
