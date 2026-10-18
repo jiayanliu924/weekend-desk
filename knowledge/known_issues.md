@@ -5,3 +5,6 @@
 - growthMode 9 折手续费是补贴，决策必须用全额口径
 - 7 个合约同一周末不是 7 个独立样本，显著性按日历周末聚类
 - 沙盒连不上交易所；所有要拉数据的回测只能在服务器跑
+- pairs_exec：PairsClient 的 mark_px/funding_rows/fill_for_cloid 只对 stub 测过，没对真交易所测过
+- pairs_exec：超额敞口检查分不清手动单和漏记成交，只报警+停新单，不自动处理
+- labs_auto：杠杆都是同一段历史里挑的（note_optimistic 恒为 true）；pairs 线约 7 周样本，必然没过 20 周门槛

@@ -5,7 +5,18 @@
 
 | 卡 | 内容 | 档 | 模型 | 依赖 | 状态 |
 |---|---|---|---|---|---|
-| A | labs_auto：服务器一条命令跑 pairs/strategy v3/options_real，按同一标准排名，写 data/labs/latest.json，推手机，网站「赚钱排行」页；update.sh 部署后后台自动跑；每周一 06:00 PT 自动跑 | 中 | Sonnet | – | 进行中 |
-| B | 跨平台同股套利执行器：两腿同时下、一腿失败立刻撤另一腿、按 cloid 只平自己、默认 off、走 autotrade 同一套安全闸与看门狗 | 高 | Sonnet ×1 写 + Sonnet ×2 找 bug + Opus 审 + Kea 签字 | – | 进行中 |
+| A | labs_auto：服务器一条命令跑 pairs/strategy v3/options_real，按同一标准排名，写 data/labs/latest.json，推手机，网站「赚钱排行」页；update.sh 部署后后台自动跑；每周一 06:00 PT 自动跑 | 中 | Sonnet | – | 完成（1 轮复核，3 处修）|
+| B | 跨平台同股套利执行器：两腿同时下、一腿失败立刻撤另一腿、按 cloid 只平自己、默认 off、走 autotrade 同一套安全闸与看门狗 | 高 | Sonnet ×1 写 + Sonnet ×2 找 bug + Opus 审 + Kea 签字 | – | 完成（3 轮：2 找 bug+投票→修 12 处→复核修 6 处；默认 off）|
 | C | 期权执行：若 A 显示期权线达标，用现有 Alpaca 层（11d）接美股/IBIT 期权；Deribit 美国不可用 | 高 | 待定 | A 结果 | 等 |
 | D | 赢家晋级规则写进代码：A 的排名第一且过门槛 → 自动进影子；影子满 N 周不差于回测 → 推送请 Kea 点"升小钱" | 高 | Sonnet | A,B | 等 |
+
+## 轮次记录
+| 卡 | 档 | 模型 | 发现 | 真 | 重复 | 轮 |
+|---|---|---|---|---|---|---|
+| A | 中 | Sonnet | 3+3 小 | 6 | 0 | 1 |
+| B | 高 | Sonnet×3 + Opus | 17 → 6 | 18 | 约 8（两审互相印证，合并） | 3（上限） |
+
+## 决定记录 2026-10-17（Opus）
+- A 上线：服务器部署后自动跑三条线并推手机排名；只读，不碰钱。
+- B 合并但默认 off：3 轮用满，按规则不再开第 4 轮；先 shadow 跑满一周、再一次最小金额 live 测试真实交易所接口（PairsClient 只对 stub 测过）。升 live 需 Kea 签字 + 老板点头。
+- 回滚：pairs_live.json 改 off（有仓位时仍会照管平仓）；labs_auto 只读无需回滚。
