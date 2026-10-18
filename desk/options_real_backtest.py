@@ -6,13 +6,13 @@
 口径
   合约    ：每周五 08:00 UTC 到期的 BTC 期权（周/月/季到期都在周五 08:00）
   入场    ：周五 08:00 UTC（7DTE，FRI7）和周一 08:00 UTC（4DTE，MON4），两种入场分开统计、不混在同一周里
-  报价    ：入场时刻 ±30 分钟内该到期日每个合约的成交 VWAP（美元 = 成交价 BTC × 成交时指数价）；没有成交就跳过
+  报价    ：入场前 60 分钟内（不含入场之后，无前视）该到期日每个合约的成交 VWAP（美元 = 成交价 BTC × 成交时指数价）；没有成交就跳过
   行权价  ：平值 = 同时有 call 和 put 成交、离指数最近的行权价；0.15Δ / 0.10Δ / 0.05Δ = 用成交里的隐含波动按 B-S 算 delta，
             取最近的（容差 ±50%×目标 delta）
   结构    ：卖铁鹰（卖 0.15Δ 买 0.05Δ；卖 0.10Δ 买 0.05Δ）、卖铁蝶（卖平值、买 0.10Δ 翼）、买跨式（平值）；
             卖宽跨式 0.15Δ 只作参考（无上限风险，"最大风险"按 10% 标的近似）。每结构 1 张 = 1 BTC
   出场    ：持有到期（按到期前 30 分钟成交里的指数价中位数结算；没有就用永续 1h K 线）；
-            提前止盈变体：入场窗口结束之后，每个整点用此前 2 小时内各腿最近成交价重估，达到最大盈利的 50%（卖方 = 收到权利金的
+            提前止盈变体：入场时刻之后，每个整点用此前 2 小时内各腿最近成交价重估，达到最大盈利的 50%（卖方 = 收到权利金的
             一半；买跨式 = 付出权利金的一半）就平。只用该整点之前的成交（无前视）
   费用    ：每腿每次成交 0.03% 标的、封顶该腿权利金 12.5%（options_paper.leg_fee_usd）+ 滑点 = 权利金的 2% / 5% / 10%（默认 5%）；
             到期交割费 0.015% 标的、封顶内在价值 12.5%（只对实值腿）
@@ -45,7 +45,8 @@ HIST_API = "https://history.deribit.com/api/v2/public"
 MIN_MS = 60_000
 H_MS = 3_600_000
 D_MS = 86_400_000
-WINDOW_MS = 30 * MIN_MS                 # 入场报价窗口 ±30 分钟
+WINDOW_MS = 30 * MIN_MS                 # 结算：到期前 30 分钟
+ENTRY_LOOKBACK_MS = 60 * MIN_MS         # 入场报价窗口 = [入场 − 60 分钟, 入场]（review 2026-10-18：原 ±30 分钟用了入场后的成交选行权价/定价）
 EXIT_LOOKBACK_MS = 2 * H_MS             # 提前止盈：每腿只认此前 2 小时内的成交
 TARGET_DELTAS = (0.15, 0.10, 0.05)
 DELTA_TOL = 0.5                          # |Δ − 目标| ≤ 0.5 × 目标
@@ -326,13 +327,13 @@ def expiry_pnl(legs: list[dict], spot_in: float, S_T: float, slip_pct: float, st
 
 def early_exit(legs: list[dict], leg_trades: dict[str, list[dict]], entry: datetime, expiry: datetime,
                spot_in: float, slip_pct: float, strategy: str) -> dict | None:
-    """入场窗口结束后每个整点检查一次；只用 ts ≤ 检查时刻、且在入场窗口之后的成交。
+    """入场之后每个整点检查一次；只用 ts ≤ 检查时刻、且在入场时刻之后的成交。
     卖方：浮盈 ≥ 收到权利金的 50% 就平；买跨式：浮盈 ≥ 付出权利金的 50%。返回 {at, pnl} 或 None（没触发）。"""
     e = structure_entry(legs, spot_in, slip_pct, strategy)
     target = TAKE_PROFIT * abs(e["credit"])
     if target <= 0:
         return None
-    start = ms(entry) + WINDOW_MS
+    start = ms(entry)
     t = (start // H_MS + 1) * H_MS
     end = ms(expiry) - H_MS
     while t <= end:
@@ -373,7 +374,7 @@ class WeekData:
 
 def load_week(src, expiry: datetime, entry_kind: str, events) -> tuple[WeekData | None, str]:
     entry = expiry - timedelta(days=ENTRIES[entry_kind])
-    a, b = ms(entry) - WINDOW_MS, ms(entry) + WINDOW_MS
+    a, b = ms(entry) - ENTRY_LOOKBACK_MS, ms(entry)
     win = src.window(a, b)
     if win is None:
         return None, "缺数据"
@@ -566,8 +567,10 @@ def report_md(currency: str, since: date, until: date, rows: list[dict], skipped
                     L.append(f"| {kind} | {NAMES[st]} | {sp:g}% | {a['n']} | {_pct(a['mean_r'], 2)} | {a['sharpe']:+.2f} | "
                              f"{a['f'] * 100:.1f}% | {_pct(a['f_ret'], 2)} | {pr} |")
     L += ["", "## 口径与局限", "",
-          "- 入场价 = ±30 分钟成交 VWAP，不是盘口；真实能成交的价可能更差（滑点 2/5/10% 就是为这个）。窗口包含入场后 30 分钟的成交，"
-          "这是报价口径，不是方向信息；提前止盈只用入场窗口之后、检查时刻之前的成交。",
+          "- 入场价 = 入场前 60 分钟成交 VWAP（不含入场之后的成交），不是盘口；真实能成交的价可能更差（滑点 2/5/10% 就是为这个）。"
+          "提前止盈只用入场之后、检查时刻之前的成交。",
+          "- **「DD≤20% 的周风险占比」、「对应周收益」和「52 周跌穿 −50%」是用同一段数据挑出来再在同一段数据上评估的（样本内），偏乐观**："
+          "未来的最大回撤几乎一定比历史见过的更深；bootstrap 只能抽到历史里出现过的最差一周。不能当样本外成绩。",
           "- delta 用成交隐含波动按 B-S（r=0）算，不是交易所的标记 delta。",
           "- 结算价 = 到期前 30 分钟成交里的指数价中位数（Deribit 用 30 分钟 TWAP），没有就用永续 K 线（有基差）。",
           "- 美股（IBIT/SPY）上的对应结构费用、点差、实物交割都不同；这里只回答“真实价格下这些结构在 BTC 周期权上有没有边际”。",

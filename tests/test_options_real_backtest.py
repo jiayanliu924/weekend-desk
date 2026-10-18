@@ -44,7 +44,7 @@ def chain_trades(at=ENTRY, spot=S0, strikes=range(48_000, 72_001, 1_000)):
             px = bs_price(spot, K, T, IV, cp)
             if px < 5:
                 continue
-            out.append(trade(at + timedelta(minutes=5), inst(K, cp), px, index=spot))
+            out.append(trade(at - timedelta(minutes=5), inst(K, cp), px, index=spot))
     return out
 
 
@@ -94,7 +94,7 @@ def test_strike_selection_from_trades():
     # 另一个到期日的成交不能混进来
     tr.append(trade(ENTRY, inst(60_000, "C", EXP + timedelta(days=7)), 9_999))
     # 同一合约两笔，VWAP 按数量加权
-    tr.append(trade(ENTRY + timedelta(minutes=10), inst(60_000, "C"), 3_000, amount=3.0))
+    tr.append(trade(ENTRY - timedelta(minutes=10), inst(60_000, "C"), 3_000, amount=3.0))
     q = rb.quotes_at(tr, EXP, S0, ENTRY)
     assert all(rb.parse_instrument(v["inst"])[0] == EXP for v in q.values())
     first = bs_price(S0, 60_000, 7 / 365, IV, "C")
@@ -185,8 +185,8 @@ def test_early_exit_triggers_at_50pct():
 
 def test_early_exit_ignores_entry_window_and_future():
     legs = _condor()
-    # 入场窗口里（+20 分钟）的低价成交不能触发
-    lt = {"c1": [trade(ENTRY + timedelta(minutes=20), "c1", 1.0)], "p1": [trade(ENTRY + timedelta(minutes=20), "p1", 1.0)]}
+    # 入场窗口里（入场前 20 分钟）的低价成交不能触发
+    lt = {"c1": [trade(ENTRY - timedelta(minutes=20), "c1", 1.0)], "p1": [trade(ENTRY - timedelta(minutes=20), "p1", 1.0)]}
     assert rb.early_exit(legs, lt, ENTRY, EXP, S0, 5.0, "iron_condor_15_05") is None
     # 在 +5h 触发；加上 +5h 之后的成交（未来）不改变触发时刻和盈亏
     base = _decay_trades({2: 0.8, 5: 0.3})
@@ -242,3 +242,16 @@ def test_blocked_network_exits_2(s, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "bot 服务器" in out and "不会用合成数据" in out
     assert not list((Path(s.data) / "reports").glob("options_real_backtest_*")) if (Path(s.data) / "reports").exists() else True
+
+
+def test_entry_quote_uses_no_post_entry_trades():
+    """review 2026-10-18：入场报价只用入场前的成交；入场后的成交（哪怕价格离谱）不改变行权价、价格、指数。"""
+    base = chain_trades()
+    settle = [trade(EXP - timedelta(minutes=5), inst(61_000, "C", EXP + timedelta(days=7)), 2_000, index=61_000)]
+    src_a = Fixture({"entry": base, "settle": settle})
+    post = [trade(ENTRY + timedelta(minutes=m), t["instrument"], 1.0, index=99_999) for m in (1, 15, 29) for t in base[:5]]
+    src_b = Fixture({"entry": base, "settle": settle, "post": post})
+    wa, _ = rb.load_week(src_a, EXP, "FRI7", None)
+    wb, _ = rb.load_week(src_b, EXP, "FRI7", None)
+    assert wa.spot == wb.spot and wa.sel == wb.sel
+    assert {k: v["usd"] for k, v in wa.quotes.items()} == {k: v["usd"] for k, v in wb.quotes.items()}
