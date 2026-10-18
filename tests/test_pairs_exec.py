@@ -989,3 +989,15 @@ def test_daily_stop_alert_rate_limited_while_unresolved(s, monkeypatch):
     assert n() == 1 and px.get(s)["mode"] == "live"
     px.step(s, later(now, 3700), client=fc, data=data)
     assert n() == 2
+
+
+def test_cli_mode_switch(tmp_path, monkeypatch):
+    from desk import pairs_exec as pe, config
+    s = config.load()
+    monkeypatch.setattr(s, "data", str(tmp_path), raising=False) if hasattr(s, "data") else None
+    monkeypatch.setattr(config, "load", lambda: s)
+    monkeypatch.setattr(pe.notify, "push", lambda *a, **k: True)
+    assert pe.main(["--mode", "shadow"]) == 0
+    assert pe.get(s)["mode"] == "shadow"
+    assert pe.main(["--mode", "off"]) == 0
+    assert pe.get(s)["mode"] == "off"

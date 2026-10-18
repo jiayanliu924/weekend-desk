@@ -1164,12 +1164,16 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="配对自动下单的管理命令")
     ap.add_argument("--clear-halt", action="store_true", help="清除停开新仓标志（先核对交易所持仓和账本）")
     ap.add_argument("--status", action="store_true")
+    ap.add_argument("--mode", choices=MODES, help="切换配对下单模式：off / shadow（演习）/ live（真下单）")
     a = ap.parse_args(argv)
     s = config.load()
+    if a.mode:
+        put(s, mode=a.mode, updated_by="cli")
+        print(f"配对下单模式已切到 {a.mode}")
     if a.clear_halt:
         put(s, halt_entries=False, halt_reason="")
         print("已清除 halt_entries")
-    if a.status or not a.clear_halt:
+    if a.status or not (a.clear_halt or a.mode):
         st = load_state(s)
         print(json.dumps({**get(s), "open_pairs": {k: {"net": v["net"], "unknown": v["unknown"]} for k, v in open_pairs(st).items()}},
                          ensure_ascii=False, indent=1))
