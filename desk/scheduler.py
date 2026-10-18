@@ -69,6 +69,9 @@ def due_jobs(now: datetime, settings, done: set) -> list[tuple[str, object]]:
     pt = now.astimezone(PT)
     if pt.weekday() == 0 and pt.hour == 5 and f"qa:{pt.date()}" not in done:   # 周一早 5 点自动体检
         out.append((f"qa:{pt.date()}", None))
+    nu = now.astimezone(timezone.utc)
+    if nu.weekday() == 0 and 13 <= nu.hour < 17 and f"labs:{nu.date()}" not in done:   # 周一 13:00 UTC 自动跑三条策略线排名
+        out.append((f"labs:{nu.date()}", None))
     h = settings["notify"].get("daily_pdf_hour_pt", 7)
     if h <= pt.hour < h + 4 and f"dailypdf:{pt.date()}" not in done:
         out.append((f"dailypdf:{pt.date()}", None))
@@ -112,6 +115,8 @@ def due_jobs(now: datetime, settings, done: set) -> list[tuple[str, object]]:
 def run_job(key: str, wk, settings):
     if key.startswith("xtract:"):
         return continuous_extract(settings)
+    if key.startswith("labs:"):
+        return start_labs_auto(settings)
     if key.startswith("headline:"):
         from . import headline_shadow
         return headline_shadow.run(settings)
@@ -150,6 +155,22 @@ def run_job(key: str, wk, settings):
     if key.startswith("qa:"):
         from . import qa
         return qa.run(settings)
+
+
+def start_labs_auto(settings):
+    """赚钱排行要跑几分钟甚至更久：放后台线程，不卡主任务循环。"""
+    import threading
+
+    def _go():
+        try:
+            from . import labs_auto
+            labs_auto.run_all(settings)
+        except Exception as e:  # noqa: BLE001
+            log.exception("labs_auto failed: %s", e)
+            notify.push(settings, "赚钱排行出错", str(e)[:300])
+    t = threading.Thread(target=_go, name="labs_auto", daemon=True)
+    t.start()
+    return t
 
 
 def continuous_extract(settings, extractor=None, now_ns: int | None = None) -> int:
