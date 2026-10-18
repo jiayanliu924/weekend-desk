@@ -163,7 +163,7 @@ def realized_total(settings) -> float:
     return sum(r.get("pnl_usd", 0) or 0 for r in _led(settings).all() if r["kind"] == "exit")
 
 
-def _live_preflight(settings, cfg, c) -> str | None:
+def _live_preflight(settings, cfg, c, check_wallet: bool | None = None) -> str | None:
     """真下单前的安全检查。返回 None 表示通过，否则返回不通过的原因（会被记进账、推送给你）。
 
     - 交易账户余额不能低于下限（不往没钱/几乎没钱的账户里下单）。
@@ -178,7 +178,9 @@ def _live_preflight(settings, cfg, c) -> str | None:
         avail = None
     if avail is not None and avail < floor:
         return f"账户可用保证金 ${avail:.2f} 低于下限 ${floor:.2f}，不下单"
-    if not _client_factory:   # 只有真实钱包才校验
+    if check_wallet is None:
+        check_wallet = not _client_factory   # 默认：只有真实钱包才校验（pairs_exec 传显式值）
+    if check_wallet:
         main, key = creds()
         try:
             from eth_account import Account

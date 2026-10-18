@@ -106,6 +106,14 @@ def due_jobs(now: datetime, settings, done: set) -> list[tuple[str, object]]:
             out.append((f"alpacaretry:{slot}", None))
         for k in [k for k in done if k.startswith("alpacaretry:") and int(k[12:]) < slot - 3]:
             done.discard(k)
+    # 跨 dex 配对自动下单：只有模式不是 off 才每分钟评估一次（off 时这里什么都不加）
+    from . import pairs_exec
+    if pairs_exec.get(settings)["mode"] != "off":
+        slot = int(now.timestamp() // 60)
+        if f"pairs:{slot}" not in done:
+            out.append((f"pairs:{slot}", None))
+        for k in [k for k in done if k.startswith("pairs:") and int(k[6:]) < slot - 3]:
+            done.discard(k)
     return out
 
 
@@ -118,6 +126,9 @@ def run_job(key: str, wk, settings):
     if key.startswith("optshock:"):
         from . import options_shock
         return options_shock.run(settings)
+    if key.startswith("pairs:"):
+        from . import pairs_exec
+        return pairs_exec.step(settings, datetime.now(timezone.utc))
     if key.startswith("alpacaretry:"):
         from . import alpaca_exec
         return alpaca_exec.retry_pending(settings)

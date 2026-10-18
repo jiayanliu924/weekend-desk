@@ -453,3 +453,32 @@ budget_day_usd = 4.0
 budget_month_usd = 60.0
 # 网页"现在开会"按钮的冷却时间
 manual_cooldown_min = 30
+
+[pairs]
+# 跨 dex 同底层配对真下单（desk/pairs_exec.py）。开关在 data/state/pairs_live.json（默认 off，和 autotrade 的 live.json 分开）。
+# 信号 = pairs_lab 的走前选出的变体；两腿 IOC 限价、等名义；只平我们自己记账的数量（reduce-only）。以下全部是保守默认值。
+interval = "5m"
+lookback_days = 17
+warmup_days = 5
+# 只做 pairs_lab 里 kind=same 且过流动性门槛的配对；allow 非空时只做列出的 "A|B"（coin 全名，按字典序），如 ["io:SNDK|xyz:SNDK"]
+allow = []
+max_leg_notional_usd = 100.0
+max_concurrent = 1
+max_total_gross_usd = 200.0
+max_pair_loss_usd = 4.0
+daily_loss_stop_usd = 8.0
+# 每腿杠杆（代码里再硬封顶 2）
+leverage = 2
+# 名义不超过盘口第一档深度的这个比例
+depth_fraction = 0.10
+max_hold_h = 24.0
+# 进场 IOC 的滑点上限；平仓/回补从 exit_slippage_bps 起，每重试一次翻倍
+slippage_bps = 30.0
+exit_slippage_bps = 60.0
+# 两腿名义差超过"每腿名义 × 这个比例"就回补多出来的那条腿
+net_tolerance_frac = 0.05
+unwind_retries = 3
+min_balance_usd = 5.0
+# 估算手续费（吃单 bps/笔），用于记账盈亏
+fee_bps = 9.0
+cooldown_min = 30
