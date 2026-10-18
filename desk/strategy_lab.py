@@ -19,6 +19,8 @@
   v2                 （2026-10-15）主策略 v2 的回测：只做 [strategy].families_enabled（默认美股单票）、|dev| > 50 反向；
                      停手：同族严格更早的最近 K=4 个周末按同一规则的净 bps 之和 < 0 → 这周末不做（model.v2_stop，和实盘同一个函数）；
                      不足 4 个周末照常做。和"美股单票 / 反向 偏离>50"那一行之差 = 停手规则的效果。
+  v3（2026-10-18，只在实验室）同一个单票反向>50 信号，按本金 % 记周收益：① 按信号平分 ② 按强度 ③ β 对冲 / 残差信号
+                     ④ 挂单平仓 ⑤ 走前挑选；报告 Sharpe、回撤、20% 回撤下的杠杆和 52 周 −50% 概率（见 evaluate_v3）。
 样本外 = 全局第 warmup 个日历周末之后（默认 8）。所有选择只看严格更早的周末（_past 构造；测试里用"改未来数据、
 过去的决定不变"和"偷看会改答案"的夹具锁死）。有效样本按日历周末数算（同一周末的合约高度相关）。
 
@@ -28,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import random
 import statistics
 import sys
 from datetime import date, datetime, timedelta, timezone
@@ -348,6 +351,343 @@ def evaluate_rows(rows: list[dict], cfg, warmup: int = 8, notional: float = 1000
     return res
 
 
+# ---------------------------------------------------------------- v3：组合层面（每周末收益 = 本金的 %）
+# 2026-10-18。只在实验室里，不改实盘决策路径。目标：同一个信号（美股单票 |dev|>50 反向，全额成本），提高单位风险收益。
+#   base      每笔 1/N（N = 样本里的单票数，17），= 原来 "$1000/笔" 的口径换成本金 %
+#   alloc     本周末出手的单票平分本金：1/n_signals，每只封顶 25%（信号少时剩下的留现金）
+#   strength  权重 ∝ min(|dev|/50, 3)，本周末归一到 1，再每只封顶 25%（超出部分留现金，不再分配）
+#   hedge     alloc + 用指数永续（XYZ100，没有就 SP500）对冲：β 只用严格更早的周末估；同一周末各单票的对冲先轧差，只交易净额
+#   resid     同 hedge，但入场信号用残差偏离 dev − β·dev_指数（|残差|>50 才做、方向逆残差）
+#   maker     alloc + 平仓挂单：限价 = 重开后那一根的收盘（"重开后中间价"的近似），下一根 K 线穿过（严格越过）限价才算成交，
+#             成交 → 挂单费（3+3、无半点差）；没成交 → 下一根收盘吃单（≈ 重开 +30 分钟，全额 14）
+#   select    走前挑选：每个周末在 2 种仓位 × 3 种对冲 × 2 种平仓 = 12 个组合里，挑"过去周末周收益 Sharpe 最高"的；
+#             过去不足 warmup 个周末、或最高的过去均值 ≤ 0 → 不做
+V3_CAP = 0.25
+V3_STRENGTH_MAX = 3.0
+BETA_WINDOW = 20          # 估 β 用最近多少个过去周末
+BETA_MIN = 6              # 少于这么多个过去周末 → 不对冲（β = 0）
+BETA_CLIP = (0.0, 3.0)
+INDEX_PREF = ("XYZ100", "SP500")
+DD_CAP = 0.20
+L_MAX = 20.0              # 杠杆搜索上限（不代表交易所允许这么高）
+L_STEP = 0.05
+BOOT_WEEKS = 52
+BOOT_PATHS = 10_000
+RUIN_LEVEL = 0.5          # "−50% 路径" = 52 周内任意一周末净值 ≤ 起始本金的 50%
+V3_SIZINGS = ("alloc", "strength")
+V3_HEDGES = ("none", "hedge", "resid")
+V3_EXITS = ("taker", "maker")
+V3_REPORT = {"base": ("fixed", "none", "taker"), "alloc": ("alloc", "none", "taker"),
+             "strength": ("strength", "none", "taker"), "hedge": ("alloc", "hedge", "taker"),
+             "resid": ("alloc", "resid", "taker"), "maker": ("alloc", "none", "maker")}
+V3_CN = {"base": "基准：每笔 1/N", "alloc": "① 按信号平分（封顶 25%）", "strength": "② 按信号强度 min(偏离/50, 3)",
+         "hedge": "③ alloc + β 对冲", "resid": "③' 残差偏离信号 + β 对冲", "maker": "④ alloc + 挂单平仓",
+         "select": "⑤ 走前挑选（12 组合）"}
+
+
+def v3_grid() -> list[tuple[str, str, str]]:
+    return [(a, h, x) for a in V3_SIZINGS for h in V3_HEDGES for x in V3_EXITS]
+
+
+def _bar_at_or_after(by_t: dict[int, dict], iv: int, t: datetime, max_fwd: int = 4) -> tuple[int, dict] | None:
+    """和 backtest_lib.price_at_or_after 同一根 K 线，但返回 (开盘时间, K 线)。"""
+    k = math.ceil(bl.ms(t) / iv) * iv - iv
+    for i in range(max_fwd):
+        c = by_t.get(k + i * iv)
+        if c:
+            return k + i * iv, c
+    return None
+
+
+def attach_exit_bars(settings, inst: dict, candles_by_iv: dict[str, list[dict]], rows: list[dict]) -> None:
+    """给这个合约的行补上平仓后下一根 K 线（同粒度）：nx_hi_bps / nx_lo_bps 相对平仓价，move2_bps = 下一根收盘相对决策价。
+    只给挂单平仓实验用；weekend_rows 本身不变（实盘停手回补也用它）。"""
+    idx = {iv: {int(c["t"]): c for c in cs} for iv, cs in candles_by_iv.items() if cs}
+    for r in rows:
+        if r["name"] != inst["name"] or r["gran"] not in idx:
+            continue
+        by_t, ivm = idx[r["gran"]], INTERVAL_MS[r["gran"]]
+        w = weekend_for_friday(date.fromisoformat(r["fri"]), settings, inst)
+        got = _bar_at_or_after(by_t, ivm, w.exit)
+        if not got:
+            continue
+        k, bar = got
+        nxt = by_t.get(k + ivm)
+        if not nxt:
+            continue
+        p_x = float(bar["c"])
+        p_d = p_x / (1 + r["move_bps"] / 1e4)
+        r["nx_hi_bps"] = (float(nxt["h"]) / p_x - 1) * 1e4
+        r["nx_lo_bps"] = (float(nxt["l"]) / p_x - 1) * 1e4
+        r["move2_bps"] = (float(nxt["c"]) / p_d - 1) * 1e4
+
+
+def index_name(rows: list[dict]) -> str | None:
+    names = {r["name"] for r in rows}
+    return next((n for n in INDEX_PREF if n in names), None)
+
+
+def beta_est(past: list[dict], name: str, idx: str | None, window: int = BETA_WINDOW, min_n: int = BETA_MIN) -> float | None:
+    """单票对指数的 β：严格更早周末（past 由 _past 构造）的 y_bps（关门→平仓）做 OLS 斜率，取最近 window 个周末，
+    少于 min_n 个或指数没波动 → None；结果夹在 BETA_CLIP。用 y 而不是 20 分钟的 move：样本少，周末全程的方差大、估得稳。"""
+    if not idx:
+        return None
+    iy = {p["fri"]: p["y_bps"] for p in past if p["name"] == idx}
+    pairs = sorted((p["fri"], p["y_bps"], iy[p["fri"]]) for p in past if p["name"] == name and p["fri"] in iy)[-window:]
+    if len(pairs) < min_n:
+        return None
+    xs, ys = [p[2] for p in pairs], [p[1] for p in pairs]
+    mx, my = statistics.mean(xs), statistics.mean(ys)
+    vx = sum((x - mx) ** 2 for x in xs)
+    if vx <= 0:
+        return None
+    b = sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / vx
+    return min(max(b, BETA_CLIP[0]), BETA_CLIP[1])
+
+
+def v3_weights(sigs: list[tuple[str, float]], sizing: str, n_universe: int, thr: float = 50.0,
+               cap: float = V3_CAP) -> dict[str, float]:
+    """sigs = [(合约, |信号偏离| bps)]（只含本周末出手的）→ {合约: 本金占比}。总和 ≤ 1。"""
+    if not sigs:
+        return {}
+    if sizing == "fixed":
+        return {k: min(1.0 / max(1, n_universe), cap) for k, _ in sigs}
+    if sizing == "alloc":
+        return {k: min(1.0 / len(sigs), cap) for k, _ in sigs}
+    if sizing == "strength":
+        raw = {k: min(abs(d) / thr, V3_STRENGTH_MAX) for k, d in sigs}
+        tot = sum(raw.values())
+        return {k: min(v / tot, cap) for k, v in raw.items()}
+    raise ValueError(sizing)
+
+
+def exit_leg(side: int, r: dict, exit_mode: str, fee: float, maker_fee: float) -> dict:
+    """单笔平仓：返回 gross / fee（bps，相对这笔名义）和挂单状态。挂单：平多 = 卖限价，下一根最高价 > 限价才成交；平空反之。"""
+    if exit_mode == "taker" or "nx_hi_bps" not in r:
+        return {"gross": side * r["move_bps"], "fee": fee, "maker": None if exit_mode == "taker" else "nodata"}
+    through = r["nx_hi_bps"] > 0 if side > 0 else r["nx_lo_bps"] < 0
+    if through:
+        return {"gross": side * r["move_bps"], "fee": maker_fee, "maker": "filled"}
+    return {"gross": side * r["move2_bps"], "fee": fee, "maker": "unfilled",
+            "slip": side * (r["move2_bps"] - r["move_bps"])}
+
+
+def v3_week(today: list[dict], past: list[dict], combo: tuple[str, str, str], ctx: dict) -> dict:
+    """一个周末在某组合下的收益（本金的比例）。today = 本周末所有行（决策时只用 dev，move 是结果），past = 严格更早的行。"""
+    sizing, hedge, exit_mode = combo
+    stocks = [r for r in today if r["family"] in ctx["families"]]
+    idx_row = next((r for r in today if r["name"] == ctx["idx"]), None)
+    betas = {}
+    if hedge != "none" and idx_row is not None:
+        for r in stocks:
+            betas[r["name"]] = beta_est(past, r["name"], ctx["idx"]) or 0.0
+    sigs, sides = [], {}
+    for r in stocks:
+        d = r["dev_bps"]
+        if hedge == "resid" and r["name"] in betas:
+            d = d - betas[r["name"]] * idx_row["dev_bps"]
+        if abs(d) > max(ctx["thr"], BASE_T):
+            sigs.append((r["name"], abs(d)))
+            sides[r["name"]] = -_sgn(d)
+    w = v3_weights(sigs, sizing, ctx["n_universe"], ctx["thr"])
+    by = {r["name"]: r for r in stocks}
+    legs, ret, H = [], 0.0, 0.0
+    for name, wt in w.items():
+        s, r = sides[name], by[name]
+        leg = exit_leg(s, r, exit_mode, ctx["fee"], ctx["maker_fee"])
+        leg.update(name=name, w=wt, side=s, net=leg["gross"] - leg["fee"], beta=betas.get(name, 0.0))
+        legs.append(leg)
+        ret += wt * leg["net"] / 1e4
+        H -= s * wt * leg["beta"]
+    idx_pnl = 0.0
+    if H and idx_row is not None:
+        idx_pnl = (H * idx_row["move_bps"] - abs(H) * ctx["fee"]) / 1e4
+    return {"ret": ret + idx_pnl, "legs": legs, "hedge_w": H, "idx_pnl": idx_pnl,
+            "gross_expo": sum(w.values()) + abs(H)}
+
+
+def v3_series(rows: list[dict], combo: tuple[str, str, str], ctx: dict) -> dict[str, dict]:
+    """{周五: v3_week}——每个日历周末（含不出手的，收益 0）；每个周末只把 _past(rows, fri) 交给决策。"""
+    out = {}
+    for fri in sorted({r["fri"] for r in rows}):
+        out[fri] = v3_week([r for r in rows if r["fri"] == fri], _past(rows, fri), combo, ctx)
+    return out
+
+
+def _sharpe(xs: list[float]) -> float | None:
+    if len(xs) < 2:
+        return None
+    sd = statistics.stdev(xs)
+    return statistics.mean(xs) / sd if sd > 0 else None
+
+
+def v3_select(series: dict[tuple, dict[str, dict]], weekends: list[str], min_weekends: int) -> dict[str, tuple | None]:
+    """{周五: 选中的组合 或 None}：只用严格更早周末的周收益（这些周收益本身也只用了更早的数据）。"""
+    picks = {}
+    for i, fri in enumerate(weekends):
+        prev = weekends[:i]
+        best, best_s = None, None
+        if len(prev) >= min_weekends:
+            for combo, ser in series.items():
+                xs = [ser[w]["ret"] for w in prev]
+                sh = _sharpe(xs)
+                if sh is None or statistics.mean(xs) <= 0:
+                    continue
+                if best_s is None or sh > best_s:
+                    best, best_s = combo, sh
+        picks[fri] = best
+    return picks
+
+
+def max_drawdown(rets: list[float], lev: float = 1.0) -> float:
+    """复利净值的最大回撤（0.2 = −20%）；某周 1 + L·r ≤ 0 → 1（爆仓）。"""
+    eq = peak = 1.0
+    dd = 0.0
+    for r in rets:
+        g = 1 + lev * r
+        if g <= 0:
+            return 1.0
+        eq *= g
+        peak = max(peak, eq)
+        dd = max(dd, 1 - eq / peak)
+    return dd
+
+
+def leverage_for_dd(rets: list[float], cap: float = DD_CAP, l_max: float = L_MAX, step: float = L_STEP) -> float:
+    """历史最大回撤 ≤ cap 的最大杠杆（从 0 往上按 step 走，第一次超过就停）；没有亏损周 → l_max。"""
+    lev, n = 0.0, 1
+    while n * step <= l_max + 1e-12:
+        if max_drawdown(rets, n * step) > cap:
+            break
+        lev = n * step
+        n += 1
+    return lev
+
+
+def ruin_prob(rets: list[float], lev: float, weeks: int = BOOT_WEEKS, paths: int = BOOT_PATHS,
+              level: float = RUIN_LEVEL, seed: int = 20261018) -> float | None:
+    """独立重抽样（iid bootstrap）周收益 × 杠杆，52 周内净值任意时刻 ≤ level 的路径比例。固定种子，可复现。"""
+    if not rets:
+        return None
+    rng = random.Random(seed)
+    hit = 0
+    for _ in range(paths):
+        eq = 1.0
+        for _ in range(weeks):
+            eq *= max(0.0, 1 + lev * rng.choice(rets))
+            if eq <= level:
+                hit += 1
+                break
+    return hit / paths
+
+
+def port_stats(rets: list[float], paths: int = BOOT_PATHS) -> dict:
+    n = len(rets)
+    if not n:
+        return {"n_weekends": 0}
+    m = statistics.mean(rets)
+    sd = statistics.stdev(rets) if n > 1 else 0.0
+    sh = m / sd if sd > 0 else None
+    lev = leverage_for_dd(rets)
+    return {"n_weekends": n, "mean": m, "sd": sd, "sharpe_w": sh, "sharpe_a": sh * math.sqrt(52) if sh is not None else None,
+            "max_dd": max_drawdown(rets), "worst": min(rets), "t": sh * math.sqrt(n) if sh is not None else None,
+            "lev": lev, "ret_at_lev": m * lev, "dd_at_lev": max_drawdown(rets, lev),
+            "p_ruin": ruin_prob(rets, lev, paths=paths) if lev > 0 else 0.0}
+
+
+def v3_ctx(rows: list[dict], cfg, half_spread: float = 2.0) -> dict:
+    c = cfg["costs"]
+    v2p = v2_params(cfg)
+    return {"fee": c["maker_bps"] + c["taker_bps"] + half_spread, "maker_fee": 2 * c["maker_bps"],
+            "thr": v2p["threshold"], "families": v2p["families"], "idx": index_name(rows),
+            "n_universe": len({r["name"] for r in rows if r["family"] in v2p["families"]})}
+
+
+def evaluate_v3(rows: list[dict], cfg, warmup: int = 8, half_spread: float = 2.0, paths: int = BOOT_PATHS) -> dict:
+    ctx = v3_ctx(rows, cfg, half_spread)
+    weekends = sorted({r["fri"] for r in rows})
+    oos_from = weekends[warmup] if len(weekends) > warmup else None
+    oos = [w for w in weekends if oos_from and w >= oos_from]
+    combos = set(v3_grid()) | set(V3_REPORT.values())
+    series = {cb: v3_series(rows, cb, ctx) for cb in combos}
+    picks = v3_select({cb: series[cb] for cb in v3_grid()}, weekends, warmup)
+    sel = {w: (series[picks[w]][w] if picks[w] else {"ret": 0.0, "legs": [], "hedge_w": 0.0, "idx_pnl": 0.0, "gross_expo": 0.0})
+           for w in weekends}
+    named = {k: series[cb] for k, cb in V3_REPORT.items()} | {"select": sel}
+    out = {"ctx": ctx, "weekends": weekends, "oos_from": oos_from, "oos": oos, "picks": picks, "stats": {}, "extra": {}}
+    for k, ser in named.items():
+        rets = [ser[w]["ret"] for w in oos]
+        out["stats"][k] = port_stats(rets, paths)
+        legs = [lg for w in oos for lg in ser[w]["legs"]]
+        ex = {"trades_per_wk": len(legs) / max(1, len(oos)),
+              "gross_expo": statistics.mean(ser[w]["gross_expo"] for w in oos) if oos else 0.0,
+              "hedge_pct": sum(ser[w]["idx_pnl"] for w in oos) / max(1, len(oos)),
+              "avg_beta": statistics.mean(lg["beta"] for lg in legs) if legs else 0.0}
+        mk = [lg for lg in legs if lg.get("maker") in ("filled", "unfilled")]
+        if mk:
+            filled = [lg for lg in mk if lg["maker"] == "filled"]
+            ex["maker"] = {"n": len(mk), "fill_rate": len(filled) / len(mk),
+                           "nodata": sum(1 for lg in legs if lg.get("maker") == "nodata"),
+                           "saved_pct_wk": sum(lg["w"] * (ctx["fee"] - lg["fee"]) for lg in filled) / 1e4 / max(1, len(oos)),
+                           "slip_pct_wk": sum(lg["w"] * lg["slip"] for lg in mk if lg["maker"] == "unfilled") / 1e4 / max(1, len(oos)),
+                           "slip_bps_unfilled": statistics.mean(lg["slip"] for lg in mk if lg["maker"] == "unfilled")
+                           if len(filled) < len(mk) else None}
+        out["extra"][k] = ex
+    return out
+
+
+def _p(x, fmt="+.2f"):
+    return "—" if x is None else format(x * 100, fmt) + "%"
+
+
+V3_HEAD = ("| 变体 | 样本外周末 | 周均 % | 周标准差 % | 周 Sharpe | 年化 Sharpe | 最大回撤（1x） | 最差周末 | t(按周末) | "
+           "杠杆 L（历史回撤≤20%） | L 下周收益 % | 52 周 −50% 概率（L） | 笔/周末 | 平均总敞口 |",
+           "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+
+
+def v3_section_cn(r3: dict) -> list[str]:
+    ctx = r3["ctx"]
+    L = [f"同一个信号（{'、'.join(sorted(ctx['families']))} |dev|>{ctx['thr']:.0f} 反向，全额成本 {ctx['fee']:.0f} bps，挂单平仓成交时 "
+         f"{ctx['maker_fee']:.0f} bps），换成**本金 %**：每个样本外日历周末一笔周收益（不出手 = 0）。N = {ctx['n_universe']} 只单票；"
+         f"对冲指数 = {ctx['idx'] or '无（没有指数行，③ 等于 ①）'}。全部决策只看严格更早的周末。", "", *V3_HEAD]
+    for k in list(V3_REPORT) + ["select"]:
+        st, ex = r3["stats"][k], r3["extra"][k]
+        if not st.get("n_weekends"):
+            L.append(f"| {V3_CN[k]} | 0 |" + " — |" * 12)
+            continue
+        L.append(f"| {V3_CN[k]} | {st['n_weekends']} | {_p(st['mean'], '+.3f')} | {_p(st['sd'], '.3f')} | {_f(st['sharpe_w'], '+.2f')} | "
+                 f"{_f(st['sharpe_a'], '+.2f')} | {_p(st['max_dd'], '.2f')} | {_p(st['worst'], '+.2f')} | {_f(st['t'], '+.2f')} | "
+                 + (f"{st['lev']:.2f}{'（到上限）' if st['lev'] >= L_MAX else ''} | {_p(st['ret_at_lev'], '+.2f')} | "
+                    f"{_p(st['p_ruin'], '.1f')} |" if st["mean"] > 0 else "—（周均 ≤ 0，不该加杠杆） | — | — |")
+                 + f" {ex['trades_per_wk']:.1f} | {ex['gross_expo']:.2f} |")
+    L.append("")
+    for k in ("hedge", "resid"):
+        ex = r3["extra"][k]
+        L.append(f"- {V3_CN[k]}：平均 β {ex['avg_beta']:.2f}，指数腿（轧差后、含全额成本）平均每周末 {_p(ex['hedge_pct'], '+.3f')}。")
+    mk = r3["extra"]["maker"].get("maker")
+    if mk:
+        L.append(f"- {V3_CN['maker']}：样本外 {mk['n']} 笔挂单，成交率 {mk['fill_rate'] * 100:.0f}%"
+                 + (f"（另有 {mk['nodata']} 笔没有下一根 K 线，按吃单算）" if mk["nodata"] else "")
+                 + f"；省下手续费 {_p(mk['saved_pct_wk'], '+.3f')}/周末，没成交那部分等 15 分钟的价格代价 {_p(mk['slip_pct_wk'], '+.3f')}/周末"
+                 + (f"（没成交的平均 {mk['slip_bps_unfilled']:+.1f} bps/笔）" if mk["slip_bps_unfilled"] is not None else "")
+                 + f"；净 {_p(mk['saved_pct_wk'] + mk['slip_pct_wk'], '+.3f')}/周末。1h 粒度的早期周末「下一根」是 1 小时，成交率偏乐观。")
+    oos_picks = [r3["picks"][w] for w in r3["oos"]]
+    cnt: dict[str, int] = {}
+    for p in oos_picks:
+        lab = "不做" if p is None else "/".join(p)
+        cnt[lab] = cnt.get(lab, 0) + 1
+    L.append("- ⑤ 走前挑选在样本外各周末选的组合（仓位/对冲/平仓）：" + "；".join(f"{k} × {v}" for k, v in sorted(cnt.items(), key=lambda x: -x[1])) + "。")
+    L += ["- **杠杆不改变 Sharpe：** L 倍杠杆把周均收益、周标准差、回撤都放大 L 倍（回撤因复利略多于 L 倍），单位风险收益不变。"
+          "想提高单位风险收益只能靠 ①–④ 这种改变收益分布本身的办法；L 只是选一个能承受的风险档位。",
+          f"- L 的定义：在这 {len(r3['oos'])} 个样本外周末的复利净值上，历史最大回撤 ≤ {DD_CAP * 100:.0f}% 的最大杠杆（步长 {L_STEP}，上限 {L_MAX:.0f}，"
+          f"上限只是搜索边界、不代表交易所允许）。**L 是用同一段样本外数据挑的 → 偏乐观**：未来的最大回撤几乎一定比这 {len(r3['oos'])} 周里见过的更深。",
+          f"- −50% 概率：把样本外周收益独立重抽 {BOOT_WEEKS} 周 × {BOOT_PATHS:,} 条路径、乘 L、复利，净值任意时刻 ≤ 起始 50% 的比例。"
+          "iid 重抽忽略了周与周之间的相关和没见过的尾部（最差也只能抽到样本外里最差的那周），**真实概率更高**。",
+          "- 有效样本：同一周末的单票高度相关，独立样本 ≈ 周末数；t(按周末) 这里含不出手的周末（收益 0），和上面按出手周末算的 t 口径不同。",
+          f"- 多重比较：①–④ 加 12 组合挑选，表里最好的一行有一部分是运气；⑤ 是唯一只看过去做选择的那一行，以它为准。"]
+    return L
+
+
 # ---------------------------------------------------------------- 旧口径复算（仪表盘"过去 28 个周末 $+204.90"）
 def legacy_check(settings, candles_1h: dict[str, list[dict]]) -> dict | None:
     """复算 sim._history_weekend_trades 的口径：1h K 线，"决策价" = 重开那一刻的 K 线收盘，出场 = 重开后 1 小时，
@@ -489,12 +829,14 @@ def v2_section_cn(res: dict) -> list[str]:
 
 
 def report_md(settings, res: dict, rows: list[dict], sources: dict[str, str], legacy: dict | None,
-              since: date | None) -> str:
+              since: date | None, r3: dict | None = None) -> str:
     L = [f"# 策略实验室：走前比较 反向 / 顺向 / 新闻条件 / 切换 / v2（{datetime.now(UTC):%Y-%m-%d %H:%M} UTC）", "",
          "回补 K 线，**只供探索、不计入正式成绩**（备忘 7.2）。头条是**样本外**（走前：每个周末的选择只看严格更早的周末）。", "",
          "## 结论（中文）", "", *summary_cn(res, rows), ""]
     if rows:
         L += ["## v2 和对照", "", *v2_section_cn(res), ""]
+    if rows and r3 is not None:
+        L += ["## v3：仓位、对冲、挂单平仓（本金 %，走前）", "", *v3_section_cn(r3), ""]
     L += ["## 数据", ""]
     for name, src in sources.items():
         rs = [r for r in rows if r["name"] == name]
@@ -570,7 +912,9 @@ def build_rows(settings, now: datetime, since: date | None, fetch: bool, names=N
             c1h[inst["coin"]] = cbi["1h"]
         src = "，".join(f"{iv} 缓存 {len(cs)} 根" for iv, cs in cbi.items()) or "没有缓存"
         sources[inst["name"]] = src + (f"（{'；'.join(notes)}）" if notes else "")
-        rows += weekend_rows(settings, inst, cbi, now, since)
+        got = weekend_rows(settings, inst, cbi, now, since)
+        attach_exit_bars(settings, inst, cbi, got)
+        rows += got
     news = ledger_news(settings)
     for r in rows:
         r["news"] = news.get(f"{r['fri']}|{r['name']}")
@@ -583,8 +927,9 @@ def run(settings, since: date | None = None, warmup: int = 8, notional: float = 
     now = now or datetime.now(UTC)
     rows, sources, c1h = build_rows(settings, now, since, fetch, names)
     res = evaluate_rows(rows, settings, warmup, notional, half_spread)
+    r3 = evaluate_v3(rows, settings, warmup, half_spread) if rows else None
     legacy = legacy_check(settings, c1h)
-    md = report_md(settings, res, rows, sources, legacy, since)
+    md = report_md(settings, res, rows, sources, legacy, since, r3)
     out = out or Path(settings.data) / "reports" / "strategy_lab.md"
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(md)
