@@ -168,20 +168,34 @@ def run_job(key: str, wk, settings):
         return qa.run(settings)
 
 
-def start_labs_auto(settings):
-    """赚钱排行要跑几分钟甚至更久：放后台线程，不卡主任务循环。"""
-    import threading
+LABS_MEM = "350M"   # 1GB 服务器：回测单独一个进程，超内存只杀它自己，不拖垮网站和下单
 
-    def _go():
-        try:
-            from . import labs_auto
-            labs_auto.run_all(settings)
-        except Exception as e:  # noqa: BLE001
-            log.exception("labs_auto failed: %s", e)
-            notify.push(settings, "赚钱排行出错", str(e)[:300])
-    t = threading.Thread(target=_go, name="labs_auto", daemon=True)
-    t.start()
-    return t
+
+def labs_cmd(python: str | None = None) -> list[str]:
+    """独立进程 + 内存上限 + 低优先级。有 systemd-run 就用 cgroup 硬上限，否则退回 nice。"""
+    import shutil
+    import sys
+    py = python or sys.executable
+    base = ["nice", "-n", "19", py, "-m", "desk.labs_auto"]
+    if shutil.which("systemd-run"):
+        return ["systemd-run", "--scope", "--quiet", "-p", f"MemoryMax={LABS_MEM}", "-p", "MemorySwapMax=0",
+                "-p", "CPUQuota=50%", *base]
+    return base
+
+
+def start_labs_auto(settings):
+    """赚钱排行：另起一个受限进程跑（以前在主进程线程里跑，内存吃满会连带卡死网站和下单程序）。"""
+    import subprocess
+    from pathlib import Path
+    logf = Path(settings.data) / "labs_auto.log"
+    try:
+        with open(logf, "ab") as fh:
+            return subprocess.Popen(labs_cmd(), stdout=fh, stderr=subprocess.STDOUT, start_new_session=True,
+                                    cwd=str(Path(__file__).resolve().parent.parent))
+    except Exception as e:  # noqa: BLE001
+        log.exception("labs_auto launch failed: %s", e)
+        notify.push(settings, "赚钱排行没启动", str(e)[:300])
+        return None
 
 
 def continuous_extract(settings, extractor=None, now_ns: int | None = None) -> int:
