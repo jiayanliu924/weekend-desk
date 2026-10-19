@@ -109,6 +109,12 @@ def due_jobs(now: datetime, settings, done: set) -> list[tuple[str, object]]:
             out.append((f"alpacaretry:{slot}", None))
         for k in [k for k in done if k.startswith("alpacaretry:") and int(k[12:]) < slot - 3]:
             done.discard(k)
+    # 总账户止损线：每分钟核对一次两条线的真实盈亏合计
+    aslot = int(now.timestamp() // 60)
+    if f"acctstop:{aslot}" not in done:
+        out.append((f"acctstop:{aslot}", None))
+    for k in [k for k in done if k.startswith("acctstop:") and int(k[9:]) < aslot - 3]:
+        done.discard(k)
     # 跨 dex 配对自动下单：只有模式不是 off 才每分钟评估一次（off 时这里什么都不加）
     from . import pairs_exec
     if pairs_exec.get(settings)["mode"] != "off" or pairs_exec.has_open(settings):   # off 也要继续管理没平的仓位
@@ -131,6 +137,9 @@ def run_job(key: str, wk, settings):
     if key.startswith("optshock:"):
         from . import options_shock
         return options_shock.run(settings)
+    if key.startswith("acctstop:"):
+        from . import account_stop
+        return account_stop.check(settings)
     if key.startswith("pairs:"):
         from . import pairs_exec
         return pairs_exec.step(settings, datetime.now(timezone.utc))

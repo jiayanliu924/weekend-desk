@@ -254,6 +254,9 @@ def entry(settings, w, lock: dict | None) -> dict | None:
     cfg = get(settings)
     if cfg["mode"] == "off" or not lock:
         return None
+    from . import account_stop
+    if account_stop.check(settings).get("tripped"):      # 总账户止损：触发后不再开新仓
+        return None
     led = _led(settings)
     if any(r["kind"] == "entry" and r["weekend"] == w.wid for r in led.all()):
         return None

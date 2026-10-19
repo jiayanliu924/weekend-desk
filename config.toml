@@ -482,3 +482,8 @@ min_balance_usd = 5.0
 # 估算手续费（吃单 bps/笔），用于记账盈亏
 fee_bps = 9.0
 cooldown_min = 30
+
+[account]
+# 总账户止损线（desk/account_stop.py）：周末策略 + 跨平台套利的真实已实现盈亏合计亏到这个数，两条线全部停开新仓。
+# 解除：python -m desk.account_stop --reset（不会自动切回真下单）
+max_loss_usd = 500.0

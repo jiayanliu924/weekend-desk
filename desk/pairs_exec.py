@@ -1082,6 +1082,10 @@ def _step(settings, now: datetime, client, data) -> dict:
     if mode == "shadow":
         return _step_shadow(ctx, data, out)
     st = load_state(settings)
+    from . import account_stop
+    if account_stop.check(settings).get("tripped"):      # 总账户止损：已开仓位上面已照管，这里只是不开新仓
+        out["skips"].append("account_stop")
+        return out
     h = get(settings)
     if h.get("halt_entries"):
         if now_ms - float(h.get("halt_alert_ts", 0) or 0) >= DAY_MS:
