@@ -44,9 +44,11 @@ class Ledger:
 
     def completed(self) -> list[dict]:
         """Weekends with both lock and outcome, in order."""
-        res = []
-        for wid in self.weekends():
-            w = self.weekend(wid)
-            if "lock" in w and "outcome" in w:
-                res.append({"weekend": wid, **w})
-        return res
+        by: dict[str, dict] = {}
+        for r in self.all():          # 只读一次文件（以前每个周末各读一遍整份账本）
+            w = by.setdefault(r["weekend"], {})
+            if r["kind"] == "review":
+                w.setdefault("reviews", []).append(r)
+            else:
+                w[r["kind"]] = r
+        return [{"weekend": wid, **by[wid]} for wid in sorted(by) if "lock" in by[wid] and "outcome" in by[wid]]

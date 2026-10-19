@@ -47,7 +47,7 @@ def test_entry_skipped_outside_window(monkeypatch):
 def test_backfill_memo_reads_cache_once(monkeypatch, tmp_path):
     jobs._BACKFILL_MEMO.clear()
     n = []
-    monkeypatch.setattr(jobs, "_v2_backfill_rows_uncached", lambda s, f, w: n.append(1) or [{"fri": "2026-10-09", "name": "NVDA"}])
+    monkeypatch.setattr(jobs, "_v2_backfill_rows_uncached", lambda s, f, w: (n.append(1) or [{"fri": "2026-10-09", "name": "NVDA"}], 0))
     s = SimpleNamespace(data=str(tmp_path))
     w = SimpleNamespace(decision=datetime(2026, 10, 18, 23, 45, tzinfo=timezone.utc))
     a = jobs._v2_backfill_rows(s, "us_equity", w)
@@ -57,3 +57,40 @@ def test_backfill_memo_reads_cache_once(monkeypatch, tmp_path):
     w2 = SimpleNamespace(decision=w.decision + timedelta(days=7))
     jobs._v2_backfill_rows(s, "us_equity", w2)
     assert len(n) == 2
+
+
+def test_backfill_memo_not_cached_on_error(monkeypatch, tmp_path):
+    jobs._BACKFILL_MEMO.clear()
+    n = []
+    monkeypatch.setattr(jobs, "_v2_backfill_rows_uncached", lambda s, f, w: (n.append(1) or [{"fri": "x", "name": "A"}], 1))
+    s = SimpleNamespace(data=str(tmp_path))
+    w = SimpleNamespace(decision=datetime(2026, 10, 18, 23, 45, tzinfo=timezone.utc))
+    jobs._v2_backfill_rows(s, "us_equity", w)
+    jobs._v2_backfill_rows(s, "us_equity", w)
+    assert len(n) == 2
+
+
+def test_partition_pruned_query_same_result(tmp_path):
+    from desk import rawstore
+    import inspect
+    base = tmp_path / "raw" / "hl_ctx"
+    import pyarrow as pa, pyarrow.parquet as pq
+    def put(day, rows):
+        d = base / f"date={day}"; d.mkdir(parents=True, exist_ok=True)
+        cols = list(zip(*rows))
+        pq.write_table(pa.table({n: list(c) for n, c in zip(rawstore.SCHEMA.names, cols)}, schema=rawstore.SCHEMA), d / "p.parquet")
+    ns = lambda s: int(datetime.fromisoformat(s).replace(tzinfo=timezone.utc).timestamp() * 1e9)
+    n = len(rawstore.SCHEMA.names)
+    def row(t, key):
+        vals = {"received_at": ns(t), "key": key}
+        return tuple(vals.get(f.name, ("x" if pa.types.is_string(f.type) or pa.types.is_large_string(f.type) else 0)) for f in rawstore.SCHEMA)
+    put("2026-10-01", [row("2026-10-01T10:00:00", "A")])
+    put("2026-10-17", [row("2026-10-17T23:00:00", "A")])
+    put("2026-10-18", [row("2026-10-18T01:00:00", "A"), row("2026-10-18T02:00:00", "B")])
+    a, b = ns("2026-10-17T00:00:00"), ns("2026-10-18T03:00:00")
+    w = f"key = 'A' AND received_at >= {a} AND received_at < {b}"
+    full = rawstore.query(tmp_path, "hl_ctx", sql_where=w, select="received_at")
+    pruned = rawstore.query(tmp_path, "hl_ctx", sql_where=w, select="received_at", a_ns=a, b_ns=b)
+    assert full == pruned and len(pruned) == 2
+    assert len(rawstore.files_between(tmp_path, "hl_ctx", a, b)) == 2
+    assert rawstore.query(tmp_path, "hl_ctx", sql_where=w, a_ns=ns("2026-09-01T00:00:00"), b_ns=ns("2026-09-02T00:00:00")) == []

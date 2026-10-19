@@ -11,7 +11,8 @@ from .extract import load_events
 
 def _ctx(settings, coin: str, a_ns: int, b_ns: int) -> list[tuple[int, dict]]:
     rows = rawstore.query(settings.data, "hl_ctx", select="received_at, payload",
-                          sql_where=f"key = '{coin}' AND received_at >= {a_ns} AND received_at < {b_ns}")
+                          sql_where=f"key = '{coin}' AND received_at >= {a_ns} AND received_at < {b_ns}",
+                          a_ns=a_ns, b_ns=b_ns)
     return [(r, json.loads(p)["data"]["ctx"]) for r, p in rows]
 
 
@@ -27,7 +28,8 @@ def first_ctx_after(settings, coin: str, t_ns: int, horizon_min: float = 30) -> 
 
 def book_before(settings, coin: str, t_ns: int) -> dict | None:
     rows = rawstore.query(settings.data, "hl_book", select="received_at, payload",
-                          sql_where=f"key = '{coin}' AND received_at >= {t_ns - int(3600e9)} AND received_at < {t_ns}")
+                          sql_where=f"key = '{coin}' AND received_at >= {t_ns - int(3600e9)} AND received_at < {t_ns}",
+                          a_ns=t_ns - int(3600e9), b_ns=t_ns)
     if not rows:
         return None
     levels = json.loads(rows[-1][1])["data"]["levels"]
@@ -46,7 +48,7 @@ def book_before(settings, coin: str, t_ns: int) -> dict | None:
 
 def trade_notional(settings, a_ns: int, b_ns: int, coin: str | None = None) -> tuple[float, int]:
     where = f"received_at >= {a_ns} AND received_at < {b_ns}" + (f" AND key = '{coin}'" if coin else "")
-    rows = rawstore.query(settings.data, "hl_trades", select="payload", sql_where=where)
+    rows = rawstore.query(settings.data, "hl_trades", select="payload", sql_where=where, a_ns=a_ns, b_ns=b_ns)
     seen, total = set(), 0.0
     for (p,) in rows:
         for t in json.loads(p).get("data", []):

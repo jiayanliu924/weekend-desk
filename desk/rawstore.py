@@ -80,12 +80,34 @@ def has_stream(data_dir: Path, stream: str) -> bool:
     return any((Path(data_dir) / "raw" / stream).glob("date=*/*.parquet"))
 
 
+def files_between(data_dir: Path, stream: str, a_ns: int, b_ns: int) -> list[str]:
+    """只列 received_at 落在 [a_ns, b_ns) 可能出现的日期分区（分区按 received_at 的 UTC 日期切）。"""
+    from datetime import timedelta
+    d0 = datetime.fromtimestamp(a_ns / 1e9, tz=timezone.utc).date()
+    d1 = datetime.fromtimestamp(max(a_ns, b_ns) / 1e9, tz=timezone.utc).date()
+    out, d = [], d0
+    base = Path(data_dir) / "raw" / stream
+    while d <= d1:
+        out += sorted(str(p) for p in (base / f"date={d.isoformat()}").glob("*.parquet"))
+        d += timedelta(days=1)
+    return out
+
+
 def query(data_dir: Path, stream: str, sql_where: str = "TRUE", select: str = "*",
-          order: str = "received_at") -> list[tuple]:
+          order: str = "received_at", a_ns: int | None = None, b_ns: int | None = None) -> list[tuple]:
+    """a_ns/b_ns 给了就只读这段时间的日期分区（2026-10-18：以前每次都扫全部历史分区，锁一个合约要 ~1 分钟）。
+    调用方的 sql_where 仍须自己写 received_at 条件——分区裁剪只是少读文件，不改变结果。"""
     if not has_stream(data_dir, stream):
         return []
+    if a_ns is not None and b_ns is not None:
+        files = files_between(data_dir, stream, a_ns, b_ns)
+        if not files:
+            return []
+        src = "[" + ", ".join("'" + f.replace("'", "''") + "'" for f in files) + "]"
+    else:
+        src = f"'{glob(data_dir, stream)}'"
     con = duckdb.connect()
-    q = f"SELECT {select} FROM read_parquet('{glob(data_dir, stream)}', hive_partitioning=true) WHERE {sql_where} ORDER BY {order}"
+    q = f"SELECT {select} FROM read_parquet({src}, hive_partitioning=true) WHERE {sql_where} ORDER BY {order}"
     return con.execute(q).fetchall()
 
 

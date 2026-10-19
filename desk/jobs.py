@@ -162,16 +162,18 @@ def _v2_backfill_rows(settings, fam: str, w: Weekend) -> list[dict]:
     key = (str(settings.data), fam, w.decision.isoformat())
     if key in _BACKFILL_MEMO:
         return [dict(r) for r in _BACKFILL_MEMO[key]]
-    out = _v2_backfill_rows_uncached(settings, fam, w)
+    out, errs = _v2_backfill_rows_uncached(settings, fam, w)
+    if errs or not out:               # 读缓存出错或为空：不缓存，下一个合约重读（不能把一次临时故障锁死一整个周末）
+        return out
     if len(_BACKFILL_MEMO) > 16:
         _BACKFILL_MEMO.clear()
     _BACKFILL_MEMO[key] = [dict(r) for r in out]
     return out
 
 
-def _v2_backfill_rows_uncached(settings, fam: str, w: Weekend) -> list[dict]:
+def _v2_backfill_rows_uncached(settings, fam: str, w: Weekend) -> tuple[list[dict], int]:
     from . import strategy_lab as sl
-    out = []
+    out, errs = [], 0
     for inst in settings.instruments:
         if model.instrument_family(inst["coin"]) != fam:
             continue
@@ -180,10 +182,11 @@ def _v2_backfill_rows_uncached(settings, fam: str, w: Weekend) -> list[dict]:
             rows = sl.weekend_rows(settings, inst, cbi, w.decision) if cbi else []
         except Exception as e:  # noqa: BLE001
             log.warning("v2 停手：读 %s 回补缓存失败：%s", inst["name"], e)
+            errs += 1
             continue
         out += [{"fri": r["fri"], "name": r["name"], "dev_bps": r["dev_bps"], "move_bps": r["move_bps"],
                  "spread_bps": None, "source": f"backfill_{r['gran']}"} for r in rows]
-    return out
+    return out, errs
 
 
 def job_outcome(settings, w: Weekend, push: bool = True) -> dict:
