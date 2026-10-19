@@ -26,6 +26,22 @@ def _path(settings) -> Path:
     return p
 
 
+def _write(settings, d: dict) -> None:
+    """原子写：先写临时文件再 os.replace，读的人永远看不到写了一半的文件。"""
+    import os
+    p = _path(settings)
+    tmp = p.with_suffix(".tmp")
+    tmp.write_text(json.dumps(d, ensure_ascii=False))
+    os.replace(tmp, p)
+
+
+def mark_killed(settings, weekends: list[str]) -> None:
+    st = state(settings)
+    if st.get("_unreadable"):
+        return
+    _write(settings, {**st, "killed_weekends": sorted(set(st.get("killed_weekends", [])) | set(weekends))})
+
+
 def limit(settings) -> float:
     try:
         return float((settings["account"] or {}).get("max_loss_usd", DEFAULT_MAX_LOSS))
@@ -34,10 +50,13 @@ def limit(settings) -> float:
 
 
 def state(settings) -> dict:
-    try:
-        return json.loads(_path(settings).read_text())
-    except (OSError, ValueError):
+    p = _path(settings)
+    if not p.exists():
         return {"tripped": False}
+    try:
+        return json.loads(p.read_text())
+    except (OSError, ValueError):
+        return {"tripped": False, "_unreadable": True}
 
 
 def tripped(settings) -> bool:
@@ -78,7 +97,9 @@ def check(settings) -> dict:
         now = time.time()
         if now - float(st.get("err_alert_ts", 0) or 0) >= 3600:      # 读不到盈亏 = 止损线失明：每小时推一次
             notify.push(settings, "总账户止损线读不到盈亏", "；".join(c["errors"])[:300], priority="high")
-            _path(settings).write_text(json.dumps({**st, "err_alert_ts": now}, ensure_ascii=False))
+            cur = state(settings)                       # 写前重读，别用开头那份旧的覆盖掉刚触发的状态
+            if not cur.get("_unreadable"):
+                _write(settings, {**cur, "err_alert_ts": now})
     if c["tripped"] or c["total_usd"] > -lim:
         return c
     _trip(settings, c)
@@ -88,7 +109,8 @@ def check(settings) -> dict:
 
 def _trip(settings, c: dict) -> None:
     from . import autotrade, pairs_exec
-    _path(settings).write_text(json.dumps({**c, "tripped": True, "ts": time.time()}, ensure_ascii=False))
+    keep = {k: v for k, v in state(settings).items() if k in ("killed_weekends",)}
+    _write(settings, {**keep, **c, "tripped": True, "ts": time.time()})
     for name, mod in (("周末策略", autotrade), ("跨平台套利", pairs_exec)):
         try:
             mod.put(settings, mode="off", updated_by="account_stop")
@@ -106,9 +128,16 @@ def main(argv=None) -> int:
     a = ap.parse_args(argv)
     s = config.load()
     if a.reset:
-        _path(s).write_text(json.dumps({"tripped": False, "reset_ts": time.time()}))   # 先清掉旧基线再算原始合计
-        raw = components(s)["raw_total_usd"]
-        _path(s).write_text(json.dumps({"tripped": False, "reset_ts": time.time(), "baseline_usd": raw}))
+        old = state(s)
+        _write(s, {"tripped": old.get("tripped", False)})       # 先去掉旧基线，算原始合计
+        comp = components(s)
+        if comp["errors"]:
+            _write(s, old)
+            print("没解除：有一条线的盈亏读不到，基线会算错。", comp["errors"])
+            return 1
+        raw = comp["raw_total_usd"]
+        _write(s, {"tripped": False, "reset_ts": time.time(), "baseline_usd": raw,
+                   "killed_weekends": old.get("killed_weekends", [])})
         print(f"已解除总账户止损（从现在的累计 ${raw:.2f} 起重新算 −${limit(s):.0f}）。需要的话再手动把各条线切回真下单。")
     c = components(s)
     print(json.dumps({**c, "limit_usd": limit(s), "tripped": tripped(s)}, ensure_ascii=False, indent=1))

@@ -97,3 +97,24 @@ def test_read_error_pushes_hourly(env, monkeypatch):
     account_stop.check(s)
     account_stop.check(s)
     assert len(pushes) == 1
+
+
+def test_reset_aborts_when_unreadable(env, monkeypatch):
+    s, _, _ = env
+    _pnl(monkeypatch, -600.0, [])
+    account_stop.check(s)
+    from desk import config
+    monkeypatch.setattr(config, "load", lambda: s)
+    monkeypatch.setattr(autotrade, "realized_total", lambda s: (_ for _ in ()).throw(OSError("x")))
+    assert account_stop.main(["--reset"]) == 1
+    assert account_stop.tripped(s)
+
+
+def test_kill_check_tripped_without_positions_does_not_connect(env, monkeypatch):
+    s, _, _ = env
+    _pnl(monkeypatch, -600.0, [])
+    account_stop.check(s)
+    monkeypatch.setattr(autotrade, "get", lambda st: {"mode": "off", "max_loss_usd": 20})
+    monkeypatch.setattr(autotrade, "_led", lambda st: SimpleNamespace(all=lambda: []))
+    monkeypatch.setattr(autotrade, "client", lambda: (_ for _ in ()).throw(AssertionError("connected")))
+    assert autotrade.kill_check(s) is None

@@ -208,6 +208,12 @@ def kill_check(settings, c=None) -> dict | None:
         if r["kind"] == "entry" and r.get("sent") and not any(
                 x["kind"] == "exit" and x["weekend"] == r["weekend"] for x in led.all()):
             open_coins.append((r["weekend"], r["coin"], r["name"]))
+    if cfg["mode"] != "live":
+        # 只因总止损触发而在看守：没仓位就不连交易所；已经紧急平过的周末不重复平、不重复推送
+        done_w = set(account_stop.state(settings).get("killed_weekends", []))
+        open_coins = [o for o in open_coins if o[0] not in done_w]
+        if not open_coins:
+            return None
     try:
         c = c or client()
         unreal = 0.0
@@ -229,6 +235,7 @@ def kill_check(settings, c=None) -> dict | None:
             except Exception:  # noqa: BLE001
                 pass
         put(settings, mode="off")
+        account_stop.mark_killed(settings, [o[0] for o in open_coins])
         notify.push(settings, "看门狗已紧急平仓并关闭自动下单",
                     f"已实现+未实现合计 ${total:.2f}，超过上限 ${cfg['max_loss_usd']:.0f}。已平：{'、'.join(closed)}", priority="max")
         return {"killed": True, "total_usd": total, "closed": closed}
