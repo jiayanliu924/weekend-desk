@@ -25,4 +25,5 @@ bash /opt/weekend-desk/setup_web.sh
 (cd /opt/weekend-desk && ./venv/bin/python -m desk refreeze || true)
 sleep 30
 ./venv/bin/python -m desk status
-(cd /opt/weekend-desk && nohup ./venv/bin/python -m desk.labs_auto > /opt/weekend-desk/data/labs_auto.log 2>&1 &)
+# 回测单独限内存（350M）、低优先级跑，超了只杀它自己，不拖垮网站和下单
+(cd /opt/weekend-desk && nohup systemd-run --scope --quiet -p MemoryMax=350M -p MemorySwapMax=0 -p CPUQuota=50% nice -n 19 ./venv/bin/python -m desk.labs_auto >> /opt/weekend-desk/data/labs_auto.log 2>&1 &)

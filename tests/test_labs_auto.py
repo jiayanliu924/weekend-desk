@@ -247,3 +247,23 @@ def test_labs_page_tolerates_missing_fields(env):  # noqa: F811
     (d / "latest.json").write_text(json.dumps({"generated_at": "2026-10-19T13:00:00", "ranking": [{"rank": 1, "line": "旧格式"}], "errors": {}}))
     r = c.get("/labs")
     assert r.status_code == 200 and "旧格式" in r.text
+
+
+def test_labs_cmd_is_memory_capped_subprocess(monkeypatch):
+    import shutil
+    from desk import scheduler
+    monkeypatch.setattr(shutil, "which", lambda n: "/usr/bin/systemd-run")
+    cmd = scheduler.labs_cmd("/py")
+    assert cmd[0] == "systemd-run" and "MemoryMax=350M" in cmd and cmd[-2:] == ["-m", "desk.labs_auto"]
+    monkeypatch.setattr(shutil, "which", lambda n: None)
+    assert scheduler.labs_cmd("/py")[:3] == ["nice", "-n", "19"]
+
+
+def test_labs_cmd_is_memory_capped_subprocess(monkeypatch):
+    import shutil
+    from desk import scheduler
+    monkeypatch.setattr(shutil, "which", lambda n: "/usr/bin/systemd-run")
+    cmd = scheduler.labs_cmd("/py")
+    assert cmd[0] == "systemd-run" and "MemoryMax=350M" in cmd and cmd[-2:] == ["-m", "desk.labs_auto"]
+    monkeypatch.setattr(shutil, "which", lambda n: None)
+    assert scheduler.labs_cmd("/py")[:3] == ["nice", "-n", "19"]
