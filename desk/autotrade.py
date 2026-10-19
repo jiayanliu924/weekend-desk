@@ -199,7 +199,8 @@ def kill_check(settings, c=None) -> dict | None:
     这个函数应在重开后、正式平仓前被调度器定期调用。
     """
     cfg = get(settings)
-    if cfg["mode"] != "live":
+    from . import account_stop
+    if cfg["mode"] != "live" and not account_stop.tripped(settings):   # 总止损把模式切成 off 后，开着的仓仍要看守到平掉
         return None
     led = _led(settings)
     open_coins = []

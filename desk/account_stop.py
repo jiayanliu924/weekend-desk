@@ -58,7 +58,11 @@ def components(settings) -> dict:
                                      for p in st.get("pairs", {}).values() if p.get("closed")))
     except Exception as e:  # noqa: BLE001
         out["errors"].append(f"pairs: {e}")
-    out["total_usd"] = out["weekend_usd"] + out["pairs_usd"]
+    raw = out["weekend_usd"] + out["pairs_usd"]
+    base = float(state(settings).get("baseline_usd", 0.0) or 0.0)   # --reset 时记下的累计盈亏，之后只算新增亏损
+    out["raw_total_usd"] = raw
+    out["baseline_usd"] = base
+    out["total_usd"] = raw - base
     return out
 
 
@@ -71,6 +75,10 @@ def check(settings) -> dict:
     c["tripped"] = bool(st.get("tripped"))
     if c["errors"]:
         log.warning("account_stop: %s", c["errors"])
+        now = time.time()
+        if now - float(st.get("err_alert_ts", 0) or 0) >= 3600:      # 读不到盈亏 = 止损线失明：每小时推一次
+            notify.push(settings, "总账户止损线读不到盈亏", "；".join(c["errors"])[:300], priority="high")
+            _path(settings).write_text(json.dumps({**st, "err_alert_ts": now}, ensure_ascii=False))
     if c["tripped"] or c["total_usd"] > -lim:
         return c
     _trip(settings, c)
@@ -98,8 +106,10 @@ def main(argv=None) -> int:
     a = ap.parse_args(argv)
     s = config.load()
     if a.reset:
-        _path(s).write_text(json.dumps({"tripped": False, "reset_ts": time.time()}))
-        print("已解除总账户止损。需要的话再手动把各条线切回真下单。")
+        _path(s).write_text(json.dumps({"tripped": False, "reset_ts": time.time()}))   # 先清掉旧基线再算原始合计
+        raw = components(s)["raw_total_usd"]
+        _path(s).write_text(json.dumps({"tripped": False, "reset_ts": time.time(), "baseline_usd": raw}))
+        print(f"已解除总账户止损（从现在的累计 ${raw:.2f} 起重新算 −${limit(s):.0f}）。需要的话再手动把各条线切回真下单。")
     c = components(s)
     print(json.dumps({**c, "limit_usd": limit(s), "tripped": tripped(s)}, ensure_ascii=False, indent=1))
     return 0

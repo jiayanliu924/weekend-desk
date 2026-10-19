@@ -73,3 +73,27 @@ def test_default_limit_when_section_missing(tmp_path):
     class T(dict):
         data = str(tmp_path)
     assert account_stop.limit(T()) == 500.0
+
+
+def test_reset_sets_baseline_and_does_not_retrip(env, monkeypatch):
+    s, pushes, _ = env
+    _pnl(monkeypatch, -600.0, [])
+    assert account_stop.check(s)["tripped"]
+    from desk import config
+    monkeypatch.setattr(config, "load", lambda: s)
+    account_stop.main(["--reset"])
+    c = account_stop.check(s)
+    assert not c["tripped"] and c["total_usd"] == 0.0
+    _pnl(monkeypatch, -1050.0, [])          # 新增亏 450：不触发
+    assert not account_stop.check(s)["tripped"]
+    _pnl(monkeypatch, -1100.0, [])          # 新增亏 500：触发
+    assert account_stop.check(s)["tripped"]
+
+
+def test_read_error_pushes_hourly(env, monkeypatch):
+    s, pushes, _ = env
+    monkeypatch.setattr(autotrade, "realized_total", lambda s: (_ for _ in ()).throw(OSError("x")))
+    monkeypatch.setattr(pairs_exec, "load_state", lambda s: {"pairs": {}})
+    account_stop.check(s)
+    account_stop.check(s)
+    assert len(pushes) == 1
