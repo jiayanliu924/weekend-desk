@@ -780,7 +780,10 @@ def _open_pair(ctx: Ctx, pair: dict, sig: dict, st: dict) -> dict:
     why = {"max_leg": cf["max_leg_notional_usd"], "depth": n_depth, "gross": n_gross}
     if notional < MIN_ORDER_USD:
         return {"skipped": f"可下名义 ${max(notional, 0):.2f} < 交易所最小 ${MIN_ORDER_USD:.0f}（{', '.join(f'{k}=${v:.0f}' for k, v in why.items())}）"}
-    sig = {**sig, "s_entry": s_live}
+    if max(abs(s_live), abs(sig["spread"])) >= float(cf["max_abs_spread_bps"]):
+        return {"skipped": "价差异常大，像是报价坏了"}
+    # 入场价差取实时盘口价差与信号 K 线价差里绝对值大的那个（同号），避免反向止损拿"偏小的入场价"误触发
+    sig = {**sig, "s_entry": s_live if abs(s_live) >= abs(sig["spread"]) else sig["spread"]}
     plan = {"pair": key, "rich_short": rich, "cheap_long": cheap, "notional_usd": round(notional, 2), "spread_bps": round(s_live, 1),
             "thr_bps": round(sig["thr"], 1), "variant": sig["variant"], "bar_t": sig["bar_t"]}
     if ctx.mode == "shadow":
@@ -1088,7 +1091,8 @@ def _spread_exits(ctx: Ctx, data: dict, out: dict):
         s_bar = None
         if o["pair_key"] in pk:
             sg_ = _series(pk[o["pair_key"]], data, iv_ms, ctx.now_ms)
-            if sg_ and sg_[-1][0] >= ctx.now_ms - 3 * iv_ms:
+            # 只看开仓之后才收盘的 K 线（序列时刻 = 收盘时刻）：开仓时的信号 K 线是旧的，不能拿来跟实时入场价差比
+            if sg_ and sg_[-1][0] >= ctx.now_ms - 3 * iv_ms and sg_[-1][0] > o["t_ms"]:
                 s_bar = pl.spread_series(sg_, "same", iv_ms)[-1]
         if wrong_way(o, s_bar, ctx.cf) or wrong_way(o, _live_spread(ctx, o), ctx.cf):
             done = _close_pair(ctx, pid, "wrong_way", load_state(ctx.settings))
@@ -1249,7 +1253,7 @@ def _step(settings, now: datetime, client, data) -> dict:
         if res.get("skipped"):
             _note_skip(ctx, key, bar_t, res["skipped"])
             out["skips"].append((key, res["skipped"]))
-            rows.append(_row(key, sig, f"没开：{res['skipped']}"))
+            rows.append(_row(key, sig, res["skipped"] if res["skipped"].startswith("价差异常大") else f"没开：{res['skipped']}"))
         else:
             out["entries"].append(res)
             ok = bool(res.get("opened"))
@@ -1281,14 +1285,8 @@ def _row(key: str, sig: dict, reason: str, entered: bool = False) -> dict:
 
 
 def _blanket_rows(ctx: Ctx, data: dict, reason: str) -> list[dict]:
-    rows = []
-    for pair in data["pairs"]:
-        try:
-            sig = signal(pair, data, ctx.cf, ctx.now_ms)
-        except Exception:  # noqa: BLE001
-            sig = {}
-        rows.append(_row(_pair_key(pair), sig, reason))
-    return rows
+    """整步都不开仓时的决策表：只写原因，不调用 signal()（它可能慢 / 出错，而这里不需要）。"""
+    return [_row(_pair_key(pair), {}, reason) for pair in data["pairs"]]
 
 
 def decision_path(settings) -> Path:
@@ -1298,16 +1296,16 @@ def decision_path(settings) -> Path:
 
 
 def _write_decisions(ctx: Ctx, out: dict, rows: list[dict]):
-    """每个 live / shadow step 写一份决策表 + 一行 INFO 汇总。写失败不影响交易。"""
-    n_in = sum(1 for r in rows if r["entered"])
-    ratios = [(abs(r["spread_bps"]) / r["thr_bps"], r) for r in rows if r["spread_bps"] is not None and r["thr_bps"]]
-    best = max(ratios, key=lambda x: x[0])[1] if ratios else None
-    log.info("pairs step[%s]: 检查 %d 对，最大 |价差|/门槛 = %s，开仓 %d 笔", ctx.mode, len(rows),
-             f"{abs(best['spread_bps']):.0f}/{best['thr_bps']:.0f} bps（{best['key']}）" if best else "无", n_in)
+    """每个 live / shadow step 写一份决策表 + 一行 INFO 汇总。任何失败都不影响交易。"""
     try:
+        n_in = sum(1 for r in rows if r["entered"])
+        ratios = [(abs(r["spread_bps"]) / r["thr_bps"], r) for r in rows if r["spread_bps"] is not None and r["thr_bps"]]
+        best = max(ratios, key=lambda x: x[0])[1] if ratios else None
+        log.info("pairs step[%s]: 检查 %d 对，最大 |价差|/门槛 = %s，开仓 %d 笔", ctx.mode, len(rows),
+                 f"{abs(best['spread_bps']):.0f}/{best['thr_bps']:.0f} bps（{best['key']}）" if best else "无", n_in)
         doc = {"ts": datetime.fromtimestamp(ctx.now_ms / 1000, timezone.utc).isoformat(), "ts_ms": ctx.now_ms, "mode": ctx.mode, "pairs": rows}
         decision_path(ctx.settings).write_text(json.dumps(doc, ensure_ascii=False, indent=1))
-    except OSError as e:
+    except Exception as e:  # noqa: BLE001
         log.warning("decision file: %s", e)
 
 
@@ -1317,8 +1315,12 @@ def decision_lines(settings) -> list[str]:
         doc = json.loads(decision_path(settings).read_text())
     except (OSError, ValueError):
         return ["还没有决策记录（live / shadow 模式跑过一个 step 之后才有）"]
-    ts = datetime.fromtimestamp(doc["ts_ms"] / 1000, timezone.utc).astimezone(ZoneInfo("America/New_York")).strftime("%m-%d %H:%M")
-    lines = [f"最近一次决策（{ts} 纽约时间，模式 {doc.get('mode')}）："]
+    t0 = datetime.fromtimestamp(doc["ts_ms"] / 1000, timezone.utc)
+    try:
+        ts, zn = t0.astimezone(ZoneInfo("America/New_York")).strftime("%m-%d %H:%M"), "纽约时间"
+    except Exception:  # noqa: BLE001
+        ts, zn = t0.strftime("%m-%d %H:%M"), "UTC"
+    lines = [f"最近一次决策（{ts} {zn}，模式 {doc.get('mode')}）："]
     for r in doc.get("pairs", []):
         sp = "无" if r["spread_bps"] is None else f"{r['spread_bps']:+.0f} bps"
         th = "无" if r["thr_bps"] is None else f"{r['thr_bps']:.0f} bps"
@@ -1348,6 +1350,9 @@ def _step_shadow(ctx: Ctx, data: dict, out: dict) -> dict:
         block = _entry_block(pair, data, cf, ctx.now_ms, black, halted)
         if block:
             rows.append(_row(key, sig, block))
+            continue
+        if abs(sig["spread"]) >= float(cf["max_abs_spread_bps"]):
+            rows.append(_row(key, sig, "价差异常大，像是报价坏了"))
             continue
         sg = 1 if sig["spread"] > 0 else -1
         rich, cheap = (pair["a"], pair["b"]) if sg > 0 else (pair["b"], pair["a"])

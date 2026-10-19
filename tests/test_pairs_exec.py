@@ -1277,3 +1277,59 @@ def test_status_without_decision_file(s, monkeypatch, capsys):
     monkeypatch.setattr(config, "load", lambda *a, **k: s)
     px.main(["--status"])
     assert "还没有决策记录" in capsys.readouterr().out
+
+
+# ---- 评审第 1 轮
+def test_wrong_way_ignores_stale_signal_bar_right_after_entry(s):
+    fc = FakeClient()
+    out, data, now = live_entry(s, fc)
+    o = next(iter(pairs_state(s).values()))["open"]
+    # 入场用的是实时价差更大的那个（同号）；信号 K 线收盘早于开仓 → 不参与反向止损
+    assert abs(o["s_entry"]) >= abs(o["s0"]) - 1e-9 and o["s_entry"] * o["s0"] > 0
+    cfg_set(s, wrong_way_mult=1.0)                     # 若旧的 K 线价差 80 参与比较（80 ≥ 1×80），会立刻误触发
+    fc.mids[A] = 120.0 * 1.007                         # 实时价差降到 70：没有反向
+    out = px.step(s, later(now, 5), client=fc, data=data)
+    assert [e for e in out["exits"] if e["reason"] == "wrong_way"] == []
+
+
+def test_wrong_way_uses_bar_closed_after_entry(s):
+    fc = FakeClient()
+    out, data, now = live_entry(s, fc)
+    data2, now2 = make_data(tail=(300.0,))             # 开仓之后又收了一根 300 bps 的 K 线
+    px.step(s, now2, client=fc, data=data2)
+    assert next(iter(pairs_state(s).values()))["closed"]["reason"] == "wrong_way"
+
+
+def test_entry_blocked_when_live_spread_absurd(s):
+    fc = FakeClient()
+    fc.mids[A] = 120.0 * 1.031                         # 实时价差约 310 bps ≥ 300，K 线信号仍是 80
+    out, data, now = live_entry(s, fc)
+    assert out["entries"] == [] and fc.orders == [] and fc.leverage == {}
+    assert row(s)["reason"] == "价差异常大，像是报价坏了"
+
+
+def test_halt_branch_rows_do_not_call_signal(s, monkeypatch):
+    fc = FakeClient()
+    set_mode(s, "live")
+    px.put(s, halt_entries=True, halt_reason="t")
+    data, now = make_data()
+    monkeypatch.setattr(px, "signal", lambda *a, **k: (_ for _ in ()).throw(AssertionError("signal called")))
+    px.step(s, now, client=fc, data=data)
+    r = row(s)
+    assert "停开新仓" in r["reason"] and r["spread_bps"] is None
+
+
+def test_decision_write_failure_never_aborts_step(s, monkeypatch):
+    fc = FakeClient()
+    monkeypatch.setattr(px, "decision_path", lambda st: (_ for _ in ()).throw(RuntimeError("boom")))
+    out, data, now = live_entry(s, fc)
+    assert out["entries"] and out["entries"][0]["opened"]
+
+
+def test_decision_lines_tz_fallback(s, monkeypatch):
+    fc = FakeClient()
+    set_mode(s, "live")
+    data, now = make_data()
+    px.step(s, now, client=fc, data=data)
+    monkeypatch.setattr(px, "ZoneInfo", lambda n: (_ for _ in ()).throw(KeyError(n)))
+    assert "UTC" in px.decision_lines(s)[0]
