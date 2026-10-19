@@ -17,6 +17,9 @@
 5. 同一个币同时只允许一对在场；开仓前交易所该币持仓必须为 0（有手动仓位 / 其他配对就不开）；改杠杆回包必须 ok。
 6. 估值：盘口买卖价差太宽时不用中间价（用 mark，再退回最近成交价并标记 stale）；盈亏含资金费（userFunding）。
 7. 一个 step 用 flock 串行化；抓数据有超时，不会卡死调度循环，也不会妨碍已有仓位的平仓 / 止损。
+8. 开仓守卫（只拦新开仓，平仓 / 止损永远照跑）：休市禁开（周五 19:30 → 周日 20:35 纽约时间）、腿不活跃、币被下架 / 暂停。
+9. 反向止损 wrong_way：同向价差扩大到入场价差的 wrong_way_mult 倍，或绝对价差 ≥ max_abs_spread_bps → 平仓并锁 24h。
+10. 每个 step 把"为什么开 / 没开"写进 data/state/pairs_last_decision.json；python -m desk.pairs_exec --status 用中文打印。
 清除"停开新仓"标志：python -m desk.pairs_exec --clear-halt
 """
 from __future__ import annotations
@@ -32,6 +35,7 @@ import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from . import autotrade, notify
 from . import backtest_lib as bl
@@ -64,6 +68,14 @@ DEFAULTS = {
     "repoll_tries": 3,                # 下单回包异常后，重查成交 / 持仓的次数
     "repoll_s": 2.0,                  # 每次重查之间等多久
     "data_reuse_s": 600.0,            # 超时后才完成的抓数据结果，多久之内还能用
+    "blackout_start": "FRI 19:30",    # 休市禁开新仓：起点（含）。设成 "" 关闭
+    "blackout_end": "SUN 20:35",      # 终点（不含）
+    "blackout_tz": "America/New_York",
+    "wrong_way_mult": 2.0,            # 同向价差 ≥ 入场价差 × 这个倍数 → 反向止损
+    "max_abs_spread_bps": 300.0,      # 绝对价差 ≥ 这个 → 无条件平
+    "stale_bars": 6,                  # 腿不活跃检查看最近几根 5m K 线
+    "stale_min_zero": 3,              # 其中零成交的根数 ≥ 这个 → 不开
+    "stale_move_bps": 10.0,           # 一条腿收盘价没动、另一条动了超过这个 → 不开
 }
 _sleep = time.sleep                   # 测试里替换
 
@@ -564,7 +576,7 @@ def signal(pair: dict, data: dict, cf: dict, now_ms: int) -> dict:
     _, picks = pl.walk_forward(by_v, days, cf["warmup_days"])
     best = picks.get(d)
     if not best:
-        return {**out, "ok": False, "why": "走前今天没有选中变体（历史累计净收益 ≤ 0）"}
+        return {**out, "ok": False, "no_variant": True, "why": "走前今天没有选中变体（历史累计净收益 ≤ 0）"}
     v = next(v for v in pl.variants() if pl.vname(v) == best)
     return {**out, "thr": cost + v[0], "variant": best, "exit_mode": v[1], "cost": cost}
 
@@ -621,7 +633,7 @@ def load_data(settings, now_ms: int, cf: dict) -> dict:
                 funding[coin] = old[1]
             else:
                 funding[coin] = bl.get_funding(settings, coin, cf["lookback_days"])[0]
-    data = {"pairs": pairs, "candles": candles, "funding": funding,
+    data = {"pairs": pairs, "candles": candles, "funding": funding, "halted": halted_coins(raw),
             "funding_t": {c: (time.time(), r) for c, r in funding.items()}}
     _DATA.update(key=key, data=data, settings=str(settings.data))
     return data
@@ -671,6 +683,72 @@ def load_data_limited(settings, now_ms: int, cf: dict) -> dict:
         raise TimeoutError(f"抓数据超过 {cf['data_timeout_s']}s") from e
 
 
+
+# ------------------------------------------------------------------ 开仓守卫（只拦新开仓；平仓 / 止损不受影响）
+_DOW = {"MON": 0, "TUE": 1, "WED": 2, "THU": 3, "FRI": 4, "SAT": 5, "SUN": 6}
+HALT_FLAGS = ("isDelisted", "halted", "isHalted", "tradingHalted")   # universe 原始数据里可能出现的下架 / 暂停字段
+
+
+def _mow(spec: str) -> int:
+    """"FRI 19:30" → 一周内的第几分钟（周一 00:00 = 0）。"""
+    d, hm = spec.split()
+    h, m = hm.split(":")
+    return _DOW[d.upper()[:3]] * 1440 + int(h) * 60 + int(m)
+
+
+def in_blackout(cf: dict, now_ms: int) -> bool:
+    """休市禁开窗口（本地墙上时间，自动跟随夏令时）：[blackout_start, blackout_end)。时区读不到 → 保守当作禁开。"""
+    if not str(cf.get("blackout_start") or "").strip():
+        return False
+    try:
+        loc = datetime.fromtimestamp(now_ms / 1000, timezone.utc).astimezone(ZoneInfo(cf["blackout_tz"]))
+        a, b = _mow(cf["blackout_start"]), _mow(cf["blackout_end"])
+    except Exception as e:  # noqa: BLE001
+        log.warning("blackout config/tz unusable (%s) → 保守禁开", e)
+        return True
+    m = loc.weekday() * 1440 + loc.hour * 60 + loc.minute
+    return a <= m < b if a <= b else (m >= a or m < b)
+
+
+def halted_coins(raw: dict | None) -> set[str]:
+    """从发现的原始 meta 里找下架 / 暂停的币。字段缺失 → 空集（该检查自动跳过）。"""
+    out: set[str] = set()
+    mcs = list((raw or {}).get("dexs", {}).values()) + [(raw or {}).get("main")]
+    for mc in mcs:
+        if not mc or not mc[0]:
+            continue
+        for u in mc[0].get("universe", []) or []:
+            if isinstance(u, dict) and any(u.get(f) for f in HALT_FLAGS):
+                out.add(u.get("name"))
+    return out
+
+
+def stale_leg(pair: dict, data: dict, cf: dict, now_ms: int) -> str | None:
+    """最近 stale_bars 根已收盘 K 线（按时间格，缺的格子算零成交）：任一腿零成交 ≥ stale_min_zero 根，
+    或这条腿收盘价全没动而另一条腿动了 > stale_move_bps → 返回描述，否则 None。用的就是信号已经载入的 K 线。"""
+    iv_ms = bl.INTERVAL_MS[cf["interval"]]
+    n = int(cf["stale_bars"])
+    cm = {}
+    for coin in (pair["a"], pair["b"]):
+        cm[coin] = {int(c["t"]): c for c in data["candles"].get(coin, []) if int(c["t"]) + iv_ms <= now_ms}
+    last = max((max(m) for m in cm.values() if m), default=None)
+    if last is None or n < 1:
+        return None
+    slots = [last - k * iv_ms for k in range(n - 1, -1, -1)]
+    closes, zeros = {}, {}
+    for coin, m in cm.items():
+        cs = [m.get(t) for t in slots]
+        zeros[coin] = sum(1 for c in cs if c is None or float(c.get("v") or 0) <= 0)
+        closes[coin] = [float(c["c"]) for c in cs if c is not None]
+    for coin, other in ((pair["a"], pair["b"]), (pair["b"], pair["a"])):
+        if zeros[coin] >= int(cf["stale_min_zero"]):
+            return f"{coin} 最近 {n} 根里 {zeros[coin]} 根零成交"
+        cc, oc = closes[coin], closes[other]
+        if len(cc) >= 2 and len(set(cc)) == 1 and len(oc) >= 2 and min(oc) > 0 and (max(oc) - min(oc)) / min(oc) * 1e4 > cf["stale_move_bps"]:
+            return f"{coin} 收盘价 {n} 根没动而 {other} 在动"
+    return None
+
+
 # ------------------------------------------------------------------ 开仓
 def _locked(st: dict, key: str, now_ms: int) -> bool:
     lk = st["locks"].get(key)
@@ -702,6 +780,7 @@ def _open_pair(ctx: Ctx, pair: dict, sig: dict, st: dict) -> dict:
     why = {"max_leg": cf["max_leg_notional_usd"], "depth": n_depth, "gross": n_gross}
     if notional < MIN_ORDER_USD:
         return {"skipped": f"可下名义 ${max(notional, 0):.2f} < 交易所最小 ${MIN_ORDER_USD:.0f}（{', '.join(f'{k}=${v:.0f}' for k, v in why.items())}）"}
+    sig = {**sig, "s_entry": s_live}
     plan = {"pair": key, "rich_short": rich, "cheap_long": cheap, "notional_usd": round(notional, 2), "spread_bps": round(s_live, 1),
             "thr_bps": round(sig["thr"], 1), "variant": sig["variant"], "bar_t": sig["bar_t"]}
     if ctx.mode == "shadow":
@@ -766,7 +845,7 @@ def _live_open(ctx: Ctx, pair: dict, sig: dict, st: dict, key: str, sg: int, ric
             return {"skipped": f"设置 {c} 杠杆回包不是 ok：{str(r)[:100]}，不开仓"}
     n_open = sum(1 for r in ctx.led.all() if r["kind"] == "open")
     pair_id = f"{_slug(key)}-{now_ms}-{n_open + 1}"
-    ctx.led.append("open", pair_id, {"pair_id": pair_id, "pair_key": key, "a": pair["a"], "b": pair["b"], "sg": sg, "s0": sig["spread"],
+    ctx.led.append("open", pair_id, {"pair_id": pair_id, "pair_key": key, "a": pair["a"], "b": pair["b"], "sg": sg, "s0": sig["spread"], "s_entry": sig.get("s_entry", sig["spread"]),
                                      "thr": sig["thr"], "variant": sig["variant"], "exit_mode": sig["exit_mode"],
                                      "t_ms": now_ms, "bar_t": sig["bar_t"], "notional_target": notional,
                                      "rich_short": rich, "cheap_long": cheap, "lev": lev})
@@ -974,21 +1053,52 @@ def _manage_one(ctx: Ctx, pid: str, out: dict):
                 _write_lock(ctx, o["pair_key"], reason)
 
 
+def wrong_way(o: dict, s: float | None, cf: dict) -> bool:
+    """价差往不利方向走：与入场同号且 |s| ≥ wrong_way_mult × |s_entry|；或 |s| ≥ max_abs_spread_bps（不论方向）。"""
+    if s is None:
+        return False
+    if abs(s) >= float(cf["max_abs_spread_bps"]):
+        return True
+    se = o.get("s_entry", o.get("s0"))
+    return bool(se) and s * se > 0 and abs(s) >= float(cf["wrong_way_mult"]) * abs(se)
+
+
+def _live_spread(ctx: Ctx, o: dict) -> float | None:
+    """实时价差（bps）。用 ctx.mark：盘口太宽时不用中间价；任一腿拿不到可靠价格 → None（不据此止损）。"""
+    pa, sa = ctx.mark(o["a"], None)
+    pb, sb = ctx.mark(o["b"], None)
+    if not pa or not pb or sa or sb:
+        return None
+    return (pa / pb - 1) * 1e4
+
+
 def _spread_exits(ctx: Ctx, data: dict, out: dict):
-    """阶段二（需要 K 线）：价差按该变体的出场规则收敛。"""
+    """阶段二（需要 K 线）：币被下架 / 暂停 → 平；反向止损 wrong_way（K 线价差或实时盘口价差任一触发）→ 平并锁定；价差按该变体的出场规则收敛。"""
     iv_ms = bl.INTERVAL_MS[ctx.cf["interval"]]
     pk = {_pair_key(p): p for p in data["pairs"]}
+    halted = set(data.get("halted") or ())
     for pid, p in open_pairs(load_state(ctx.settings)).items():
         o = p["open"]
-        if o["pair_key"] not in pk or p["unknown"] or p["close_req"]:
+        if p["unknown"] or p["close_req"]:
             continue
-        sg_ = _series(pk[o["pair_key"]], data, iv_ms, ctx.now_ms)
-        if sg_ and sg_[-1][0] >= ctx.now_ms - 3 * iv_ms:
-            s_now = pl.spread_series(sg_, "same", iv_ms)[-1]
-            if _exit_due(o["exit_mode"], o["sg"], o["s0"], s_now):
-                reason = f"exit_{o['exit_mode']}"
-                done = _close_pair(ctx, pid, reason, load_state(ctx.settings))
-                out["exits"].append({"pair_id": pid, "reason": reason, "closed": done})
+        if halted & {o["a"], o["b"], *p["net"]}:
+            done = _close_pair(ctx, pid, "halted", load_state(ctx.settings))
+            out["exits"].append({"pair_id": pid, "reason": "halted", "closed": done})
+            continue
+        s_bar = None
+        if o["pair_key"] in pk:
+            sg_ = _series(pk[o["pair_key"]], data, iv_ms, ctx.now_ms)
+            if sg_ and sg_[-1][0] >= ctx.now_ms - 3 * iv_ms:
+                s_bar = pl.spread_series(sg_, "same", iv_ms)[-1]
+        if wrong_way(o, s_bar, ctx.cf) or wrong_way(o, _live_spread(ctx, o), ctx.cf):
+            done = _close_pair(ctx, pid, "wrong_way", load_state(ctx.settings))
+            out["exits"].append({"pair_id": pid, "reason": "wrong_way", "closed": done})
+            _write_lock(ctx, o["pair_key"], "wrong_way")
+            continue
+        if s_bar is not None and _exit_due(o["exit_mode"], o["sg"], o["s0"], s_bar):
+            reason = f"exit_{o['exit_mode']}"
+            done = _close_pair(ctx, pid, reason, load_state(ctx.settings))
+            out["exits"].append({"pair_id": pid, "reason": reason, "closed": done})
 
 
 def _daily_stop(ctx: Ctx, out: dict) -> bool:
@@ -1085,6 +1195,7 @@ def _step(settings, now: datetime, client, data) -> dict:
     from . import account_stop
     if account_stop.check(settings).get("tripped"):      # 总账户止损：已开仓位上面已照管，这里只是不开新仓
         out["skips"].append("account_stop")
+        _write_decisions(ctx, out, _blanket_rows(ctx, data, "总账户止损已触发，停开新仓"))
         return out
     h = get(settings)
     if h.get("halt_entries"):
@@ -1093,54 +1204,150 @@ def _step(settings, now: datetime, client, data) -> dict:
                         f"原因：{h.get('halt_reason', '?')}。核对交易所持仓后，运行 python -m desk.pairs_exec --clear-halt 清除。", priority="high")
             put(settings, halt_alert_ts=now_ms)
         out["skips"].append("halt_entries")
+        _write_decisions(ctx, out, _blanket_rows(ctx, data, f"停开新仓标志（{h.get('halt_reason') or '?'}）"))
         return out
     pk = {_pair_key(p): p for p in data["pairs"]}
+    rows: list[dict] = []
+    black, halted = in_blackout(cf, now_ms), set(data.get("halted") or ())
     for key, pair in pk.items():
         st = load_state(settings)
         sig = signal(pair, data, cf, now_ms)
         bar_t = sig.get("bar_t", 0)
         if not sig["ok"]:
             out["skips"].append((key, sig["why"]))
+            rows.append(_row(key, sig, "走前判断今天不做" if sig.get("no_variant") else f"数据不可用：{sig['why']}"))
             continue
         if abs(sig["spread"]) <= sig["thr"]:
             if key in st["locks"]:        # 价差已回到门槛以内 → 解除锁定
                 ctx.led.append("lock_clear", key, {"pair_key": key, "t_ms": now_ms})
+            rows.append(_row(key, sig, f"价差 {abs(sig['spread']):.0f} < 门槛 {sig['thr']:.0f}"))
             continue
         reason = None
+        short = None
         live = open_pairs(st)
         last = [p["open"] for p in st["pairs"].values() if p["open"]["pair_key"] == key]
         if _locked(st, key, now_ms):
-            reason = "止损 / 超时出场后锁定中（24h 或价差回到门槛以内才解除）"
+            reason, short = "止损 / 超时出场后锁定中（24h 或价差回到门槛以内才解除）", "止损锁定中"
         elif any(p["open"]["pair_key"] == key for p in live.values()):
-            reason = "这一对已有仓位"
+            reason = short = "这一对已有仓位"
         elif last and (last[-1]["bar_t"] == bar_t or now_ms - last[-1]["t_ms"] < cf["cooldown_min"] * 60_000):
             reason = "冷却中 / 同一根 K 线已入场过"
+            short = reason
         elif len(live) >= cf["max_concurrent"]:
-            reason = f"同时持有的配对已达上限 {cf['max_concurrent']}"
+            reason = short = f"同时持有的配对已达上限 {cf['max_concurrent']}"
         if reason:
             _note_skip(ctx, key, bar_t, reason)
             out["skips"].append((key, reason))
+            rows.append(_row(key, sig, "已开仓" if reason == "这一对已有仓位" else short))
+            continue
+        block = _entry_block(pair, data, cf, now_ms, black, halted)
+        if block:
+            out["skips"].append((key, block))
+            rows.append(_row(key, sig, block))
             continue
         res = _open_pair(ctx, pair, sig, st)
         if res.get("skipped"):
             _note_skip(ctx, key, bar_t, res["skipped"])
             out["skips"].append((key, res["skipped"]))
+            rows.append(_row(key, sig, f"没开：{res['skipped']}"))
         else:
             out["entries"].append(res)
+            ok = bool(res.get("opened"))
+            rows.append(_row(key, sig, "已开仓" if ok else f"开仓未成功：{res.get('error') or '一条腿没成交，已回补'}", entered=ok))
         if get(settings).get("halt_entries"):
             break
+    _write_decisions(ctx, out, rows)
     return out
 
 
+def _entry_block(pair: dict, data: dict, cf: dict, now_ms: int, black: bool, halted: set) -> str | None:
+    """只拦新开仓的守卫，→ 中文原因或 None。"""
+    if black:
+        return "休市禁开"
+    bad = sorted(halted & {pair["a"], pair["b"]})
+    if bad:
+        return f"{'、'.join(bad)} 已下架 / 暂停"
+    st_ = stale_leg(pair, data, cf, now_ms)
+    if st_:
+        return f"腿不活跃（{st_}）"
+    return None
+
+
+# ------------------------------------------------------------------ 决策透明度
+def _row(key: str, sig: dict, reason: str, entered: bool = False) -> dict:
+    r = lambda x: None if x is None else round(float(x), 1)  # noqa: E731
+    return {"key": key, "spread_bps": r(sig.get("spread")), "thr_bps": r(sig.get("thr")), "variant": sig.get("variant"),
+            "entered": entered, "reason": reason}
+
+
+def _blanket_rows(ctx: Ctx, data: dict, reason: str) -> list[dict]:
+    rows = []
+    for pair in data["pairs"]:
+        try:
+            sig = signal(pair, data, ctx.cf, ctx.now_ms)
+        except Exception:  # noqa: BLE001
+            sig = {}
+        rows.append(_row(_pair_key(pair), sig, reason))
+    return rows
+
+
+def decision_path(settings) -> Path:
+    p = Path(settings.data) / "state" / "pairs_last_decision.json"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def _write_decisions(ctx: Ctx, out: dict, rows: list[dict]):
+    """每个 live / shadow step 写一份决策表 + 一行 INFO 汇总。写失败不影响交易。"""
+    n_in = sum(1 for r in rows if r["entered"])
+    ratios = [(abs(r["spread_bps"]) / r["thr_bps"], r) for r in rows if r["spread_bps"] is not None and r["thr_bps"]]
+    best = max(ratios, key=lambda x: x[0])[1] if ratios else None
+    log.info("pairs step[%s]: 检查 %d 对，最大 |价差|/门槛 = %s，开仓 %d 笔", ctx.mode, len(rows),
+             f"{abs(best['spread_bps']):.0f}/{best['thr_bps']:.0f} bps（{best['key']}）" if best else "无", n_in)
+    try:
+        doc = {"ts": datetime.fromtimestamp(ctx.now_ms / 1000, timezone.utc).isoformat(), "ts_ms": ctx.now_ms, "mode": ctx.mode, "pairs": rows}
+        decision_path(ctx.settings).write_text(json.dumps(doc, ensure_ascii=False, indent=1))
+    except OSError as e:
+        log.warning("decision file: %s", e)
+
+
+def decision_lines(settings) -> list[str]:
+    """--status 用：一对一行，纯中文。"""
+    try:
+        doc = json.loads(decision_path(settings).read_text())
+    except (OSError, ValueError):
+        return ["还没有决策记录（live / shadow 模式跑过一个 step 之后才有）"]
+    ts = datetime.fromtimestamp(doc["ts_ms"] / 1000, timezone.utc).astimezone(ZoneInfo("America/New_York")).strftime("%m-%d %H:%M")
+    lines = [f"最近一次决策（{ts} 纽约时间，模式 {doc.get('mode')}）："]
+    for r in doc.get("pairs", []):
+        sp = "无" if r["spread_bps"] is None else f"{r['spread_bps']:+.0f} bps"
+        th = "无" if r["thr_bps"] is None else f"{r['thr_bps']:.0f} bps"
+        lines.append(f"  {r['key']}：价差 {sp}，门槛 {th}，方案 {r['variant'] or '无'} → {'开了' if r['entered'] else '没开'}：{r['reason']}")
+    if not doc.get("pairs"):
+        lines.append("  （没有可检查的配对）")
+    return lines
+
+
 def _step_shadow(ctx: Ctx, data: dict, out: dict) -> dict:
-    """演习：算信号和名义，记账 + 推送，不发任何单（不调用 ioc / set_leverage）。"""
+    """演习：算信号和名义，记账 + 推送，不发任何单（不调用 ioc / set_leverage）。守卫（休市 / 下架 / 腿不活跃）同样生效。"""
     cf, led = ctx.cf, ctx.led
+    rows: list[dict] = []
+    black, halted = in_blackout(cf, ctx.now_ms), set(data.get("halted") or ())
     for pair in data["pairs"]:
         key = _pair_key(pair)
         sig = signal(pair, data, cf, ctx.now_ms)
-        if not sig["ok"] or abs(sig["spread"]) <= sig["thr"]:
+        if not sig["ok"]:
+            rows.append(_row(key, sig, "走前判断今天不做" if sig.get("no_variant") else f"数据不可用：{sig['why']}"))
+            continue
+        if abs(sig["spread"]) <= sig["thr"]:
+            rows.append(_row(key, sig, f"价差 {abs(sig['spread']):.0f} < 门槛 {sig['thr']:.0f}"))
             continue
         if any(r["kind"] == "plan" and r.get("pair_key") == key and r.get("bar_t") == sig["bar_t"] for r in led.all()):
+            rows.append(_row(key, sig, "本根 K 线已演习记录过"))
+            continue
+        block = _entry_block(pair, data, cf, ctx.now_ms, black, halted)
+        if block:
+            rows.append(_row(key, sig, block))
             continue
         sg = 1 if sig["spread"] > 0 else -1
         rich, cheap = (pair["a"], pair["b"]) if sg > 0 else (pair["b"], pair["a"])
@@ -1151,6 +1358,7 @@ def _step_shadow(ctx: Ctx, data: dict, out: dict) -> dict:
             n_depth = float("inf")   # 没有盘口（没钱包）：深度上限未知
         notional = min(cf["max_leg_notional_usd"], n_depth, cf["max_total_gross_usd"] / 2)
         if notional < MIN_ORDER_USD:
+            rows.append(_row(key, sig, f"可下名义 ${notional:.0f} < 交易所最小 ${MIN_ORDER_USD:.0f}"))
             continue
         plan = {"pair_key": key, "bar_t": sig["bar_t"], "rich_short": rich, "cheap_long": cheap, "notional_usd": round(notional, 2),
                 "spread_bps": round(sig["spread"], 1), "thr_bps": round(sig["thr"], 1), "variant": sig["variant"],
@@ -1160,6 +1368,8 @@ def _step_shadow(ctx: Ctx, data: dict, out: dict) -> dict:
                     f"空 {rich}、多 {cheap}，每腿约 ${notional:.0f}，价差 {sig['spread']:+.0f} bps（门槛 {sig['thr']:.0f}，变体 {sig['variant']}）。"
                     "演习模式，没有真下单。")
         out["plans"].append(plan)
+        rows.append(_row(key, sig, "演习开仓（没有真下单）", entered=True))
+    _write_decisions(ctx, out, rows)
     return out
 
 
@@ -1181,6 +1391,7 @@ def main(argv=None) -> int:
         st = load_state(s)
         print(json.dumps({**get(s), "open_pairs": {k: {"net": v["net"], "unknown": v["unknown"]} for k, v in open_pairs(st).items()}},
                          ensure_ascii=False, indent=1))
+        print("\n".join(decision_lines(s)))
     return 0
 
 

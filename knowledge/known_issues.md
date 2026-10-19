@@ -10,3 +10,4 @@
 - labs_auto：杠杆都是同一段历史里挑的（note_optimistic 恒为 true）；pairs 线约 7 周样本，必然没过 20 周门槛
 - autotrade.exit_ 出错时写的 exit 记录没有 pnl_usd，总止损会把那笔算成 0（2026-10-19 评审，未修）
 - 总止损只算已实现盈亏；开着的套利仓受单对 $4/单日 $8 约束，周末仓受 kill_check 看守
+- pairs_exec 守卫（2026-10-19）：下架/暂停字段名（isDelisted / halted / isHalted / tradingHalted）是猜的，没对真实 meta 验证；发现数据缓存最长 6 小时，下架检测有延迟；休市窗口按纽约墙上时间，没处理美股假日

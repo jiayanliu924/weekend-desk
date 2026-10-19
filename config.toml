@@ -482,6 +482,17 @@ min_balance_usd = 5.0
 # 估算手续费（吃单 bps/笔），用于记账盈亏
 fee_bps = 9.0
 cooldown_min = 30
+# 休市禁开新仓（只拦新开仓，平仓 / 止损照跑）：各 dex 休市时定价方式不同（trade.xyz 用 30 分钟 EMA、无外部价），周末价差是结构性的，周日开盘的 oracle 跳变也会造假价差。设 "" 关闭
+blackout_start = "FRI 19:30"
+blackout_end = "SUN 20:35"
+blackout_tz = "America/New_York"
+# 反向止损：同向价差 ≥ 入场价差 × wrong_way_mult，或绝对价差 ≥ max_abs_spread_bps → 平仓并锁 24h
+wrong_way_mult = 2.0
+max_abs_spread_bps = 300.0
+# 腿不活跃：最近 stale_bars 根 5m 里零成交 ≥ stale_min_zero 根，或一条腿收盘价没动而另一条动了 > stale_move_bps → 不开
+stale_bars = 6
+stale_min_zero = 3
+stale_move_bps = 10.0
 
 [account]
 # 总账户止损线（desk/account_stop.py）：周末策略 + 跨平台套利的真实已实现盈亏合计亏到这个数，两条线全部停开新仓。

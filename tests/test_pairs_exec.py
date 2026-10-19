@@ -1,8 +1,11 @@
 """跨 dex 配对真下单（desk/pairs_exec.py）：全部用注入的假客户端和确定性假数据，不连交易所。
 覆盖：off/shadow 不发单、live 两腿开仓、一腿被拒回补、部分成交回补、平仓只用 reduce-only 且只平我们自己的量（手动仓位不动）、
 各种上限拦截、当日亏损止损切回 off、cloid 前缀、杠杆封顶、异常路径不留单腿。"""
+import json
+import logging
 import shutil
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from pathlib import Path
 
 import pytest
@@ -15,7 +18,8 @@ from desk.ledger import Ledger
 
 ROOT = Path(__file__).resolve().parent.parent
 IV = bl.INTERVAL_MS["5m"]
-T0 = 1_760_000_000_000 // pl.DAY_MS * pl.DAY_MS
+# 整天对齐，再 +3 天：now 落在纽约周二晚上，避开默认的休市禁开窗口（周五 19:30 → 周日 20:35）
+T0 = 1_760_000_000_000 // pl.DAY_MS * pl.DAY_MS + 3 * pl.DAY_MS
 A, B = "io:SNDK", "xyz:SNDK"      # A（io）在 pairs_lab 里排第一：s>0 = A 贵 = 空 A 多 B
 A2, B2 = "io:NBIS", "xyz:NBIS"
 
@@ -49,26 +53,29 @@ def cfg_set(s, **kw):
 
 
 # ---------------------------------------------------------------- 假数据：每 24 根出现 2 根 +80 bps 的价差，最后一根正好是尖峰
-def candles(coin_prices):
-    return [{"t": T0 + i * IV, "c": str(p), "v": "10"} for i, p in enumerate(coin_prices)]
+def candles(coin_prices, shift=0):
+    return [{"t": T0 + shift + i * IV, "c": str(p), "v": "10"} for i, p in enumerate(coin_prices)]
 
 
-def make_data(n_days=17, tail=(), base=120.0, allow_second=False):
+def make_data(n_days=17, tail=(), base=120.0, allow_second=False, day_shift=0):
     """B 恒为 base，A = base·(1+s/1e4)。n = n_days·288 + 1 根，最后一根（序号 n−1，≡ 0 mod 24）是尖峰；
     tail 是追加在后面的价差（bps），例如 (0, 0) 表示价差已收敛。返回 (data, now)：now = 最后一根收盘后 20 秒。"""
     n = n_days * 288 + 1
     sp = [80.0 if (i % 24) in (0, 1) else 0.0 for i in range(n)] + list(tail)
-    pa = [base * (1 + x / 1e4) for x in sp]
-    pb = [base] * len(sp)
+    # 两腿共同的小幅价格噪声（不改价差）：免得 B 腿"收盘价一动不动"被腿不活跃守卫误伤
+    bs = [base * (1 + 1e-4 * ((i % 7) - 3)) for i in range(len(sp))]
+    pa = [b_ * (1 + x / 1e4) for b_, x in zip(bs, sp)]
+    pb = bs
     raw = pl.fixture_raw()
     pairs = [p for p in pl.discover_pairs(raw, {"min_day_ntl_vlm_usd": 2e5, "min_oi_usd": 1e5, "max_spread_bps": 20.0})
              if p["kind"] == "same" and p["gate_ok"]]
-    cs = {A: candles(pa), B: candles(pb)}
+    sh = day_shift * pl.DAY_MS
+    cs = {A: candles(pa, sh), B: candles(pb, sh)}
     if allow_second:
-        cs.update({A2: candles(pa), B2: candles(pb)})
+        cs.update({A2: candles(pa, sh), B2: candles(pb, sh)})
     pairs = [p for p in pairs if p["a"] in cs]
     data = {"pairs": pairs, "candles": cs, "funding": {}}
-    now = datetime.fromtimestamp((T0 + len(sp) * IV) / 1000 + 20, timezone.utc)
+    now = datetime.fromtimestamp((T0 + sh + len(sp) * IV) / 1000 + 20, timezone.utc)
     return data, now
 
 
@@ -628,7 +635,7 @@ def test_reconcile_exchange_flat_for_n_minutes_settles_books_loss_alerts_once(s)
     out, data, now = live_entry(s, fc)
     pid = next(iter(pairs_state(s)))
     fc.pos = {}                                   # 被强平 / 手动平掉了
-    fc.mids[A] *= 1.01
+    fc.mids[A] *= 1.004                           # 价差 80 → 约 120 bps，还没到反向止损的 2 倍线
     px.step(s, later(now, 60), client=fc, data=data)
     assert pairs_state(s)[pid]["closed"] is None  # 还没到 N 分钟：先观察
     px.step(s, later(now, 60 * 7), client=fc, data=data)
@@ -1001,3 +1008,272 @@ def test_cli_mode_switch(tmp_path, monkeypatch):
     assert pe.get(s)["mode"] == "shadow"
     assert pe.main(["--mode", "off"]) == 0
     assert pe.get(s)["mode"] == "off"
+
+
+# ================================================================ 开仓守卫 / 反向止损 / 决策透明度
+NY = ZoneInfo("America/New_York")
+
+
+def ny_ms(y, mo, d, h, mi):
+    return int(datetime(y, mo, d, h, mi, tzinfo=NY).timestamp() * 1000)
+
+
+def utc_ms(y, mo, d, h, mi):
+    return int(datetime(y, mo, d, h, mi, tzinfo=timezone.utc).timestamp() * 1000)
+
+
+def decisions(s):
+    return json.loads((Path(s.data) / "state" / "pairs_last_decision.json").read_text())
+
+
+def row(s, key=f"{A}|{B}"):
+    return next(r for r in decisions(s)["pairs"] if r["key"] == key)
+
+
+def cut(data, coin, n, skip_last=0, **upd):
+    """复制一份 data，把 coin 倒数第 skip_last+1 起的 n 根 K 线字段改掉，例如 v=0 或 c=120.0。
+    零成交的 K 线会被 pairs_lab.align 丢掉，所以零成交测试要留住最后一根，免得先被"数据断档"拦下。"""
+    cs = {c: [dict(x) for x in v] for c, v in data["candles"].items()}
+    for x in (cs[coin][-n - skip_last:len(cs[coin]) - skip_last]):
+        x.update({k: str(v) for k, v in upd.items()})
+    return {**data, "candles": cs}
+
+
+# ---- 1. 休市禁开
+def test_blackout_window_boundaries_and_dst(s):
+    cf = px.cfg(s)
+    assert cf["blackout_start"] == "FRI 19:30" and cf["blackout_end"] == "SUN 20:35" and cf["blackout_tz"] == "America/New_York"
+    for args, want in [((2026, 10, 30, 19, 29), False), ((2026, 10, 30, 19, 30), True), ((2026, 10, 31, 12, 0), True),
+                       ((2026, 11, 1, 20, 34), True), ((2026, 11, 1, 20, 35), False), ((2026, 11, 2, 9, 0), False),
+                       ((2026, 10, 28, 12, 0), False), ((2026, 10, 25, 20, 35), False), ((2026, 10, 25, 20, 34), True)]:
+        assert px.in_blackout(cf, ny_ms(*args)) is want, args
+    # 夏令时 2026-11-01 回拨：周日 20:35 EST = 周一 01:35Z（若误用固定 UTC-4 会差一小时）
+    assert px.in_blackout(cf, utc_ms(2026, 11, 2, 1, 34)) is True and px.in_blackout(cf, utc_ms(2026, 11, 2, 1, 35)) is False
+    # 夏令时期间的周五 19:30 EDT = 23:30Z
+    assert px.in_blackout(cf, utc_ms(2026, 10, 30, 23, 29)) is False and px.in_blackout(cf, utc_ms(2026, 10, 30, 23, 30)) is True
+    assert px.in_blackout({**cf, "blackout_start": ""}, ny_ms(2026, 10, 31, 12, 0)) is False
+    assert px.in_blackout({**cf, "blackout_tz": "Nowhere/Land"}, ny_ms(2026, 10, 28, 12, 0)) is True      # 时区读不到 → 保守禁开
+
+
+def test_blackout_blocks_new_entry_but_weekday_enters(s):
+    fc = FakeClient()
+    set_mode(s, "live")
+    data, now = make_data(day_shift=4)             # 纽约周五晚 20:05 → 禁开
+    assert px.in_blackout(px.cfg(s), ms(now))
+    out = px.step(s, now, client=fc, data=data)
+    assert out["entries"] == [] and fc.orders == [] and fc.leverage == {}
+    assert row(s)["reason"] == "休市禁开" and row(s)["entered"] is False
+    data2, now2 = make_data(day_shift=0)           # 纽约周二晚上 → 正常开
+    assert px.step(s, now2, client=fc, data=data2)["entries"][0]["opened"] is True
+
+
+def test_blackout_does_not_block_exits(s):
+    fc = FakeClient()
+    out, data, now = live_entry(s, fc)
+    n = len(fc.orders)
+    cfg_set(s, blackout_start="MON 00:00", blackout_end="SUN 23:59")       # 整周禁开
+    assert px.in_blackout(px.cfg(s), ms(later(now, 25 * 3600)))
+    out = px.step(s, later(now, 25 * 3600), client=fc, data=data)
+    assert out["exits"] and out["exits"][0]["reason"] == "max_hold" and out["entries"] == []
+    assert abs(fc.pos[A]) < 1e-9 and abs(fc.pos[B]) < 1e-9 and all(o["reduce_only"] for o in fc.orders[n:])
+
+
+def test_blackout_applies_to_shadow(s):
+    fc = FakeClient()
+    set_mode(s, "shadow")
+    data, now = make_data(day_shift=4)
+    out = px.step(s, now, client=fc, data=data)
+    assert out["plans"] == [] and row(s)["reason"] == "休市禁开" and decisions(s)["mode"] == "shadow"
+
+
+# ---- 2. 反向止损
+def test_entry_spread_recorded_with_sign(s):
+    fc = FakeClient()
+    out, data, now = live_entry(s, fc)
+    o = next(iter(pairs_state(s).values()))["open"]
+    assert o["s_entry"] == pytest.approx(80.0, abs=1.0) and o["s_entry"] > 0 and o["rich_short"] == A
+
+
+def test_wrong_way_unit_sign_and_caps(s):
+    cf = px.cfg(s)
+    assert cf["wrong_way_mult"] == 2.0 and cf["max_abs_spread_bps"] == 300.0
+    o = {"s_entry": -80.0, "s0": -80.0}
+    assert px.wrong_way(o, -160.0, cf) and px.wrong_way(o, -200.0, cf)
+    assert not px.wrong_way(o, -159.0, cf)
+    assert not px.wrong_way(o, +200.0, cf)                    # 反号且 < 300：这是在收敛，不算反向
+    assert px.wrong_way(o, +300.0, cf) and px.wrong_way(o, -300.0, cf)       # 绝对价差上限不分方向
+    assert not px.wrong_way(o, None, cf)
+
+
+def test_wrong_way_exit_reduce_only_and_lock(s):
+    fc = FakeClient()
+    out, data, now = live_entry(s, fc)
+    n = len(fc.orders)
+    fc.mids[A] = 120.0 * 1.017                             # 价差 80 → 170 bps ≥ 2×80
+    out = px.step(s, later(now, 60), client=fc, data=data)
+    assert out["exits"] and out["exits"][0]["reason"] == "wrong_way" and out["exits"][0]["closed"]
+    assert abs(fc.pos[A]) < 1e-9 and abs(fc.pos[B]) < 1e-9
+    assert fc.orders[n:] and all(o["reduce_only"] for o in fc.orders[n:])
+    p = next(iter(pairs_state(s).values()))
+    assert p["closed"]["reason"] == "wrong_way"
+    lk = px.load_state(s)["locks"][f"{A}|{B}"]
+    assert lk["reason"] == "wrong_way" and lk["until_ms"] - lk["t_ms"] == 24 * 3600_000
+
+
+def test_wrong_way_not_triggered_by_smaller_or_opposite_move(s):
+    fc = FakeClient()
+    out, data, now = live_entry(s, fc)
+    fc.mids[A] = 120.0 * 1.012                             # 120 bps < 160
+    assert px.step(s, later(now, 60), client=fc, data=data)["exits"] == []
+    fc.mids[A] = 120.0 * 0.99                              # 反向（价差 −100）：不是 wrong_way
+    out = px.step(s, later(now, 120), client=fc, data=data)
+    assert not [e for e in out["exits"] if e["reason"] == "wrong_way"]
+
+
+def test_max_abs_spread_closes_even_when_ratio_not_hit(s):
+    cfg_set(s, wrong_way_mult=10.0, max_abs_spread_bps=150.0)
+    fc = FakeClient()
+    out, data, now = live_entry(s, fc)
+    fc.mids[A] = 120.0 * 1.016                             # 160 bps ≥ 150，但 < 10×80
+    out = px.step(s, later(now, 60), client=fc, data=data)
+    assert out["exits"][0]["reason"] == "wrong_way" and abs(fc.pos[A]) < 1e-9
+
+
+def test_wrong_way_ignores_untrustworthy_wide_book(s):
+    fc = FakeClient()
+    out, data, now = live_entry(s, fc)
+    fc.wide = {A}
+    fc.mids[A] *= 1.2                                      # 盘口太宽的中间价不可信，不能据此止损
+    out = px.step(s, later(now, 60), client=fc, data=data)
+    assert not [e for e in out["exits"] if e["reason"] == "wrong_way"]
+
+
+# ---- 3. 腿不活跃
+def test_stale_leg_zero_volume_blocks_entry(s):
+    fc = FakeClient()
+    set_mode(s, "live")
+    data, now = make_data()
+    out = px.step(s, now, client=fc, data=cut(data, B, 3, skip_last=1, v=0))
+    assert out["entries"] == [] and fc.orders == []
+    assert "腿不活跃" in row(s)["reason"] and B in row(s)["reason"]
+
+
+def test_stale_leg_two_zero_bars_still_enters(s):
+    fc = FakeClient()
+    set_mode(s, "live")
+    data, now = make_data()
+    out = px.step(s, now, client=fc, data=cut(data, B, 2, skip_last=1, v=0))
+    assert out["entries"] and out["entries"][0]["opened"]
+
+
+def test_stale_leg_missing_bars_count_as_zero(s):
+    data, now = make_data()
+    cs = {c: list(v) for c, v in data["candles"].items()}
+    cs[B] = cs[B][:-3] + cs[B][-1:]                        # 缺 2 根（API 不返回无成交的 K 线）：2 < 3
+    assert px.stale_leg(data["pairs"][0], {**data, "candles": cs}, px.cfg(s), ms(now)) is None
+    cs[B] = cs[B][:-3] + cs[B][-1:]                        # 再缺 1 根 → 3
+    assert "零成交" in px.stale_leg(data["pairs"][0], {**data, "candles": cs}, px.cfg(s), ms(now))
+
+
+def test_stale_leg_flat_close_while_other_moves(s):
+    fc = FakeClient()
+    set_mode(s, "live")
+    data, now = make_data()
+    flat = cut(data, B, 6, c=120.0)                        # B 六根收盘一动不动，A 最后一根跳了 80 bps
+    assert "没动" in px.stale_leg(flat["pairs"][0], flat, px.cfg(s), ms(now))
+    out = px.step(s, now, client=fc, data=flat)
+    assert out["entries"] == [] and fc.orders == [] and "腿不活跃" in row(s)["reason"]
+    both = cut(flat, A, 6, c=120.0)                        # 另一条腿也没动（< 10 bps）→ 不算
+    assert px.stale_leg(both["pairs"][0], both, px.cfg(s), ms(now)) is None
+
+
+# ---- 4. 下架 / 暂停
+def test_halted_coins_from_raw_meta():
+    raw = {"dexs": {"xyz": [{"universe": [{"name": "xyz:A", "isDelisted": True}, {"name": "xyz:B", "halted": True},
+                                         {"name": "xyz:C"}, {"name": "xyz:D", "isHalted": False}]}, []]},
+           "main": [{"universe": [{"name": "BTC"}, {"name": "XRP", "isDelisted": True}]}, []]}
+    assert px.halted_coins(raw) == {"xyz:A", "xyz:B", "XRP"}
+    assert px.halted_coins(pl.fixture_raw()) == set()      # 字段缺失 → 空集，检查自动跳过
+    assert px.halted_coins(None) == set() and px.halted_coins({"dexs": {"x": None}, "main": None}) == set()
+
+
+def test_halted_coin_blocks_entry(s):
+    fc = FakeClient()
+    set_mode(s, "live")
+    data, now = make_data()
+    out = px.step(s, now, client=fc, data={**data, "halted": {B}})
+    assert out["entries"] == [] and fc.orders == []
+    assert B in row(s)["reason"] and "下架" in row(s)["reason"]
+
+
+def test_halted_coin_closes_open_pair_reduce_only(s):
+    fc = FakeClient()
+    out, data, now = live_entry(s, fc)
+    n = len(fc.orders)
+    out = px.step(s, later(now, 60), client=fc, data={**data, "halted": {A}})
+    assert out["exits"] and out["exits"][0]["reason"] == "halted" and out["exits"][0]["closed"]
+    assert abs(fc.pos[A]) < 1e-9 and abs(fc.pos[B]) < 1e-9 and all(o["reduce_only"] for o in fc.orders[n:])
+    assert next(iter(pairs_state(s).values()))["closed"]["reason"] == "halted"
+
+
+def test_halted_close_works_even_if_pair_dropped_from_discovery(s):
+    fc = FakeClient()
+    out, data, now = live_entry(s, fc)
+    out = px.step(s, later(now, 60), client=fc, data={**data, "pairs": [], "halted": {B}})      # 下架币被 discover_pairs 剔除
+    assert out["exits"] and out["exits"][0]["reason"] == "halted"
+    assert abs(fc.pos[A]) < 1e-9 and abs(fc.pos[B]) < 1e-9
+
+
+# ---- 5. 决策透明度
+def test_decision_file_entered_then_open(s, caplog):
+    fc = FakeClient()
+    caplog.set_level(logging.INFO, logger="pairs_exec")
+    out, data, now = live_entry(s, fc)
+    d = decisions(s)
+    assert d["mode"] == "live" and d["ts"] and len(d["pairs"]) == 1
+    r = d["pairs"][0]
+    assert r["key"] == f"{A}|{B}" and r["entered"] is True and r["reason"] == "已开仓"
+    assert r["spread_bps"] == pytest.approx(80.0, abs=0.2) and r["thr_bps"] > 0 and r["variant"]
+    msgs = [m.getMessage() for m in caplog.records if m.name == "pairs_exec"]
+    assert any("检查 1 对" in m and "开仓 1 笔" in m and "/" in m for m in msgs)
+    px.step(s, later(now, 60), client=fc, data=data)
+    assert row(s)["reason"] == "已开仓" and row(s)["entered"] is False          # 已有仓位
+
+
+def test_decision_file_below_threshold_lock_and_no_variant(s, monkeypatch):
+    fc = FakeClient()
+    set_mode(s, "live")
+    data, now = make_data(tail=(10.0,))                    # 价差 10 bps，远低于门槛
+    px.step(s, now, client=fc, data=data)
+    r = row(s)
+    assert r["spread_bps"] == pytest.approx(10.0, abs=0.2) and r["reason"].startswith("价差 10 < 门槛 ") and not r["entered"]
+    data2, now2 = make_data()                              # 锁定中
+    key = f"{A}|{B}"
+    Ledger(s.data, "pairs").append("lock", key, {"pair_key": key, "reason": "wrong_way", "t_ms": ms(now2), "until_ms": ms(now2) + 3600_000})
+    px.step(s, now2, client=fc, data=data2)
+    assert row(s)["reason"] == "止损锁定中"
+    real = px.signal                                       # 走前判断今天不做
+    monkeypatch.setattr(px, "signal", lambda *a, **k: {**real(*a, **k), "ok": False, "no_variant": True, "why": "x", "thr": None, "variant": None})
+    px.step(s, later(now2, 30), client=fc, data=data2)
+    r = row(s)
+    assert r["reason"] == "走前判断今天不做" and r["variant"] is None and r["thr_bps"] is None
+    assert fc.orders == []
+
+
+def test_status_prints_plain_chinese_decision_table(s, monkeypatch, capsys):
+    fc = FakeClient()
+    set_mode(s, "live")
+    data, now = make_data(day_shift=4)
+    px.step(s, now, client=fc, data=data)
+    monkeypatch.setattr(config, "load", lambda *a, **k: s)
+    assert px.main(["--status"]) == 0
+    out = capsys.readouterr().out
+    line = next(ln for ln in out.splitlines() if f"{A}|{B}" in ln and "门槛" in ln)
+    assert "价差" in line and "休市禁开" in line and "没开" in line
+    assert "最近一次决策" in out
+
+
+def test_status_without_decision_file(s, monkeypatch, capsys):
+    monkeypatch.setattr(config, "load", lambda *a, **k: s)
+    px.main(["--status"])
+    assert "还没有决策记录" in capsys.readouterr().out
