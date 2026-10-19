@@ -72,7 +72,7 @@ def test_default_limit_when_section_missing(tmp_path):
     s.__getitem__ = None
     class T(dict):
         data = str(tmp_path)
-    assert account_stop.limit(T()) == 30.0
+    assert account_stop.limit(T()) == 20.0
 
 
 def test_reset_sets_baseline_and_does_not_retrip(env, monkeypatch):

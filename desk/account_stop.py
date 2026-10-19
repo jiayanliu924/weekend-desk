@@ -17,7 +17,7 @@ from pathlib import Path
 from . import notify
 
 log = logging.getLogger(__name__)
-DEFAULT_MAX_LOSS = 30.0
+DEFAULT_MAX_LOSS = 20.0
 
 
 def _path(settings) -> Path:
