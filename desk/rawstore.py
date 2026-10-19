@@ -83,8 +83,8 @@ def has_stream(data_dir: Path, stream: str) -> bool:
 def files_between(data_dir: Path, stream: str, a_ns: int, b_ns: int) -> list[str]:
     """只列 received_at 落在 [a_ns, b_ns) 可能出现的日期分区（分区按 received_at 的 UTC 日期切）。"""
     from datetime import timedelta
-    d0 = datetime.fromtimestamp(a_ns / 1e9, tz=timezone.utc).date()
-    d1 = datetime.fromtimestamp(max(a_ns, b_ns) / 1e9, tz=timezone.utc).date()
+    d0 = datetime.fromtimestamp(a_ns // 10**9, tz=timezone.utc).date()
+    d1 = datetime.fromtimestamp(max(a_ns, b_ns) // 10**9, tz=timezone.utc).date()
     out, d = [], d0
     base = Path(data_dir) / "raw" / stream
     while d <= d1:
