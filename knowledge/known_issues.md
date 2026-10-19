@@ -8,3 +8,5 @@
 - pairs_exec：PairsClient 的 mark_px/funding_rows/fill_for_cloid 只对 stub 测过，没对真交易所测过
 - pairs_exec：超额敞口检查分不清手动单和漏记成交，只报警+停新单，不自动处理
 - labs_auto：杠杆都是同一段历史里挑的（note_optimistic 恒为 true）；pairs 线约 7 周样本，必然没过 20 周门槛
+- autotrade.exit_ 出错时写的 exit 记录没有 pnl_usd，总止损会把那笔算成 0（2026-10-19 评审，未修）
+- 总止损只算已实现盈亏；开着的套利仓受单对 $4/单日 $8 约束，周末仓受 kill_check 看守
