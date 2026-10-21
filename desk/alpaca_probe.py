@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sys
 from datetime import date, timedelta
 from pathlib import Path
@@ -20,6 +21,16 @@ from . import config
 
 UNDERLYINGS = ["SOXX", "SMH", "QQQ", "SPY", "NVDA", "AMD", "MU", "INTC"]
 DATA = ax.DATA_URL
+OCC = re.compile(r"^[A-Z]{1,5}\d{6,7}[CP]\d{8}$")   # 标准合约代码；"1SPY…" 这种是拆股/分红调整过的，跳过
+
+
+def _stock_close(c: ax.Client, sym: str, day: date) -> float | None:
+    """标的在 day 之前最近一个交易日的收盘价（选"当时"的平值，不是现在的）。"""
+    d = c._req("GET", f"{DATA}/v2/stocks/{sym}/bars",
+               params={"timeframe": "1Day", "start": (day - timedelta(days=10)).isoformat(), "end": day.isoformat(),
+                       "limit": 20, "adjustment": "raw", "feed": "iex"})
+    b = d.get("bars") or []
+    return float(b[-1]["c"]) if b else None
 
 
 def _contracts(c: ax.Client, und: str, exp_gte: date, exp_lte: date, status: str) -> list[dict]:
@@ -67,15 +78,21 @@ def probe(c: ax.Client, und: str, today: date) -> dict:
         r["earliest_expiry"] = exps[0] if exps else None
         # 抽样：约一年前到期、离现价最近（没有现价就取中位行权价）的看跌期权
         tgt = (today - timedelta(days=365)).isoformat()
-        cand = [x for x in old if x.get("type") == "put"]
+        cand = [x for x in old if x.get("type") == "put" and OCC.match(x["symbol"])]
         if cand:
             exp = min({x["expiration_date"] for x in cand}, key=lambda e: abs(date.fromisoformat(e) - date.fromisoformat(tgt)))
             same = [x for x in cand if x["expiration_date"] == exp]
             ks = sorted(float(x["strike_price"]) for x in same)
-            ref = spot or ks[len(ks) // 2]
+            # 平值按到期前 30 天当时的标的价格选（按现在的价格选，一年前那张会是深度虚值、几乎没成交）
+            try:
+                ref = _stock_close(c, und, date.fromisoformat(exp) - timedelta(days=30))
+            except Exception:  # noqa: BLE001
+                ref = None
+            ref = ref or ks[len(ks) // 2]
+            r["sample_spot_then"] = ref
             pick = min(same, key=lambda x: abs(float(x["strike_price"]) - ref))
             sym = pick["symbol"]
-            bars = _bars(c, sym, date.fromisoformat(exp) - timedelta(days=120), date.fromisoformat(exp))
+            bars = _bars(c, sym, date.fromisoformat(exp) - timedelta(days=60), date.fromisoformat(exp))
             r["sample"] = sym
             r["sample_bars"] = len(bars)
             r["sample_first_bar"] = bars[0]["t"][:10] if bars else None
@@ -99,13 +116,15 @@ def main(argv=None) -> int:
     today = date.today()
     rows = [probe(c, u, today) for u in UNDERLYINGS]
     print(f"Alpaca 期权历史数据探测（{'纸面' if paper else '真钱'}账户 key，只读）")
-    print("标的 | 已到期合约数 | 最早到期日 | 抽样合约 | 抽样日线根数 | 日线最早 | 历史买卖报价")
+    print("标的 | 已到期合约数 | 最早到期日 | 抽样合约（到期前 30 天平值）| 到期前 60 天里有成交的天数 | 第一根日线")
     for r in rows:
         if "error" in r:
             print(f"{r['underlying']} | 出错：{r['error']}")
             continue
         print(f"{r['underlying']} | {r.get('expired_contracts')} | {r.get('earliest_expiry')} | {r.get('sample', '—')} | "
-              f"{r.get('sample_bars', '—')} | {r.get('sample_first_bar', '—')} | {r.get('sample_quotes', '—')}")
+              f"{r.get('sample_bars', '—')} | {r.get('sample_first_bar', '—')}")
+    q = next((r.get("sample_quotes") for r in rows if r.get("sample_quotes")), "—")
+    print(f"历史买卖报价接口：{q}")
     out = Path(s.data) / "reports" / "alpaca_probe.json"
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps({"date": today.isoformat(), "paper": paper, "rows": rows}, ensure_ascii=False, indent=1))
