@@ -289,19 +289,26 @@ def plan_table(est: dict[tuple[str, str], float], margin: float = 1.0) -> tuple[
     return "\n".join(lines), raw * margin
 
 
-def diagnose(db, und: str = "SPY", day: str = "2024-02-01") -> None:
-    """看 Databento 自己的 OPRA 符号长什么样，并对一个符号试询价。"""
-    res = db.symbology.resolve(dataset=DATASET, symbols=[f"{und}.OPT"], stype_in="parent", stype_out="raw_symbol",
-                               start_date=day, end_date=(date.fromisoformat(day) + timedelta(days=1)).isoformat())
-    mp = res.get("result", {}) if isinstance(res, dict) else {}
-    raws = [iv.get("s") for ivs in mp.values() for iv in ivs][:5] if mp else []
-    print(f"Databento {und}.OPT 在 {day} 的原始符号样例：{[repr(x) for x in raws]}")
-    print(f"resolve 原始返回（截断）：{str(res)[:400]}")
-    if raws:
-        t0, t1 = day_window(date.fromisoformat(day))
-        c = db.metadata.get_cost(dataset=DATASET, start=t0.isoformat(), end=t1.isoformat(), symbols=[raws[0]],
-                                 schema=SCHEMA, stype_in="raw_symbol")
-        print(f"用 Databento 自己的符号询价一个合约半小时：${c}")
+def diagnose(db, und: str = "SPY", day: str = "2024-02-01", occ: str = "SPY240301P00469000") -> None:
+    """排查"符号认不出"：① 我们拼的符号能否解析 ② 父代码能解析出多少个 ③ 用我们的符号询价。"""
+    d1 = (date.fromisoformat(day) + timedelta(days=1)).isoformat()
+    osi = occ_to_osi(occ)
+    for label, kw in (("我们拼的符号 → instrument_id", dict(symbols=[osi], stype_in="raw_symbol")),
+                      (f"{und}.OPT 父代码 → instrument_id", dict(symbols=[f"{und}.OPT"], stype_in="parent"))):
+        try:
+            res = db.symbology.resolve(dataset=DATASET, stype_out="instrument_id", start_date=day, end_date=d1, **kw)
+            r = res.get("result", {}) if isinstance(res, dict) else {}
+            print(f"{label}：解析到 {len(r)} 个；未解析 {res.get('not_found') if isinstance(res, dict) else '?'}；"
+                  f"部分 {res.get('partial') if isinstance(res, dict) else '?'}；样例 {[repr(k) for k in list(r)[:3]]}")
+        except Exception as e:  # noqa: BLE001
+            print(f"{label} 出错：{str(e)[:250]}")
+    t0, t1 = day_window(date.fromisoformat(day))
+    for sch_kw in (dict(symbols=[osi], stype_in="raw_symbol"), dict(symbols=[f"{und}.OPT"], stype_in="parent")):
+        try:
+            c = db.metadata.get_cost(dataset=DATASET, start=t0.isoformat(), end=t1.isoformat(), schema=SCHEMA, **sch_kw)
+            print(f"询价 {sch_kw['stype_in']} {sch_kw['symbols'][0]!r} {day} 收盘前半小时：${c}")
+        except Exception as e:  # noqa: BLE001
+            print(f"询价 {sch_kw['stype_in']} 出错：{str(e)[:250]}")
 
 
 def max_cost(settings) -> float:
@@ -451,9 +458,9 @@ def main(argv=None) -> int:
     import databento as dbn
     db = dbn.Historical(key)
     if a.diagnose:
-        for u, d in (("SPY", "2024-02-01"), ("SOXX", "2025-09-15")):
+        for u, d, occ in (("SPY", "2024-02-01", "SPY240301P00469000"), ("SOXX", "2025-09-15", "SOXX251024P00270000")):
             try:
-                diagnose(db, u, d)
+                diagnose(db, u, d, occ)
             except Exception as e:  # noqa: BLE001
                 print(f"{u} 诊断出错：{str(e)[:300]}")
         return 0
