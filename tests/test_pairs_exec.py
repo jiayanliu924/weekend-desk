@@ -1424,6 +1424,7 @@ def test_E3_loose_pair_never_orders_live_but_shadows_to_separate_ledger(s):
     set_mode(s, "live")
     data, now = make_data()
     data["pairs"] = [{**p, "strict": False} for p in data["pairs"]]
+    cfg_set(s, loose_live_allow=[])        # 生产配置已签字放开（"*"）；这里验证闸本身
     out = px.step(s, now, client=fc, data=data)
     assert fc.orders == [] and out["entries"] == [] and not pairs_state(s)
     assert len(out["loose_plans"]) == 1
@@ -1443,7 +1444,7 @@ def test_E3_loose_pair_never_orders_live_but_shadows_to_separate_ledger(s):
 def test_E4_config_max_concurrent_is_two():
     import tomllib
     c = tomllib.loads((ROOT / "config.toml").read_text())["pairs"]
-    assert c["max_concurrent"] == 2 and c["loose_live_allow"] == []
+    assert c["max_concurrent"] == 2 and c["loose_live_allow"] == ["*"]     # 2026-10-21 Kea 签字
     assert c["max_concurrent"] * c["max_pair_loss_usd"] <= c["daily_loss_stop_usd"]
 
 
@@ -1499,3 +1500,11 @@ def test_E2b_due_full_refetch_and_funding_are_staggered(s, monkeypatch):
     assert len(fund) == min(len(legs), px.FUNDING_REFRESH_PER_LOAD)
     stale = [c for c, v in d1["funding_t"].items() if v[0] == 0]
     assert len(stale) == len(legs) - len(fund)                            # 没刷新的保留旧时间，下次照样到期
+
+
+def test_loose_live_allow_star_makes_all_thin_pairs_live():
+    thin = {"a": "io:X", "b": "xyz:X", "strict": False}
+    assert not px._live_eligible(thin, {"loose_live_allow": []})
+    assert px._live_eligible(thin, {"loose_live_allow": ["*"]})
+    assert px._live_eligible(thin, {"loose_live_allow": ["io:X|xyz:X"]})
+    assert not px._live_eligible({"a": "io:X", "b": "xyz:X"}, {"loose_live_allow": []})   # 没标 strict 仍不放

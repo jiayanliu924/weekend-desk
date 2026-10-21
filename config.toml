@@ -471,7 +471,7 @@ max_leg_notional_usd = 100.0
 # 同时最多持有几对（代码硬封顶 3）；2 对 × 单对最多亏 $4 = $8 = 单日止损 $8（< 总账户止损 $20）
 max_concurrent = 2
 # 过上面的配对门槛、但不过 [universe] 严门槛的"薄配对"：live 模式下只影子记账（独立账本 pairs_loose），列在这里的 key 才真下单（晋级要 Kea 签字）。例 ["io:XYZ|xyz:XYZ"]
-loose_live_allow = []
+loose_live_allow = ["*"]   # 2026-10-21 Kea 签字：全部薄配对都上真钱（仍过走前判断 + 单对 $4 / 日 $8 / 总账户 $20 止损）
 # K 线增量抓取：冷启动（要全量抓）允许的最长等待；平时 data_timeout_s 默认 45 秒
 data_timeout_cold_s = 300.0
 max_total_gross_usd = 400.0

@@ -567,8 +567,10 @@ def _candidates(data: dict) -> list[dict]:
 
 
 def _live_eligible(pair: dict, cf: dict) -> bool:
-    """live 能不能真下单：过 [universe] 严门槛（strict），或 key 在 loose_live_allow 里。没标 strict = 不行（宁可不下）。"""
-    return pair.get("strict") is True or _pair_key(pair) in cf["loose_live_allow"]
+    """live 能不能真下单：过 [universe] 严门槛（strict），或 key 在 loose_live_allow 里（"*" = 全部薄配对都真下）。
+    没标 strict = 不行（宁可不下）。薄配对仍要过走前判断、盘口深度封顶和全部止损线。"""
+    allow = cf["loose_live_allow"]
+    return pair.get("strict") is True or "*" in allow or _pair_key(pair) in allow
 
 
 def _series(pair: dict, data: dict, iv_ms: int, now_ms: int):
