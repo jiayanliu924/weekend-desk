@@ -229,6 +229,10 @@ def price_plan(db, reqs: list[dict], workers: int = MAX_WORKERS, sleep=time.slee
                 r["cost"] = cost_of(db, r)
                 return
             except Exception as e:  # noqa: BLE001
+                msg = str(e)
+                if not _is_429(e) and ("422" in msg or "symbology" in msg):   # 参数/符号问题：重试没用，记下来接着估
+                    r["cost"], r["error"] = 0.0, msg.splitlines()[0][:160] + " | " + " ".join(msg.splitlines()[1:2])[:160]
+                    return
                 if attempt == 5:
                     raise
                 sleep(min(2 ** (attempt + 1), 30) if _is_429(e) else 1 + attempt)
@@ -257,6 +261,11 @@ def estimate(db, reqs: list[dict], exact: bool = False, workers: int = MAX_WORKE
         for d in sample_days(sorted(days)):
             picked += days[d]
     price_plan(db, picked, workers, sleep)
+    bad = [r for r in picked if r.get("error")]
+    if bad:
+        print(f"注意：{len(bad)}/{len(picked)} 个抽样请求询价失败（按 $0 计，估价会偏低）。例：")
+        for r in bad[:3]:
+            print(f"  {r['und']} {r['day']} 前几个符号 {[x for x in r['symbols'][:2]]}：{r['error']}")
     out = {}
     for k, days in by.items():
         ds = sorted(days)
@@ -278,6 +287,21 @@ def plan_table(est: dict[tuple[str, str], float], margin: float = 1.0) -> tuple[
     if margin != 1.0:
         lines.append(f"合计 x{margin} 安全边际（与上限比较） | {raw * margin:,.2f}")
     return "\n".join(lines), raw * margin
+
+
+def diagnose(db, und: str = "SPY", day: str = "2024-02-01") -> None:
+    """看 Databento 自己的 OPRA 符号长什么样，并对一个符号试询价。"""
+    res = db.symbology.resolve(dataset=DATASET, symbols=[f"{und}.OPT"], stype_in="parent", stype_out="raw_symbol",
+                               start_date=day, end_date=(date.fromisoformat(day) + timedelta(days=1)).isoformat())
+    mp = res.get("result", {}) if isinstance(res, dict) else {}
+    raws = [iv.get("s") for ivs in mp.values() for iv in ivs][:5] if mp else []
+    print(f"Databento {und}.OPT 在 {day} 的原始符号样例：{[repr(x) for x in raws]}")
+    print(f"resolve 原始返回（截断）：{str(res)[:400]}")
+    if raws:
+        t0, t1 = day_window(date.fromisoformat(day))
+        c = db.metadata.get_cost(dataset=DATASET, start=t0.isoformat(), end=t1.isoformat(), symbols=[raws[0]],
+                                 schema=SCHEMA, stype_in="raw_symbol")
+        print(f"用 Databento 自己的符号询价一个合约半小时：${c}")
 
 
 def max_cost(settings) -> float:
@@ -404,6 +428,7 @@ def main(argv=None) -> int:
     g = ap.add_mutually_exclusive_group(required=True)
     g.add_argument("--plan", action="store_true", help="只算价格，不下载")
     g.add_argument("--download", action="store_true", help="下载（需 --yes 且总价不超上限）")
+    g.add_argument("--diagnose", action="store_true", help="看 Databento 的 OPRA 符号格式并试询价一个合约")
     ap.add_argument("--yes", action="store_true")
     ap.add_argument("--exact", action="store_true", help="逐个请求精确询价（慢，调用很多）；默认抽样估算 x1.2")
     ap.add_argument("--underlyings", nargs="+", default=UNDERLYINGS)
@@ -425,6 +450,13 @@ def main(argv=None) -> int:
         return 1
     import databento as dbn
     db = dbn.Historical(key)
+    if a.diagnose:
+        for u, d in (("SPY", "2024-02-01"), ("SOXX", "2025-09-15")):
+            try:
+                diagnose(db, u, d)
+            except Exception as e:  # noqa: BLE001
+                print(f"{u} 诊断出错：{str(e)[:300]}")
+        return 0
     src = AlpacaSource(ax.Client(kid, sec, paper=paper))
     return run(s, src, db, a.underlyings, date.fromisoformat(a.start), date.fromisoformat(a.end),
                "plan" if a.plan else "download", a.yes, exact=a.exact)
