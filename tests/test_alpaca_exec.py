@@ -34,6 +34,7 @@ def s(tmp_path):
         shutil.copy(ROOT / f, tmp_path / f)
     st = config.load(tmp_path)
     st.raw["alpaca"] = {**st.raw["alpaca"], "enabled": True}
+    st.raw["debate"] = {**st.raw.get("debate", {}), "enabled": False}   # 辩论闸门另有 tests/test_debate.py
     return st
 
 

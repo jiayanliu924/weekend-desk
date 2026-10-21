@@ -115,6 +115,12 @@ def due_jobs(now: datetime, settings, done: set) -> list[tuple[str, object]]:
         out.append((f"acctstop:{aslot}", None))
     for k in [k for k in done if k.startswith("acctstop:") and int(k[9:]) < aslot - 3]:
         done.discard(k)
+    # 巡检员（只读，只推送不下单）：每小时一次 + 每天 07:05 PT 日报；真正的活在后台线程里跑，不占这个循环
+    try:
+        from . import supervisor
+        out.extend(supervisor.due(now, settings, done))
+    except Exception as e:  # noqa: BLE001  巡检员配置写错也不能拖垮下单循环
+        log.warning("supervisor.due failed: %s", e)
     # 跨 dex 配对自动下单：只有模式不是 off 才每分钟评估一次（off 时这里什么都不加）
     from . import pairs_exec
     if pairs_exec.get(settings)["mode"] != "off" or pairs_exec.has_open(settings):   # off 也要继续管理没平的仓位
@@ -127,6 +133,9 @@ def due_jobs(now: datetime, settings, done: set) -> list[tuple[str, object]]:
 
 
 def run_job(key: str, wk, settings):
+    if key.startswith("supervisor"):
+        from . import supervisor
+        return supervisor.run_async(settings, "daily" if key.startswith("supervisor_daily:") else "hourly")
     if key.startswith("xtract:"):
         return continuous_extract(settings)
     if key.startswith("labs:"):

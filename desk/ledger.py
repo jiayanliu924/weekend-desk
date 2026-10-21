@@ -27,7 +27,15 @@ class Ledger:
     def all(self) -> list[dict]:
         if not self.path.exists():
             return []
-        return [json.loads(l) for l in self.path.read_text().splitlines() if l.strip()]
+        lines = [l for l in self.path.read_text().splitlines() if l.strip()]
+        out = []
+        for i, l in enumerate(lines):
+            try:
+                out.append(json.loads(l))
+            except ValueError:
+                if i != len(lines) - 1:      # 只容忍最后一行写到一半（正在追加）；中间坏行照旧报错
+                    raise
+        return out
 
     def weekend(self, wid: str) -> dict[str, dict]:
         out: dict[str, dict] = {}

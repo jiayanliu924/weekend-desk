@@ -66,6 +66,7 @@ STRUCT_NAME = {"A": "铁蝶式（卖波动，亏损有上限）", "B": "买跨�
 WHO = ("kea", "boss")
 CRYPTO_SHOCKS = {"HACK", "REG"}   # 突发类别里和比特币直接相关的 → IBIT；其他（地缘 / 关税 / 宏观意外）→ 大盘
 CLOSE_BUFFER_MIN = 10
+DEBATE_MAX_TRIES = 2   # 辩论遇到临时错误最多试几次（debate_error 记录，下次锁定可重试）
 DEFAULTS = {"enabled": False, "live": False, "max_risk_usd": 100.0, "daily_loss_stop_usd": 100.0,
             "paper_events_required": 5, "wing_pct": 3.0, "macro_underlying": "SPY",
             "gate_min_events": 60, "gate_worst_multiple": 3.0}
@@ -142,6 +143,11 @@ class Client:
     def latest_price(self, symbol: str) -> float:
         d = self._req("GET", f"{DATA_URL}/v2/stocks/{symbol}/trades/latest")
         return float(d["trade"]["p"])
+
+    def bars(self, symbol: str, start: date, end: date) -> list[dict]:
+        d = self._req("GET", f"{DATA_URL}/v2/stocks/{symbol}/bars",
+                      params={"timeframe": "1Day", "start": start.isoformat(), "end": end.isoformat(), "limit": 100, "adjustment": "split"})
+        return d.get("bars") or []
 
     def snapshots(self, underlying: str, expiration: date | None = None) -> dict[str, dict]:
         out, tok = {}, None
@@ -514,7 +520,7 @@ def _push(settings, title: str, body: str, priority: str = "default"):
         log.warning("notify failed: %s", e)
 
 
-def open_for_sample(settings, sample, paper_plan: dict, now: datetime | None = None, transport=None) -> dict | None:
+def open_for_sample(settings, sample, paper_plan: dict, now: datetime | None = None, transport=None, debate_llm=None) -> dict | None:
     """锁定后调用（options.job_lock）。返回写进账本的记录；没启用 / 选 C / 每日样本 → None。"""
     c = cfg(settings)
     if not c["enabled"]:
@@ -573,11 +579,59 @@ def open_for_sample(settings, sample, paper_plan: dict, now: datetime | None = N
                         S=S, expiry=exp.isoformat(), legs=sel["legs"], pricing=pr)
     except Exception as e:  # noqa: BLE001
         return skip(f"取合约/报价出错：{str(e)[:200]}")
+    # Card B：多空辩论闸门。只能否决或缩小张数；出错按 [debate] on_error（默认 skip）
+    from . import debate
+    dbt = None
+    try:
+        if debate.cfg(settings)["enabled"]:
+            prop = {"sid": sid, "underlying": under, "structure": chosen, "structure_name": STRUCT_NAME[chosen],
+                    "event_type": sample.event_type, "window_end": sample.end.isoformat(), "expiry": exp.isoformat(),
+                    "qty": qty, "max_loss_usd": pr["max_loss_per_contract"] * qty}
+            ctx = debate.build_context(settings, prop, cl, now)
+            dbt = debate.run_gate(settings, ctx, prop, llm=debate_llm, now=now)
+    except Exception as e:  # noqa: BLE001
+        dbt = {"ok": False, "veto": True, "id": None, "direction": "unclear", "confidence": 0.0, "size_mult": 0.0,
+               "error": f"辩论闸门异常：{type(e).__name__}: {str(e)[:150]}", "error_kind": "transient", "cost_usd": 0.0}
+    dsum = None
+    if dbt is not None:
+        dsum = debate.brief(dbt)
+        if dbt["veto"]:
+            why = dbt.get("error") or "；".join(dbt.get("veto_reasons") or []) or "风控否决"
+            reason = (f"多空辩论没通过（{'出错，按规则不下单' if dbt.get('error') else '被否决'}）：{why}。辩论编号 {dbt.get('id')}")
+            extra = dict(S=S, expiry=exp.isoformat(), legs=sel["legs"], pricing=pr, debate=dsum)
+            kind = dbt.get("error_kind")
+            if dbt.get("error") and kind == "budget":
+                _push(settings, f"美股期权辩论：AI 预算用完，{sid} 没下单", why, priority="high")
+            if dbt.get("error") and kind in ("transient", "deadline", "budget"):
+                tries = 1 + sum(1 for r in led.all() if r["weekend"] == sid and r["kind"] == "debate_error")
+                if tries < DEBATE_MAX_TRIES and now < sample.end:
+                    rec = led.append("debate_error", sid, {**base, "reason": reason, "attempt": tries, **extra})
+                    _push(settings, f"美股期权没下单（辩论出错，可重试）：{sid}", f"模式：{MODE_NAME[mode]}。{reason}", priority="high")
+                    return rec
+            return skip(reason, **extra)
+        new_qty = min(qty, math.floor(qty * min(1.0, max(0.0, float(dbt["size_mult"])))))
+        if new_qty <= 0:
+            return skip(f"多空辩论建议缩仓到 {dbt['size_mult']:.2f}，{qty} 张缩完是 0 张，不下。辩论编号 {dbt.get('id')}",
+                        S=S, expiry=exp.isoformat(), legs=sel["legs"], pricing=pr, debate=dsum)
+        qty = new_qty
+        # 辩论花了时间：重新取报价、重算限价和每张最大亏损（只许张数不增）
+        try:
+            pr = price_structure(chosen, sel, cl.snapshots(under, exp))
+            if not pr["ok"]:
+                return skip("辩论后重新取报价失败：" + "；".join(pr["problems"]), S=S, expiry=exp.isoformat(), legs=sel["legs"], debate=dsum)
+            qty = min(qty, qty_for(float(c["max_risk_usd"]), pr["max_loss_per_contract"]))
+            if qty <= 0:
+                return skip("辩论后重新报价，每张最大亏损超过单笔风险上限：0 张，不下", S=S, expiry=exp.isoformat(),
+                            legs=sel["legs"], pricing=pr, debate=dsum)
+        except Exception as e:  # noqa: BLE001
+            return skip(f"辩论后重新取报价出错：{str(e)[:200]}", debate=dsum)
     legs = [{**l, "entry_mid": pr["mids"][l["symbol"]]} for l in sel["legs"]]
     payload = mleg_payload(legs, qty, "limit", pr["limit_price"], client_order_id=f"wd-{sid}-open")
     body = {**base, "S": S, "expiry": exp.isoformat(), "K": sel["K"], "wings": sel.get("wings"), "legs": legs, "qty": qty,
             "pricing": {k: v for k, v in pr.items() if k != "mids"}, "max_loss_usd": pr["max_loss_per_contract"] * qty,
             "payload": payload, "endpoint": cl.base}
+    if dsum is not None:
+        body["debate"] = dsum
     try:
         resp = cl.submit_order(payload)
         rec = led.append("open", sid, {**body, "sent": True, "response": resp})
@@ -590,6 +644,7 @@ def open_for_sample(settings, sample, paper_plan: dict, now: datetime | None = N
           f"模式：{MODE_NAME[mode]}。{under} {STRUCT_NAME[chosen]} {qty} 张，到期 {exp}，平值 {sel['K']:g}"
           + (f"，翅膀 {sel['wings']['put']:g}/{sel['wings']['call']:g}" if chosen == "A" else "")
           + f"。限价 {netw}，最多亏 ${pr['max_loss_per_contract'] * qty:.0f}。窗口结束自动平仓。"
+          + (f"\n多空辩论 {dsum['id']}：风控方向 {dsum['direction']}，把握 {dsum['confidence']:.2f}，仓位系数 {dsum['size_mult']:.2f}。" if dsum else "")
           + ("" if mode == "live" else "\n没走真钱的原因：" + "；".join(fails[:3])),
           priority="high" if mode == "live" else "default")
     return rec

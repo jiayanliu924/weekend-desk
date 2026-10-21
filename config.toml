@@ -434,6 +434,16 @@ server = "https://ntfy.sh"
 # 每天几点（加州时间）推送当日 PDF
 daily_pdf_hour_pt = 7
 
+[debate]
+# Card B：美股期权下单前的多空辩论闸门（desk/debate.py）。只能否决或缩小张数，不能加仓/改结构。false = 直接放行。
+enabled = true
+# researcher_model / risk_model 不写就用 [agents] 的 member_model(Haiku) / lead_model(Sonnet)
+veto_confidence = 0.6
+min_size_mult = 0.25
+# LLM 出错/超时/超预算/解析失败：skip = 不下单（默认，记录）；pass = 放行原张数
+on_error = "skip"
+max_cost_usd = 0.30
+
 [agents]
 # AI 团队（18 个起步，赛马岗自动增减）。不碰真钱、不改规则；按结果自动奖惩。
 enabled = true
@@ -508,3 +518,36 @@ stale_move_bps = 10.0
 # 总账户止损线（desk/account_stop.py）：周末策略 + 跨平台套利的真实已实现盈亏合计亏到这个数，两条线全部停开新仓。
 # 解除：python -m desk.account_stop --reset（不会自动切回真下单）
 max_loss_usd = 20.0
+
+[supervisor]
+# 巡检员（desk/supervisor.py，只读：只推送提醒，绝不下单 / 撤单 / 改模式）。每小时跑一次，每天 07:05 PT 推一条大白话日报（最多调 1 次大模型）。
+# 同一个问题最多每 repush_hours 小时再推一次（升级除外），同级别最多连推 max_repeats 次。
+enabled = true
+# 真钱线连续多少小时（只算开市时间）没开仓就提醒
+no_entry_market_h = 48
+# 周末自动下单线：多少天内一单都没下就提醒
+weekend_no_entry_days = 8
+# 24 小时内"抓数据超过 45s"的次数：≥ warn 提醒，≥ alert 警报
+timeout_warn_24h = 5
+timeout_alert_24h = 60
+# 行情采集多少分钟没更新 → 提醒 / 警报；新闻多少分钟没更新 → 提醒
+ctx_stale_warn_min = 10
+ctx_stale_alert_min = 30
+news_stale_warn_min = 180
+# 总止损 / 套利单日止损：用掉多少比例 → 提醒 / 警报
+loss_warn_frac = 0.5
+loss_alert_frac = 0.75
+# 大盘：看这几个；连跌天数 / 近 10 日涨跌 % / 离 20 日高点 %
+regime_symbols = ["SOXX", "QQQ", "SPY"]
+regime_down_days_warn = 4
+regime_down_days_alert = 5
+regime_change10_warn_pct = -5.0
+regime_change10_alert_pct = -8.0
+regime_drawdown_warn_pct = -7.0
+regime_drawdown_alert_pct = -10.0
+disk_free_min_pct = 15
+mem_avail_min_pct = 15
+repush_hours = 6
+max_repeats = 4
+daily_hour_pt = 7
+daily_minute_pt = 5

@@ -369,6 +369,24 @@ def _headline_rows(hs: dict) -> str:
     return "".join(f"<tr><td>{E(lab)}</td>{''.join(cell(bh.get(h)) for h in hz)}</tr>" for lab, bh in rows)
 
 
+def _supervisor_block() -> str:
+    """概览上的"巡检员发现的问题"：只列最近一次每小时巡检里的 warn / alert，没有就什么都不显示。"""
+    try:
+        from . import supervisor
+        last = supervisor.load_state(S).get("last") or {}
+        fs = [f for f in last.get("findings", []) if f.get("level") in ("warn", "alert")]
+        if not fs:
+            return ""
+        rows = "".join(
+            f'<div style="margin-top:8px"><b class="{"bad" if f["level"] == "alert" else ""}">'
+            f'{"警报" if f["level"] == "alert" else "提醒"} · {E(f["title"])}</b>'
+            f'<div class="ev">{E(f["body"])}（从 {E(supervisor._pt(f.get("since", "")))} 起）</div></div>' for f in fs)
+        return (f'<div class="card" style="margin-top:12px;border-left:3px solid var(--warn)"><div class="k">巡检员发现的问题'
+                f'（{E(supervisor._pt(last.get("ts", "")))} 更新，加州时间）</div>{rows}</div>')
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def strategy_line(settings) -> str:
     """概览上的"当前主策略"一行（读 config.toml [strategy]）。"""
     from .model import FAMILY_CN, strategy_cfg
@@ -501,6 +519,7 @@ def overview(req: Request):
   </div>
 </section>
 
+{_supervisor_block()}
 <h2>成绩</h2>
 <p class="sub" style="margin-bottom:10px"><b>{E(strategy_line(S))}</b></p>
 <div class="strip">
