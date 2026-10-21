@@ -381,6 +381,10 @@ fee_per_contract_usd = 0.65
 contract_multiplier = 100
 slippage_pct = 1.0
 
+[opra]
+# 卡 D2：Databento 美股期权 1 分钟报价下载（desk/opra_fetch.py）。--download 前先算总价，超过这个数直接拒绝。
+max_cost_usd = 100.0
+
 [alpaca]
 # 11d 美股期权执行层（desk/alpaca_exec.py；说明见 knowledge/alpaca_exec_README.md）。
 # enabled=false：完全不动。enabled=true、live=false：有纸面 key 就发到 Alpaca 纸面账户，否则只演练记账。

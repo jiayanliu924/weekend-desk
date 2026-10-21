@@ -50,3 +50,5 @@ E6 pairs_lab 用 pairs_gate，让实验室报告覆盖新配对。
 - S 中 / Sonnet 写 → 同一审（4 条）→ 修 / 2 轮。只读；每小时代码巡检 + 每天 07:05 PT 一次 Sonnet 总结推手机。
 - D1 低 / Opus 直接写：只估价不下载。
 - 决定（Opus）：B、S 合并上线；B 默认开启（期权真钱本来就还关着，先在纸面账户跑）。回滚：[debate] enabled=false / [supervisor] enabled=false。
+- A3（Opus，2026-10-22）：预先登记 4 条买方规则 knowledge/options_triggers_v1.toml，sha256 前 16 位 b58dd4dc8d78e6c0。改任何数字 = v2，尝试次数累加。
+- D2 中 / Sonnet 写（抽样估价 + $100 上限 + 需 --yes）。等服务器 --plan 实测。
