@@ -114,8 +114,23 @@ def chunks(items: list, n: int = MAX_SYMBOLS) -> list[list]:
 class AlpacaSource:
     """包一层 ax.Client；测试里换成假的（同名方法）。"""
 
-    def __init__(self, c: ax.Client):
+    def __init__(self, c: ax.Client, sleep=time.sleep, min_gap_s: float = 0.35):
         self.c = c
+        self._sleep, self._gap, self._last = sleep, min_gap_s, 0.0
+
+    def _get(self, url: str, params: dict):
+        """Alpaca 限速 200 次/分钟：每次请求至少间隔 min_gap_s；碰到 429 等 60 秒再试，最多 5 次。"""
+        for k in range(6):
+            wait = self._gap - (time.monotonic() - self._last)
+            if wait > 0:
+                self._sleep(wait)
+            self._last = time.monotonic()
+            try:
+                return self.c._req("GET", url, params=params)
+            except RuntimeError as e:
+                if "429" not in str(e) or k == 5:
+                    raise
+                self._sleep(60)
 
     def closes(self, und: str, start: date, end: date) -> dict[str, float]:
         out, tok = {}, None
@@ -124,7 +139,7 @@ class AlpacaSource:
                  "adjustment": "raw", "feed": "iex"}
             if tok:
                 p["page_token"] = tok
-            d = self.c._req("GET", f"{ax.DATA_URL}/v2/stocks/{und}/bars", params=p)
+            d = self._get(f"{ax.DATA_URL}/v2/stocks/{und}/bars", p)
             for b in d.get("bars") or []:
                 out[b["t"][:10]] = float(b["c"])
             tok = d.get("next_page_token")
@@ -145,7 +160,7 @@ class AlpacaSource:
                          "expiration_date_lte": nxt.isoformat(), "status": status, "limit": 1000}
                     if tok:
                         p["page_token"] = tok
-                    d = self.c._req("GET", f"{self.c.base}/v2/options/contracts", params=p)
+                    d = self._get(f"{self.c.base}/v2/options/contracts", p)
                     out += d.get("option_contracts") or []
                     tok = d.get("next_page_token")
                     if not tok:
@@ -346,7 +361,12 @@ def run(settings, src, db, unds: list[str], start: date, end: date, mode: str, y
     reqs_all = []
     for u in unds:
         out(f"[{u}] 读取收盘价和合约列表（Alpaca，免费）…")
-        m = build_meta(src, u, start, end)
+        cache = root / "meta" / f"meta_{u}_{start}_{end}.json"
+        if cache.exists():      # 断点续跑：合约清单已经拉过就不再拉（Alpaca 限速）
+            m = json.loads(cache.read_text())
+        else:
+            m = build_meta(src, u, start, end)
+            cache.write_text(json.dumps(m))
         (root / "meta" / f"closes_{u}.json").write_text(json.dumps(m["closes"]))
         (root / "meta" / f"needed_{u}.json").write_text(json.dumps(m["needed"]))
         monthly = defaultdict(set)

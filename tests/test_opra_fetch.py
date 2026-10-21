@@ -175,3 +175,28 @@ def test_429_backoff_and_concurrency(monkeypatch):
     of.price_plan(DB(), r, workers=99, sleep=sleeps.append)
     assert r[0]["cost"] == 2.0 and sleeps == [2, 4]
     assert of.MAX_WORKERS <= 4
+
+
+def test_alpaca_source_retries_429_and_paces():
+    from desk import opra_fetch as of
+    calls, sleeps = [], []
+    class C:
+        base = "x"
+        def _req(self, m, url, params=None):
+            calls.append(url)
+            if len(calls) < 3:
+                raise RuntimeError("Alpaca GET /v2/options/contracts → 429: rate limit exceeded")
+            return {"ok": 1}
+    src = of.AlpacaSource(C(), sleep=sleeps.append, min_gap_s=0.0)
+    assert src._get("u", {}) == {"ok": 1} and len(calls) == 3 and sleeps.count(60) == 2
+
+
+def test_alpaca_source_other_errors_raise():
+    from desk import opra_fetch as of
+    import pytest
+    class C:
+        base = "x"
+        def _req(self, m, url, params=None):
+            raise RuntimeError("Alpaca → 403: forbidden")
+    with pytest.raises(RuntimeError):
+        of.AlpacaSource(C(), sleep=lambda x: None, min_gap_s=0.0)._get("u", {})
