@@ -20,3 +20,23 @@
 - A 上线：服务器部署后自动跑三条线并推手机排名；只读，不碰钱。
 - B 合并但默认 off：3 轮用满，按规则不再开第 4 轮；先 shadow 跑满一周、再一次最小金额 live 测试真实交易所接口（PairsClient 只对 stub 测过）。升 live 需 Kea 签字 + 老板点头。
 - 回滚：pairs_live.json 改 off（有仓位时仍会照管平仓）；labs_auto 只读无需回滚。
+
+## 卡 E（2026-10-21）：配对扩容 4 → 全部可配（服务器实测：4 个 dex、163 合约、同股配对 14、代理 2）
+档：高。模型：Sonnet 写 → Sonnet×2 找 bug（已做第 1 轮）→ Opus 审 → Kea 签字。
+第 1 轮已改：[pairs] gate_* 配对专用门槛（硬底线 $2万/$2万/60bps）、max_concurrent 硬封顶 3。
+第 1 轮找 bug（2 个 Sonnet，互相印证）要修：
+E1 已开仓配对掉出门槛 → 收敛出场失效：开仓配对的两腿永远进 load_data 和 _spread_exits 的 pk（从账本取，不看门槛）。
+E2 28 条腿抓数据 3.5–5 分钟 > 45s 超时，超时时 _spread_exits 整段跳过：K 线改增量抓（内存里有就只抓最近几根，资金费率照旧 1h 缓存），目标 28 腿每根 K 线 < 30s；冷启动（_DATA 为空）单独允许更长超时。
+E3 新放进来的薄配对（过宽门槛、不过 [universe] 严门槛）先影子：live 模式下也只记账不下单，写独立账本，不进真钱盈亏 / 止损统计；config [pairs] loose_live_allow = [] 列出的才真下（晋级要 Kea 签字）。
+E4 max_concurrent 改 2（2 × 单对 $4 = 日止损 $8），注释改对。
+E5 一手价值 > 名义 × net_tolerance_frac 的配对不开（防开完下一分钟因 imbalance 平、再开的空转）；imbalance 平仓后也锁 lock_h。
+E6 pairs_lab 用 pairs_gate，让实验室报告覆盖新配对。
+验收：全部测试过；每条修复各有一个测试；tasks/done/E.md ≤15 行。
+
+### 卡 E 轮次：高 / Sonnet×2 找 bug（第 1 轮 6+4 条，互相印证合并为 E1–E6）→ Sonnet 写 → Sonnet 第 2 轮（1 条，已修）/ 共 2 轮
+### 决定记录 2026-10-21（Opus）
+- 合并。live 照旧只真下"过严门槛"的 4 对；新进来的约 10 对薄配对只影子记账（pairs_loose 账本），不碰钱、不进止损统计。
+- 晋级：某薄配对在实验室报告（pairs_lab.md，已覆盖新配对）样本外扣全额手续费为正 + 影子信号次数够 → 推给 Kea，Kea 签字后加进 loose_live_allow。
+- 同时持有上限 1 → 2（2 × 单对 $4 = 日止损 $8；总账户 $20 止损不变）。
+- 回滚：config [pairs] gate_* 删掉（回到严门槛）、max_concurrent 改回 1；或 pairs 模式切 shadow / off（有仓位照管平仓）。
+- 部署后要实测：28 条腿增量抓 K 线是否 < 45s（看日志里"抓数据超过"是否消失）。

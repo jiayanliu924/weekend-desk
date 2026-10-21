@@ -165,13 +165,14 @@ def info_post(payload: dict, weight: float = CANDLE_MAX_WEIGHT, post=None, pacer
 
 
 # ---------------------------------------------------------------- K 线抓取 + 缓存
-def fetch_candles_paged(coin: str, interval: str, days: int, post=None, pacer: Pacer | None = None) -> list[dict]:
+def fetch_candles_paged(coin: str, interval: str, days: int, post=None, pacer: Pacer | None = None,
+                        start_ms: int | None = None) -> list[dict]:
     """沿用 backfill.fetch_candles 的接口，但 candleSnapshot 一次最多 5000 根，往前翻页直到够 days 天。
 
     Hyperliquid 每个周期只保留最近 5000 根（15m ≈ 52 天，1h ≈ 208 天），更早的要靠本地缓存累积（save_cache 会合并）。
     """
     end = int(time.time() * 1000)
-    start = end - days * 86400 * 1000
+    start = start_ms if start_ms is not None else end - days * 86400 * 1000   # start_ms：增量抓取，只要这个时间之后的
     out: dict[int, dict] = {}
     cur_end = end
     for _ in range(60):

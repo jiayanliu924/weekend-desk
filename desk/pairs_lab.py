@@ -76,6 +76,27 @@ def canonical(symbol: str) -> tuple[str, bool]:
     return (ALIASES[s], True) if s in ALIASES else (s, False)
 
 
+# 配对门槛的硬底线：配置放得再松也不低于这些
+GATE_FLOOR = {"min_day_ntl_vlm_usd": 20_000.0, "min_oi_usd": 20_000.0, "max_spread_bps": 60.0}
+
+
+def pairs_gate(settings, cf: dict | None = None) -> dict:
+    """配对专用的流动性门槛：先取 [universe]（周末线用的），再用 [pairs] 里 gate_* 覆盖。
+    只影响哪些配对进候选；仓位仍按盘口深度 × depth_fraction 封顶，成本（含点差）仍进走前判断。
+    门槛不能低于 GATE_FLOOR（太薄的盘口连最小单都成交不干净）。pairs_exec 和实验室共用这一份。"""
+    if cf is None:
+        cf = (settings.raw.get("pairs") if hasattr(settings, "raw") else settings.get("pairs", {})) or {}
+    g = dict(uv.gate_cfg(settings))
+    for k in ("min_day_ntl_vlm_usd", "min_oi_usd", "max_spread_bps"):
+        v = cf.get("gate_" + k)
+        if v is not None:
+            g[k] = float(v)
+    g["min_day_ntl_vlm_usd"] = max(g["min_day_ntl_vlm_usd"], GATE_FLOOR["min_day_ntl_vlm_usd"])
+    g["min_oi_usd"] = max(g["min_oi_usd"], GATE_FLOOR["min_oi_usd"])
+    g["max_spread_bps"] = min(g["max_spread_bps"], GATE_FLOOR["max_spread_bps"])
+    return g
+
+
 def discover_pairs(raw: dict, gate: dict) -> list[dict]:
     """同一规范底层、不同 dex 的两两组合。主 dex（加密）不在 raw['dexs'] 里，天然不参与。"""
     mk = [m for m in uv.parse_markets(raw) if not m.is_delisted and m.dex]
@@ -472,7 +493,7 @@ def report_md(res: dict) -> str:
 def run(settings, raw: dict, discovery_source: str, days: int = 60, interval: str = "5m", warmup: int = 5,
         fetch: bool = True, notional: float = 1000.0, out: Path | None = None) -> tuple[str, dict]:
     iv_ms = bl.INTERVAL_MS[interval]
-    gate = uv.gate_cfg(settings)
+    gate = pairs_gate(settings)      # 和 pairs_exec 用同一份配对门槛，报告覆盖实盘会考虑的全部配对
     pairs = discover_pairs(raw, gate)
     errors = [f"{k or '主 dex'}: {v}" for k, v in (raw.get("errors") or {}).items()]
     cache_c: dict[str, tuple] = {}

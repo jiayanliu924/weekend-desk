@@ -51,6 +51,10 @@ DEPTH_FRAC_CAP = 0.10       # 名义 ≤ 第一档深度的 10%（配置再大�
 MIN_ORDER_USD = 10.0        # Hyperliquid 最小下单价值
 MIN_ORDER_MARGIN = 1.05     # 向下取整到 szDecimals 之后每腿仍要 ≥ 最小下单价值 × 这个系数
 EPS = 1e-9
+FULL_REFETCH_PER_LOAD = 2   # 每次抓数据最多几条腿做到期的全量 K 线重抓（冷启动不受限）
+FUNDING_REFRESH_PER_LOAD = 4  # 每次抓数据最多刷新几条腿的资金费率（没有旧值的不受限）
+CONCURRENT_HARD_CAP = 3     # 同时持有配对数的硬上限（配置再大也按 3）
+GATE_FLOOR = pl.GATE_FLOOR       # 配对门槛的硬底线
 DAY_MS = pl.DAY_MS
 HOUR_MS = 3_600_000
 
@@ -62,7 +66,10 @@ DEFAULTS = {
     "unwind_retries": 3, "min_balance_usd": 5.0, "fee_bps": 9.0, "cooldown_min": 30,
     "max_mark_spread_bps": 100.0,     # 盘口买卖价差超过这个就不信中间价
     "settled_after_min": 5.0,         # 交易所持仓为 0 而账本非 0 持续多久 → 按已了结处理
-    "data_timeout_s": 45.0,           # 抓 K 线 / 发现数据的最长等待
+    "data_timeout_s": 45.0,           # 抓 K 线 / 发现数据的最长等待（增量抓取）
+    "data_timeout_cold_s": 300.0,     # 冷启动（内存里还没有任何数据，要全量抓）的最长等待
+    "candle_full_refetch_h": 6.0,     # 内存里的 K 线每隔多久全量重抓一次（其余时候只抓最近几根）
+    "loose_live_allow": [],           # 过配对门槛但不过 [universe] 严门槛的配对，只有列在这里的才真下单，其余只影子记账
     "lock_h": 24.0,                   # 止损 / 超时出场后锁定该配对多久
     "alert_every_min": 60.0,          # 同类告警的最短间隔
     "repoll_tries": 3,                # 下单回包异常后，重查成交 / 持仓的次数
@@ -122,8 +129,15 @@ def cfg(settings) -> dict:
     d.update((settings.raw.get("pairs") if hasattr(settings, "raw") else settings.get("pairs", {})) or {})
     d["leverage"] = int(max(1, min(int(float(d["leverage"])), LEV_HARD_CAP)))
     d["depth_fraction"] = max(0.0, min(float(d["depth_fraction"]), DEPTH_FRAC_CAP))
-    d["max_concurrent"] = max(0, int(d["max_concurrent"]))
+    d["max_concurrent"] = max(0, min(int(d["max_concurrent"]), CONCURRENT_HARD_CAP))
+    d["loose_live_allow"] = [str(x) for x in (d.get("loose_live_allow") or [])]
     return d
+
+
+pairs_gate = pl.pairs_gate          # 实现在 pairs_lab（实验室共用）
+
+
+LOOSE_LEDGER = "pairs_loose"    # 薄配对影子记账的独立账本（load_state / account_stop 都不读它）
 
 
 def _led(settings) -> Ledger:
@@ -547,6 +561,16 @@ def _pair_key(p: dict) -> str:
     return f"{p['a']}|{p['b']}"
 
 
+def _candidates(data: dict) -> list[dict]:
+    """开仓候选 = 去掉"只因还有仓位才留着"的配对（它们只用来算出场价差）。"""
+    return [p for p in data["pairs"] if not p.get("held_only")]
+
+
+def _live_eligible(pair: dict, cf: dict) -> bool:
+    """live 能不能真下单：过 [universe] 严门槛（strict），或 key 在 loose_live_allow 里。没标 strict = 不行（宁可不下）。"""
+    return pair.get("strict") is True or _pair_key(pair) in cf["loose_live_allow"]
+
+
 def _series(pair: dict, data: dict, iv_ms: int, now_ms: int):
     """只用已收盘的 K 线（t + 周期 ≤ now）。"""
     def closed(coin):
@@ -596,7 +620,8 @@ _DATA: dict = {}
 
 
 def load_data(settings, now_ms: int, cf: dict) -> dict:
-    """发现（缓存 6 小时）+ 每根新 K 线抓一次两腿 K 线 + 资金费率（缓存 1 小时）。同一根 K 线内重复调用走内存。"""
+    """发现（缓存 6 小时）+ 每根新 K 线抓一次两腿 K 线（内存里有就只增量抓最近几根，每 candle_full_refetch_h 小时全量重抓）
+    + 资金费率（缓存 1 小时）。同一根 K 线内重复调用走内存。已开仓配对的两腿永远在里面（不看门槛）。"""
     iv_ms = bl.INTERVAL_MS[cf["interval"]]
     key = (str(settings.data), now_ms // iv_ms)
     if _DATA.get("key") == key:
@@ -614,27 +639,58 @@ def load_data(settings, now_ms: int, cf: dict) -> dict:
             raw = json.loads(cached.read_text()) if cached.exists() else None
     if raw is None:
         raise RuntimeError("没有 universe 发现数据")
-    pairs = [p for p in pl.discover_pairs(raw, uv.gate_cfg(settings)) if p["kind"] == "same" and p["gate_ok"]]
-    if cf["allow"]:
-        pairs = [p for p in pairs if _pair_key(p) in cf["allow"]]
+    strict = {_pair_key(p) for p in pl.discover_pairs(raw, uv.gate_cfg(settings)) if p["kind"] == "same" and p["gate_ok"]}
+    held = {p["open"]["pair_key"] for p in open_pairs(load_state(settings)).values()}   # 已开仓配对：不管门槛都要继续看价差
+    pairs = []
+    for p in pl.discover_pairs(raw, pairs_gate(settings, cf)):
+        if p["kind"] != "same":
+            continue
+        k = _pair_key(p)
+        cand = p["gate_ok"] and (not cf["allow"] or k in cf["allow"])
+        if cand or k in held:
+            # strict = 也过 [universe] 严门槛（周末线用的）；held_only = 只因为还有仓位才留着（出场用，不再当开仓候选）
+            pairs.append({**p, "strict": k in strict, "held_only": not cand})
     candles, funding = {}, {}
     prev = _DATA.get("data", {}) if _DATA.get("settings") == str(settings.data) else {}
+    prev_c, full_t = prev.get("candles", {}), dict(prev.get("candles_full_t", {}))
+    iv_ms = bl.INTERVAL_MS[cf["interval"]]
+    keep_from = now_ms - int(cf["lookback_days"]) * DAY_MS
+    # 到期的全量重抓 / 资金费率刷新每次最多做几条腿，其余照旧增量 / 用旧值：冷启动后所有腿同一时刻到期，
+    # 一次全量重抓 28 条腿要 3–5 分钟，会撞 45 秒超时（复核第 2 轮）。这样到期的腿分摊到之后几根 K 线。
+    n_full, n_fund = 0, 0
+    fund_t: dict = {}
     for p in pairs:
         for coin in (p["a"], p["b"]):
             if coin in candles:
                 continue
+            old = prev_c.get(coin) or []
+            incr = bool(old) and time.time() - full_t.get(coin, 0) < float(cf["candle_full_refetch_h"]) * 3600
+            if old and not incr:
+                if n_full >= FULL_REFETCH_PER_LOAD:
+                    incr = True
+                else:
+                    n_full += 1
             try:
-                candles[coin] = bl.fetch_candles_paged(coin, cf["interval"], cf["lookback_days"])
+                if incr:   # 增量：只抓最后一根往前几根（最后一根当时还没收盘，要重抓），合并后裁到回看窗口
+                    new = bl.fetch_candles_paged(coin, cf["interval"], cf["lookback_days"], start_ms=int(old[-1]["t"]) - 3 * iv_ms)
+                    m = {int(c["t"]): c for c in old}
+                    m.update({int(c["t"]): c for c in new})
+                    candles[coin] = [m[t] for t in sorted(m) if t >= keep_from]
+                else:
+                    candles[coin] = bl.fetch_candles_paged(coin, cf["interval"], cf["lookback_days"])
+                    full_t[coin] = time.time()
             except Exception as e:  # noqa: BLE001
                 log.warning("candles %s: %s", coin, e)
-                candles[coin] = []
+                candles[coin] = old       # 抓失败：留着旧的（太旧时 signal() 会因"数据断档"不出信号）
             old = prev.get("funding_t", {}).get(coin)
-            if old and time.time() - old[0] < 3600:
-                funding[coin] = old[1]
+            if old and (time.time() - old[0] < 3600 or n_fund >= FUNDING_REFRESH_PER_LOAD):
+                funding[coin], fund_t[coin] = old[1], old          # 没刷新：保留原来的抓取时间，下次照样到期
             else:
+                n_fund += 1 if old else 0
                 funding[coin] = bl.get_funding(settings, coin, cf["lookback_days"])[0]
-    data = {"pairs": pairs, "candles": candles, "funding": funding, "halted": halted_coins(raw),
-            "funding_t": {c: (time.time(), r) for c, r in funding.items()}}
+                fund_t[coin] = (time.time(), funding[coin])
+    data = {"pairs": pairs, "candles": candles, "candles_full_t": full_t, "funding": funding, "halted": halted_coins(raw),
+            "funding_t": fund_t}
     _DATA.update(key=key, data=data, settings=str(settings.data))
     return data
 
@@ -673,14 +729,17 @@ def load_data_limited(settings, now_ms: int, cf: dict) -> dict:
             raise TimeoutError("上一次数据抓取还没结束")
     f = _EXEC.submit(_run_load, settings, now_ms, cf)
     _FUT["f"] = f
+    # 冷启动（内存里还没有这个数据目录的 K 线）要全量抓，单独给更长的超时；之后都是增量
+    cold = _DATA.get("settings") != str(settings.data)
+    tmo = float(cf["data_timeout_cold_s"] if cold else cf["data_timeout_s"])
     try:
-        return f.result(timeout=float(cf["data_timeout_s"]))
+        return f.result(timeout=tmo)
     except concurrent.futures.TimeoutError as e:
         _FUT["orphan"] = True
         d = _fresh_result(cf)
         if d is not None:
             return d
-        raise TimeoutError(f"抓数据超过 {cf['data_timeout_s']}s") from e
+        raise TimeoutError(f"抓数据超过 {tmo:.0f}s") from e
 
 
 
@@ -762,6 +821,8 @@ def _write_lock(ctx: Ctx, key: str, reason: str):
 def _open_pair(ctx: Ctx, pair: dict, sig: dict, st: dict) -> dict:
     cf, now_ms = ctx.cf, ctx.now_ms
     key = _pair_key(pair)
+    if ctx.mode == "live" and not _live_eligible(pair, cf):      # 最后一道闸：薄配对没签字晋级，live 里绝不发单
+        return {"skipped": "过宽门槛但不过严门槛，且不在 loose_live_allow（只做影子记账）"}
     sg = 1 if sig["spread"] > 0 else -1
     rich, cheap = (pair["a"], pair["b"]) if sg > 0 else (pair["b"], pair["a"])   # s>0 = A 贵：空 A 多 B
     bk = {c: _book(ctx, c) for c in (rich, cheap)}
@@ -835,6 +896,10 @@ def _live_open(ctx: Ctx, pair: dict, sig: dict, st: dict, key: str, sg: int, ric
     dec = {c: ctx.c.sz_decimals(c) for c in (rich, cheap)}
     legs = {rich: {"buy": False, "px_ref": bk[rich]["bid"], "depth": bk[rich]["bid_depth_usd"]},
             cheap: {"buy": True, "px_ref": bk[cheap]["ask"], "depth": bk[cheap]["ask_depth_usd"]}}
+    for c in (rich, cheap):   # 一手价值 > 名义 × 容忍度：开完就会被 imbalance 平掉再开，空转烧手续费 → 不开
+        lot = 10 ** -dec[c] * legs[c]["px_ref"]
+        if lot > notional * float(cf["net_tolerance_frac"]):
+            return {"skipped": f"{c} 一手 ${lot:.2f} > 名义 ${notional:.0f} × 容忍度 {cf['net_tolerance_frac']}，取整误差会触发 imbalance"}
     for c in (rich, cheap):   # 向下取整到 szDecimals 之后，每腿仍要明显高于最小下单价值
         v = _floor(notional / legs[c]["px_ref"], dec[c]) * legs[c]["px_ref"]
         if v < MIN_ORDER_USD * MIN_ORDER_MARGIN:
@@ -1052,7 +1117,7 @@ def _manage_one(ctx: Ctx, pid: str, out: dict):
         if reason:
             done = _close_pair(ctx, pid, reason, load_state(ctx.settings))
             out["exits"].append({"pair_id": pid, "reason": reason, "closed": done})
-            if reason in ("per_pair_loss", "max_hold"):
+            if reason in ("per_pair_loss", "max_hold", "imbalance"):
                 _write_lock(ctx, o["pair_key"], reason)
 
 
@@ -1210,7 +1275,9 @@ def _step(settings, now: datetime, client, data) -> dict:
         out["skips"].append("halt_entries")
         _write_decisions(ctx, out, _blanket_rows(ctx, data, f"停开新仓标志（{h.get('halt_reason') or '?'}）"))
         return out
-    pk = {_pair_key(p): p for p in data["pairs"]}
+    cands = _candidates(data)
+    pk = {_pair_key(p): p for p in cands if _live_eligible(p, cf)}
+    loose = [p for p in cands if not _live_eligible(p, cf)]     # 薄配对：只影子记账（独立账本），不下单
     rows: list[dict] = []
     black, halted = in_blackout(cf, now_ms), set(data.get("halted") or ())
     for key, pair in pk.items():
@@ -1260,6 +1327,10 @@ def _step(settings, now: datetime, client, data) -> dict:
             rows.append(_row(key, sig, "已开仓" if ok else f"开仓未成功：{res.get('error') or '一条腿没成交，已回补'}", entered=ok))
         if get(settings).get("halt_entries"):
             break
+    try:
+        out["loose_plans"] = _shadow_scan(ctx, loose, data, Ledger(settings.data, LOOSE_LEDGER), rows, push=False)
+    except Exception as e:  # noqa: BLE001  影子记账出任何问题都不能影响真仓位
+        log.warning("loose shadow: %s", e)
     _write_decisions(ctx, out, rows)
     return out
 
@@ -1286,7 +1357,7 @@ def _row(key: str, sig: dict, reason: str, entered: bool = False) -> dict:
 
 def _blanket_rows(ctx: Ctx, data: dict, reason: str) -> list[dict]:
     """整步都不开仓时的决策表：只写原因，不调用 signal()（它可能慢 / 出错，而这里不需要）。"""
-    return [_row(_pair_key(pair), {}, reason) for pair in data["pairs"]]
+    return [_row(_pair_key(pair), {}, reason) for pair in _candidates(data)]
 
 
 def decision_path(settings) -> Path:
@@ -1332,10 +1403,19 @@ def decision_lines(settings) -> list[str]:
 
 def _step_shadow(ctx: Ctx, data: dict, out: dict) -> dict:
     """演习：算信号和名义，记账 + 推送，不发任何单（不调用 ioc / set_leverage）。守卫（休市 / 下架 / 腿不活跃）同样生效。"""
-    cf, led = ctx.cf, ctx.led
     rows: list[dict] = []
+    out["plans"].extend(_shadow_scan(ctx, _candidates(data), data, ctx.led, rows, push=True))
+    _write_decisions(ctx, out, rows)
+    return out
+
+
+def _shadow_scan(ctx: Ctx, pairs: list[dict], data: dict, led: Ledger, rows: list[dict], push: bool) -> list[dict]:
+    """对 pairs 逐个算"本来会开什么"，写进 led（plan 记录），不发单。shadow 模式写 pairs 账本；
+    live 模式下的薄配对写 pairs_loose 独立账本（永远不进真钱盈亏 / 止损 / 总账户止损）。"""
+    cf = ctx.cf
+    plans: list[dict] = []
     black, halted = in_blackout(cf, ctx.now_ms), set(data.get("halted") or ())
-    for pair in data["pairs"]:
+    for pair in pairs:
         key = _pair_key(pair)
         sig = signal(pair, data, cf, ctx.now_ms)
         if not sig["ok"]:
@@ -1369,13 +1449,13 @@ def _step_shadow(ctx: Ctx, data: dict, out: dict) -> dict:
                 "spread_bps": round(sig["spread"], 1), "thr_bps": round(sig["thr"], 1), "variant": sig["variant"],
                 "exit_mode": sig["exit_mode"], "max_hold_h": cf["max_hold_h"], "sent": False}
         led.append("plan", key, plan)
-        notify.push(ctx.settings, f"配对演习：{key} 本来会开仓",
-                    f"空 {rich}、多 {cheap}，每腿约 ${notional:.0f}，价差 {sig['spread']:+.0f} bps（门槛 {sig['thr']:.0f}，变体 {sig['variant']}）。"
-                    "演习模式，没有真下单。")
-        out["plans"].append(plan)
-        rows.append(_row(key, sig, "演习开仓（没有真下单）", entered=True))
-    _write_decisions(ctx, out, rows)
-    return out
+        if push:
+            notify.push(ctx.settings, f"配对演习：{key} 本来会开仓",
+                        f"空 {rich}、多 {cheap}，每腿约 ${notional:.0f}，价差 {sig['spread']:+.0f} bps（门槛 {sig['thr']:.0f}，变体 {sig['variant']}）。"
+                        "演习模式，没有真下单。")
+        plans.append(plan)
+        rows.append(_row(key, sig, "演习开仓（没有真下单）" if push else "影子记账（薄配对，没有真下单）", entered=push))
+    return plans
 
 
 def main(argv=None) -> int:

@@ -73,7 +73,7 @@ def make_data(n_days=17, tail=(), base=120.0, allow_second=False, day_shift=0):
     cs = {A: candles(pa, sh), B: candles(pb, sh)}
     if allow_second:
         cs.update({A2: candles(pa, sh), B2: candles(pb, sh)})
-    pairs = [p for p in pairs if p["a"] in cs]
+    pairs = [{**p, "strict": True} for p in pairs if p["a"] in cs]      # 夹具里的配对都过严门槛
     data = {"pairs": pairs, "candles": cs, "funding": {}}
     now = datetime.fromtimestamp((T0 + sh + len(sp) * IV) / 1000 + 20, timezone.utc)
     return data, now
@@ -808,7 +808,7 @@ def test_data_timeout_does_not_block_exits(s, monkeypatch):
     fc = FakeClient()
     out, data, now = live_entry(s, fc)
     monkeypatch.setattr(px, "load_data", lambda *a, **k: _t.sleep(1.0))
-    cfg_set(s, data_timeout_s=0.1)
+    cfg_set(s, data_timeout_s=0.1, data_timeout_cold_s=0.1)
     t0 = _t.time()
     out = px.step(s, later(now, 25 * 3600), client=fc, data=None)
     assert _t.time() - t0 < 0.8 and "数据不可用" in out["error"]
@@ -932,7 +932,7 @@ def test_late_finished_load_is_reused_instead_of_erroring(s, monkeypatch):
         gate.wait(2.0)
         return data
     monkeypatch.setattr(px, "load_data", slow)
-    cfg_set(s, data_timeout_s=0.05)
+    cfg_set(s, data_timeout_s=0.05, data_timeout_cold_s=0.05)
     cf = px.cfg(s)
     with pytest.raises(TimeoutError):
         px.load_data_limited(s, ms(now), cf)
@@ -1333,3 +1333,169 @@ def test_decision_lines_tz_fallback(s, monkeypatch):
     px.step(s, now, client=fc, data=data)
     monkeypatch.setattr(px, "ZoneInfo", lambda n: (_ for _ in ()).throw(KeyError(n)))
     assert "UTC" in px.decision_lines(s)[0]
+
+
+# ---------------------------------------------------------------- 配对专用门槛 + 同时持有上限
+def test_pairs_gate_overrides_universe_and_respects_floor(s):
+    g = px.pairs_gate(s, px.cfg(s))
+    assert g["min_day_ntl_vlm_usd"] == 20_000.0 and g["min_oi_usd"] == 20_000.0 and g["max_spread_bps"] == 60.0
+    cfg_set(s, gate_min_day_ntl_vlm_usd=1.0, gate_min_oi_usd=0.0, gate_max_spread_bps=500.0)
+    g = px.pairs_gate(s, px.cfg(s))
+    assert g == {**g, **px.GATE_FLOOR}                      # 放得再松也停在硬底线
+    s.raw["pairs"] = {k: v for k, v in s.raw["pairs"].items() if not k.startswith("gate_")}
+    g = px.pairs_gate(s, px.cfg(s))
+    from desk import universe as uv
+    assert g["min_day_ntl_vlm_usd"] == uv.gate_cfg(s)["min_day_ntl_vlm_usd"]   # 没配就和周末线一样
+
+
+def test_pairs_gate_does_not_touch_weekend_universe(s):
+    from desk import universe as uv
+    assert uv.gate_cfg(s)["min_day_ntl_vlm_usd"] == 200_000.0 and uv.gate_cfg(s)["max_spread_bps"] == 20.0
+
+
+def test_looser_gate_admits_thin_pair():
+    raw = pl.fixture_raw()
+    strict = {"min_day_ntl_vlm_usd": 2e5, "min_oi_usd": 1e5, "max_spread_bps": 20.0}
+    loose = {**strict, **px.GATE_FLOOR}
+    n_strict = sum(p["kind"] == "same" and p["gate_ok"] for p in pl.discover_pairs(raw, strict))
+    n_loose = sum(p["kind"] == "same" and p["gate_ok"] for p in pl.discover_pairs(raw, loose))
+    assert n_loose >= n_strict
+
+
+def test_max_concurrent_hard_cap(s):
+    cfg_set(s, max_concurrent=50)
+    assert px.cfg(s)["max_concurrent"] == px.CONCURRENT_HARD_CAP == 3
+
+
+# ---------------------------------------------------------------- 卡 E：扩容后的 6 条修复
+def _raw_ctx(s, monkeypatch, strict_keys=None):
+    """load_data 用的假环境：fixture_raw、假 K 线抓取（记录每次请求）。返回 (calls, now_ms)。"""
+    raw = pl.fixture_raw()
+    monkeypatch.setattr(px.uv, "discover", lambda *a, **k: raw)
+    monkeypatch.setattr(bl, "get_funding", lambda settings, coin, days: ([], None))
+    px._DATA.clear()
+    calls = []
+    now_ms = T0 + 20 * pl.DAY_MS
+
+    def fake(coin, interval, days, post=None, pacer=None, start_ms=None):
+        calls.append((coin, start_ms))
+        lo = start_ms if start_ms is not None else now_ms - days * pl.DAY_MS
+        return [{"t": t, "c": "100", "v": "1"} for t in range(lo // IV * IV, now_ms, IV)]
+    monkeypatch.setattr(bl, "fetch_candles_paged", fake)
+    return calls, now_ms
+
+
+def test_E1_open_pair_legs_kept_in_data_even_if_gate_drops_it(s, monkeypatch):
+    fc = FakeClient()
+    out, data, now = live_entry(s, fc)
+    calls, now_ms = _raw_ctx(s, monkeypatch)
+    cfg_set(s, gate_min_day_ntl_vlm_usd=1e12, gate_min_oi_usd=1e12)      # 门槛高到没有配对能过（硬底线只管下限）
+    d = px.load_data(s, now_ms, px.cfg(s))
+    held = [p for p in d["pairs"] if px._pair_key(p) == f"{A}|{B}"]
+    assert held and held[0]["held_only"] and A in d["candles"] and B in d["candles"]
+    assert px._candidates(d) == []                                       # 但不再当开仓候选
+    # 且 _spread_exits 能用到它的 K 线价差（pk 里有这一对）
+    assert f"{A}|{B}" in {px._pair_key(p) for p in d["pairs"]}
+
+
+def test_E2_incremental_candle_fetch_and_cold_start_timeout(s, monkeypatch):
+    calls, now_ms = _raw_ctx(s, monkeypatch)
+    cf = px.cfg(s)
+    d1 = px.load_data(s, now_ms, cf)
+    n_full = len(calls)
+    assert n_full == 2 and all(st is None for _, st in calls)            # 冷启动：全量
+    d2 = px.load_data(s, now_ms + IV, cf)                                # 下一根 K 线：只增量
+    inc = calls[n_full:]
+    assert len(inc) == 2 and all(st is not None and st >= now_ms - 5 * IV for _, st in inc)
+    assert abs(len(d2["candles"][A]) - len(d1["candles"][A])) <= 1
+    assert all(int(c["t"]) >= now_ms + IV - cf["lookback_days"] * pl.DAY_MS for c in d2["candles"][A])   # 裁到回看窗口
+    ts = [int(c["t"]) for c in d2["candles"][A]]
+    assert ts == sorted(set(ts))
+    # 超过 6 小时 → 全量重抓
+    for c in d2["candles_full_t"]:
+        d2["candles_full_t"][c] -= 7 * 3600
+    px.load_data(s, now_ms + 2 * IV, cf)
+    assert sum(st is None for _, st in calls) == 4
+    assert cf["data_timeout_cold_s"] >= 300 > cf["data_timeout_s"]
+
+
+def test_E3_loose_pair_never_orders_live_but_shadows_to_separate_ledger(s):
+    fc = FakeClient()
+    set_mode(s, "live")
+    data, now = make_data()
+    data["pairs"] = [{**p, "strict": False} for p in data["pairs"]]
+    out = px.step(s, now, client=fc, data=data)
+    assert fc.orders == [] and out["entries"] == [] and not pairs_state(s)
+    assert len(out["loose_plans"]) == 1
+    recs = Ledger(s.data, px.LOOSE_LEDGER).all()
+    assert recs and all(r["kind"] == "plan" and r["sent"] is False for r in recs)
+    assert not any(r["kind"] == "plan" for r in px._led(s).all())        # 主账本（真钱）里没有
+    # 白名单里的 key 才真下
+    cfg_set(s, loose_live_allow=[f"{A}|{B}"])
+    out = px.step(s, later(now, 60), client=fc, data=data)
+    assert len(out["entries"]) == 1 and fc.orders
+    # 缺 strict 标记 = 不放行；而且 _open_pair 本身也拦
+    cfg_set(s, loose_live_allow=[])
+    ctx = px.Ctx(s, fc, px.cfg(s), int(now.timestamp() * 1000), "live")
+    assert "影子" in px._open_pair(ctx, {"a": A, "b": B}, {"spread": 80.0}, px.load_state(s))["skipped"]
+
+
+def test_E4_config_max_concurrent_is_two():
+    import tomllib
+    c = tomllib.loads((ROOT / "config.toml").read_text())["pairs"]
+    assert c["max_concurrent"] == 2 and c["loose_live_allow"] == []
+    assert c["max_concurrent"] * c["max_pair_loss_usd"] <= c["daily_loss_stop_usd"]
+
+
+def test_E5_big_lot_pair_not_opened_and_imbalance_close_locks(s):
+    fc = FakeClient(mids={A: 120.0 * 1.008 * 100, B: 120.0 * 100, A2: 1, B2: 1})    # 一手 0.01 × 12000 = $120 > 名义 × 5%
+    set_mode(s, "live")
+    data, now = make_data()
+    fc.depth = {c: 1e9 for c in fc.mids}
+    out = px.step(s, now, client=fc, data=data)
+    assert fc.orders == [] and any("一手" in r for _, r in out["skips"])
+    # imbalance 出场后锁 lock_h
+    fc2 = FakeClient()
+    out, data, now = live_entry(s, fc2)
+    pid = next(iter(pairs_state(s)))
+    fc2.pos[A] = fc2.pos[A] * 0.5     # 账本不动；用 close_req 模拟 imbalance
+    px._led(s).append("close_req", pid, {"pair_id": pid, "reason": "imbalance", "t_ms": int(now.timestamp() * 1000)})
+    px.step(s, later(now, 60), client=fc2, data=data)
+    assert px.load_state(s)["locks"][f"{A}|{B}"]["reason"] == "imbalance"
+
+
+def test_E6_lab_uses_pairs_gate(s):
+    cfg_set(s, gate_min_day_ntl_vlm_usd=20000.0)
+    assert pl.pairs_gate(s) == px.pairs_gate(s, px.cfg(s))
+    md, res = pl.run(s, pl.fixture_raw(), "fixture", days=60, interval="5m", warmup=5, fetch=False)
+    n_loose = sum(p["gate_ok"] for p in pl.discover_pairs(pl.fixture_raw(), pl.pairs_gate(s)))
+    assert sum(p["gate_ok"] for p in res["pairs"]) == n_loose
+
+
+def test_E2b_due_full_refetch_and_funding_are_staggered(s, monkeypatch):
+    """冷启动后所有腿同时到期：每次抓数据最多 FULL_REFETCH_PER_LOAD 条腿全量重抓、FUNDING_REFRESH_PER_LOAD 条腿刷资金费率。"""
+    import time as _t
+    raw = pl.fixture_raw()
+    monkeypatch.setattr(px.uv, "discover", lambda: raw)
+    cfg_set(s, allow=[])
+    full, fund = [], []
+    def fake_fetch(coin, iv, days, start_ms=None, **k):
+        if start_ms is None:
+            full.append(coin)
+        return [{"t": T0, "c": "1", "v": "1"}]
+    monkeypatch.setattr(px.bl, "fetch_candles_paged", fake_fetch)
+    monkeypatch.setattr(px.bl, "get_funding", lambda st, coin, d: (fund.append(coin) or [], "x"))
+    cf = px.cfg(s)
+    px._DATA.clear()
+    d0 = px.load_data(s, T0 + 10 * IV, cf)
+    legs = {c for p in d0["pairs"] for c in (p["a"], p["b"])}
+    assert len(legs) > px.FULL_REFETCH_PER_LOAD and set(full) == legs     # 冷启动：全部全量
+    # 让全部腿的全量重抓和资金费率都到期
+    d0["candles_full_t"] = {c: 0 for c in legs}
+    d0["funding_t"] = {c: (0, []) for c in legs}
+    full.clear(); fund.clear()
+    d1 = px.load_data(s, T0 + 11 * IV, cf)
+    assert len(full) == min(len(legs), px.FULL_REFETCH_PER_LOAD)
+    assert len(fund) == min(len(legs), px.FUNDING_REFRESH_PER_LOAD)
+    stale = [c for c, v in d1["funding_t"].items() if v[0] == 0]
+    assert len(stale) == len(legs) - len(fund)                            # 没刷新的保留旧时间，下次照样到期
