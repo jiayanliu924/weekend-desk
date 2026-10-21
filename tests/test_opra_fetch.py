@@ -200,3 +200,14 @@ def test_alpaca_source_other_errors_raise():
             raise RuntimeError("Alpaca → 403: forbidden")
     with pytest.raises(RuntimeError):
         of.AlpacaSource(C(), sleep=lambda x: None, min_gap_s=0.0)._get("u", {})
+
+
+def test_fetch_month_skips_unresolvable_request():
+    from desk import opra_fetch as of
+    class TS:
+        def get_range(self, **kw):
+            raise RuntimeError("422 symbology_invalid_request\nNone of the symbols could be resolved")
+    class DB:
+        timeseries = TS()
+    df = of.fetch_month(DB(), [{"symbols": ["SPY   240301P00469000"], "start": "a", "end": "b"}])
+    assert len(df) == 0

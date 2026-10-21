@@ -346,8 +346,21 @@ def fetch_month(db, reqs: list[dict]):
     import pandas as pd
     frames = []
     for r in reqs:
-        store = db.timeseries.get_range(dataset=DATASET, schema=SCHEMA, stype_in="raw_symbol", symbols=r["symbols"],
-                                        start=r["start"], end=r["end"])
+        for attempt in range(4):
+            try:
+                store = db.timeseries.get_range(dataset=DATASET, schema=SCHEMA, stype_in="raw_symbol", symbols=r["symbols"],
+                                                start=r["start"], end=r["end"])
+                break
+            except Exception as e:  # noqa: BLE001
+                msg = str(e)
+                if "symbology" in msg or "could be resolved" in msg:   # 这一天这批合约都还没上市：没数据也不收钱，跳过
+                    store = None
+                    break
+                if attempt == 3:
+                    raise
+                time.sleep(min(2 ** (attempt + 1), 30))
+        if store is None:
+            continue
         df = store.to_df(price_type="float", map_symbols=True)
         if len(df):
             frames.append(_normalize(df))
