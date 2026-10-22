@@ -356,8 +356,8 @@ def _fetch_one(db, r: dict):
             msg = str(e)
             if "symbology" in msg or "could be resolved" in msg:   # 这一天这批合约都还没上市：没数据也不收钱，跳过
                 return None
-            if "available" in msg and ("end" in msg or "start" in msg):   # 最近几天 Databento 还没出历史数据：跳过，下次再补
-                return None
+            if ("available" in msg and ("end" in msg or "start" in msg)) or "license" in msg:
+                return None        # 最近几天的数据还没出 / 要实时授权：跳过（回测用不到这么新的）
             if attempt == 3:
                 raise
             time.sleep(min(2 ** (attempt + 1), 30))
@@ -423,7 +423,9 @@ def _prep(settings, src, root: Path, u: str, start: date, end: date, close_times
         monthly[month_of(ds)].update(syms)
     (root / "meta" / f"needed_monthly_{u}.json").write_text(json.dumps({k: sorted(v) for k, v in sorted(monthly.items())}))
     del monthly
-    reqs = build_requests(u, m["needed"], close_times)
+    # 缓存的合约清单可能截到更晚的日期：只要 [start, end] 之内的天（Databento 最近一天的数据要实时授权）
+    needed = {d: v for d, v in m["needed"].items() if start.isoformat() <= d <= end.isoformat()}
+    reqs = build_requests(u, needed, close_times)
     reqs = [r for r in reqs if not month_path(root, u, r["month"]).exists()]      # 已下载的月份不再计费
     out(f"[{u}] 交易日 {len(m['closes'])}，合约 {m['n_contracts']}，待下载请求 {len(reqs)}")
     del m
