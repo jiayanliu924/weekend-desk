@@ -211,3 +211,18 @@ def test_fetch_month_skips_unresolvable_request():
         timeseries = TS()
     df = of.fetch_month(DB(), [{"symbols": ["SPY   240301P00469000"], "start": "a", "end": "b"}])
     assert len(df) == 0
+
+
+def test_alpaca_source_retries_network_errors():
+    from desk import opra_fetch as of
+    class ConnectError(Exception):
+        pass
+    n, sleeps = [], []
+    class C:
+        base = "x"
+        def _req(self, m, url, params=None):
+            n.append(1)
+            if len(n) < 3:
+                raise ConnectError("Temporary failure in name resolution")
+            return {"ok": 1}
+    assert of.AlpacaSource(C(), sleep=sleeps.append, min_gap_s=0.0)._get("u", {}) == {"ok": 1} and sleeps.count(15) == 2

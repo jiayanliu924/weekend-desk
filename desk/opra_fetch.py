@@ -131,6 +131,10 @@ class AlpacaSource:
                 if "429" not in str(e) or k == 5:
                     raise
                 self._sleep(60)
+            except Exception as e:  # noqa: BLE001  网络抖动（DNS / 连接断开 / 超时）：等 15 秒再试
+                if k == 5 or not any(w in type(e).__name__ for w in ("Connect", "Timeout", "Network", "Read", "Protocol")):
+                    raise
+                self._sleep(15)
 
     def closes(self, und: str, start: date, end: date) -> dict[str, float]:
         out, tok = {}, None
@@ -405,11 +409,12 @@ def run(settings, src, db, unds: list[str], start: date, end: date, mode: str, y
     reqs_all = []
     for u in unds:
         out(f"[{u}] 读取收盘价和合约列表（Alpaca，免费）…")
-        cache = root / "meta" / f"meta_{u}_{start}_{end}.json"
-        if cache.exists():      # 断点续跑：合约清单已经拉过就不再拉（Alpaca 限速）
-            m = json.loads(cache.read_text())
-        else:
+        cache = root / "meta" / f"meta_{u}_{start}.json"
+        m = json.loads(cache.read_text()) if cache.exists() else None
+        # 断点续跑：合约清单拉过、而且截止日离现在不超过 7 天就直接用（Alpaca 限速，重拉 QQQ/SPY 要十几分钟）
+        if not m or date.fromisoformat(m.get("end", "1900-01-01")) < end - timedelta(days=7):
             m = build_meta(src, u, start, end)
+            m["end"] = end.isoformat()
             cache.write_text(json.dumps(m))
         (root / "meta" / f"closes_{u}.json").write_text(json.dumps(m["closes"]))
         (root / "meta" / f"needed_{u}.json").write_text(json.dumps(m["needed"]))
