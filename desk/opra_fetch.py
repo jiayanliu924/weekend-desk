@@ -165,7 +165,8 @@ class AlpacaSource:
                     if tok:
                         p["page_token"] = tok
                     d = self._get(f"{self.c.base}/v2/options/contracts", p)
-                    out += d.get("option_contracts") or []
+                    out += [{"symbol": c.get("symbol", ""), "expiration_date": c.get("expiration_date"),
+                             "strike_price": c.get("strike_price")} for c in d.get("option_contracts") or []]
                     tok = d.get("next_page_token")
                     if not tok:
                         break
@@ -406,36 +407,79 @@ def download(db, reqs: list[dict], root: Path, log=print, est: dict | None = Non
 
 
 # ---------------------------------------------------------------- 主流程
-def _prep(settings, src, root: Path, u: str, start: date, end: date, close_times: dict, out) -> list[dict]:
-    """一只标的：读/建合约清单（有缓存），写 meta 文件，返回还没下载的请求。"""
-    out(f"[{u}] 读取收盘价和合约列表（Alpaca，免费）…")
-    cache = root / "meta" / f"meta_{u}_{start}.json"
-    m = json.loads(cache.read_text()) if cache.exists() else None
-    # 断点续跑：合约清单拉过、而且截止日离现在不超过 7 天就直接用（Alpaca 限速，重拉 QQQ/SPY 要十几分钟）
-    if not m or date.fromisoformat(m.get("end", "1900-01-01")) < end - timedelta(days=7):
-        m = build_meta(src, u, start, end)
-        m["end"] = end.isoformat()
-        cache.write_text(json.dumps(m))
-    (root / "meta" / f"closes_{u}.json").write_text(json.dumps(m["closes"]))
-    (root / "meta" / f"needed_{u}.json").write_text(json.dumps(m["needed"]))
-    monthly = defaultdict(set)
-    for ds, syms in m["needed"].items():
-        monthly[month_of(ds)].update(syms)
-    (root / "meta" / f"needed_monthly_{u}.json").write_text(json.dumps({k: sorted(v) for k, v in sorted(monthly.items())}))
-    del monthly
-    # 缓存的合约清单可能截到更晚的日期：只要 [start, end] 之内的天（Databento 最近一天的数据要实时授权）
-    needed = {d: v for d, v in m["needed"].items() if start.isoformat() <= d <= end.isoformat()}
-    reqs = build_requests(u, needed, close_times)
-    reqs = [r for r in reqs if not month_path(root, u, r["month"]).exists()]      # 已下载的月份不再计费
-    out(f"[{u}] 交易日 {len(m['closes'])}，合约 {m['n_contracts']}，待下载请求 {len(reqs)}")
-    del m
-    return reqs
+def _load_index(src, root: Path, u: str, start: date, end: date, out) -> tuple[dict, "ContractIndex"]:
+    """收盘价 + 合约索引。合约清单只存三列（到期、代码、行权价）的小文件，内存占用很小；
+    缓存 7 天内有效（Alpaca 限速，重拉 QQQ/SPY 要十几分钟）。不再把"每天要哪些合约"整个放进内存——2GB 服务器放不下 QQQ/SPY。"""
+    meta = root / "meta"
+    cpath, kpath, info = meta / f"contracts_{u}.tsv", meta / f"closes_{u}.json", meta / f"index_{u}.json"
+    ok = cpath.exists() and kpath.exists() and info.exists()
+    if ok:
+        i = json.loads(info.read_text())
+        ok = i.get("start") == start.isoformat() and date.fromisoformat(i.get("end", "1900-01-01")) >= end - timedelta(days=7)
+    if not ok:
+        closes = src.closes(u, start, end)
+        cons = src.contracts(u, start + timedelta(days=DTE_MIN), end + timedelta(days=DTE_MAX))
+        idx = ContractIndex(cons)
+        del cons
+        with open(cpath, "w") as f:
+            for e, sym, k in idx.rows:
+                f.write(f"{e.isoformat()}\t{sym}\t{k}\n")
+        kpath.write_text(json.dumps(closes))
+        info.write_text(json.dumps({"start": start.isoformat(), "end": end.isoformat(), "n": len(idx.rows)}))
+        return closes, idx
+    closes = json.loads(kpath.read_text())
+    idx = ContractIndex([])
+    rows = []
+    with open(cpath) as f:
+        for line in f:
+            e, sym, k = line.rstrip("\n").split("\t")
+            rows.append((date.fromisoformat(e), sym, float(k)))
+    idx.rows, idx.exps = rows, [r[0] for r in rows]
+    return closes, idx
+
+
+def _month_days(closes: dict, start: date, end: date) -> dict[str, list[str]]:
+    by = defaultdict(list)
+    for ds in sorted(closes):
+        if start.isoformat() <= ds <= end.isoformat():      # Databento 最近一天要实时授权：只要 [start, end]
+            by[month_of(ds)].append(ds)
+    return by
+
+
+def _reqs_for_days(u: str, days: list[str], closes: dict, idx, close_times: dict) -> list[dict]:
+    need = {}
+    for ds in days:
+        syms = idx.needed(date.fromisoformat(ds), closes[ds])
+        if syms:
+            need[ds] = syms
+    return build_requests(u, need, close_times)
+
+
+def _estimate_underlying(db, u, months, closes, idx, close_times, root, exact, workers, sleep) -> dict:
+    """{(标的, 月): 预计 $}，只算还没下载的月份；默认每月抽 3 天精确问价再按天数放大。"""
+    est = {}
+    for mo, days in sorted(months.items()):
+        if month_path(root, u, mo).exists():
+            continue
+        picked = days if exact else sample_days(days)
+        reqs = _reqs_for_days(u, picked, closes, idx, close_times)
+        if not reqs:
+            continue
+        price_plan(db, reqs, workers, sleep)
+        bad = [r for r in reqs if r.get("error")]
+        if bad and len(bad) == len(reqs):
+            print(f"  {u} {mo}：抽样的 {len(reqs)} 个请求都询价失败（多是还没上市的合约），按 $0 计")
+        per_day = defaultdict(float)
+        for r in reqs:
+            per_day[r["day"]] += r.get("cost") or 0.0
+        est[(u, mo)] = sum(per_day.values()) if exact else sum(per_day.values()) / max(1, len(picked)) * len(days)
+    return est
 
 
 def run(settings, src, db, unds: list[str], start: date, end: date, mode: str, yes: bool = False,
         root: Path | None = None, out=print, workers: int = MAX_WORKERS, exact: bool = False, sleep=time.sleep) -> int:
-    """一只标的一只标的地做（2GB 服务器：同时把 8 只的合约清单放进内存会被系统杀掉）。
-    plan：逐只估价，最后出总表。download：逐只估价 → 累计（×安全边际）不超上限才下这一只 → 下完释放内存再下一只。"""
+    """一只标的、一个月一个月地做（2GB 服务器）。plan：逐只估价出总表。download：逐只估价 →
+    累计（×安全边际）不超上限才下这一只 → 一个月一个月生成请求并下载，下完释放。"""
     import gc
     root = root or (settings.data / "opra")
     (root / "meta").mkdir(parents=True, exist_ok=True)
@@ -449,29 +493,36 @@ def run(settings, src, db, unds: list[str], start: date, end: date, mode: str, y
     spent = 0.0
     done = skipped = 0
     for u in unds:
-        reqs = _prep(settings, src, root, u, start, end, close_times, out)
-        if not reqs:
+        out(f"[{u}] 读取收盘价和合约列表（Alpaca，免费）…")
+        closes, idx = _load_index(src, root, u, start, end, out)
+        months = _month_days(closes, start, end)
+        todo = [m for m in months if not month_path(root, u, m).exists()]
+        out(f"[{u}] 交易日 {sum(len(v) for v in months.values())}，合约 {len(idx.rows)}，待下载月份 {len(todo)}")
+        if not todo:
             continue
-        n_calls = len(reqs) if exact else sum(1 for _ in _picked_count(reqs))
-        out(f"[{u}] 向 Databento 询价（不扣费，约 {n_calls} 次调用）…")
-        est = estimate(db, reqs, exact, workers, sleep)
+        out(f"[{u}] 向 Databento 询价（不扣费）…")
+        est = _estimate_underlying(db, u, months, closes, idx, close_times, root, exact, workers, sleep)
         est_all.update(est)
         _, u_total = plan_table(est, margin)
         if mode != "plan":
             if spent + u_total > cap:
                 out(f"中止：累计预计 ${spent + u_total:,.2f}（含安全边际）会超过上限 ${cap:,.2f}，{u} 及之后的不下载。")
                 return 2
-            res = download(db, reqs, root, out, est)
+            for mo in sorted(todo):
+                reqs = _reqs_for_days(u, months[mo], closes, idx, close_times)
+                res = download(db, reqs, root, out, est)
+                done += res["downloaded"]
+                skipped += res["skipped"]
+                del reqs
+                gc.collect()
             spent += u_total
-            done += res["downloaded"]
-            skipped += res["skipped"]
-        del reqs, est
+        del closes, idx, months
         gc.collect()
     table, total = plan_table(est_all, margin)
     out(table)
     out(f"上限 ${cap:,.2f}（config.toml [opra] max_cost_usd）；已下载的月份已排除。")
     if mode == "plan":
-        out("只是计划，没有下载，没有扣费。" + ("" if total <= cap else f"注意：超过上限，下载会在超限的那只标的前停下。"))
+        out("只是计划，没有下载，没有扣费。" + ("" if total <= cap else "注意：超过上限，下载会在超限的那只标的前停下。"))
         return 0
     out(f"完成：新下载 {done} 个月文件，跳过已有 {skipped} 个（API 不返回实扣金额，实际以 Databento 账单为准）。")
     return 0

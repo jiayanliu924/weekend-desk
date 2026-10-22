@@ -101,7 +101,7 @@ def test_plan_cost_sum_and_meta(tmp_path, capsys):
     out = capsys.readouterr().out
     # 9 月 2 天、10 月 1 天，都 ≤3 天 → 全部精确询价 3 次，合计 4.50，x1.2 = 5.40
     assert db.cost_calls == 3 and "4.50" in out and "5.40" in out
-    assert (tmp_path / "opra" / "meta" / "closes_SOXX.json").exists() and (tmp_path / "opra" / "meta" / "needed_SOXX.json").exists()
+    assert (tmp_path / "opra" / "meta" / "closes_SOXX.json").exists() and (tmp_path / "opra" / "meta" / "contracts_SOXX.tsv").exists()
     assert not (tmp_path / "opra" / "cbbo1m").exists()
 
 
@@ -249,3 +249,20 @@ def test_extra_mode_plan_cap_download_resume(tmp_path):
     n = db.get_calls
     assert of.run_extra(st, FakeSrc(), db, ["SOXX"], "download", yes=True) == 0   # 续跑：已有月份不再请求
     assert db.get_calls == n
+
+
+def test_index_cache_roundtrip_gives_same_requests(tmp_path):
+    root = tmp_path / "opra"
+    (root / "meta").mkdir(parents=True)
+    src = FakeSrc()
+    s0, e0 = date(2025, 9, 1), date(2025, 10, 5)
+    c1, i1 = of._load_index(src, root, "SOXX", s0, e0, print)
+    c2, i2 = of._load_index(src, root, "SOXX", s0, e0, print)      # 第二次走缓存
+    assert c1 == c2 and i1.rows == i2.rows
+    days = sorted(c1)
+    assert of._reqs_for_days("SOXX", days, c1, i1, {}) == of._reqs_for_days("SOXX", days, c2, i2, {})
+
+
+def test_month_days_clips_to_end():
+    m = of._month_days({"2026-10-20": 1.0, "2026-10-21": 1.0, "2026-09-30": 1.0}, date(2026, 9, 1), date(2026, 10, 20))
+    assert m == {"2026-09": ["2026-09-30"], "2026-10": ["2026-10-20"]}
