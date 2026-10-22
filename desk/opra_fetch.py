@@ -356,6 +356,8 @@ def _fetch_one(db, r: dict):
             msg = str(e)
             if "symbology" in msg or "could be resolved" in msg:   # 这一天这批合约都还没上市：没数据也不收钱，跳过
                 return None
+            if "available" in msg and ("end" in msg or "start" in msg):   # 最近几天 Databento 还没出历史数据：跳过，下次再补
+                return None
             if attempt == 3:
                 raise
             time.sleep(min(2 ** (attempt + 1), 30))
@@ -526,7 +528,7 @@ def main(argv=None) -> int:
     ap.add_argument("--exact", action="store_true", help="逐个请求精确询价（慢，调用很多）；默认抽样估算 x1.2")
     ap.add_argument("--underlyings", nargs="+", default=UNDERLYINGS)
     ap.add_argument("--start", default=DEFAULT_START)
-    ap.add_argument("--end", default=(date.today() - timedelta(days=1)).isoformat())
+    ap.add_argument("--end", default=(date.today() - timedelta(days=4)).isoformat())   # 留几天给 Databento 出历史数据
     a = ap.parse_args(argv)
     s = config.load()
     key = os.environ.get("DATABENTO_API_KEY", "").strip()
