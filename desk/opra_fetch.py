@@ -401,50 +401,72 @@ def download(db, reqs: list[dict], root: Path, log=print, est: dict | None = Non
 
 
 # ---------------------------------------------------------------- 主流程
+def _prep(settings, src, root: Path, u: str, start: date, end: date, close_times: dict, out) -> list[dict]:
+    """一只标的：读/建合约清单（有缓存），写 meta 文件，返回还没下载的请求。"""
+    out(f"[{u}] 读取收盘价和合约列表（Alpaca，免费）…")
+    cache = root / "meta" / f"meta_{u}_{start}.json"
+    m = json.loads(cache.read_text()) if cache.exists() else None
+    # 断点续跑：合约清单拉过、而且截止日离现在不超过 7 天就直接用（Alpaca 限速，重拉 QQQ/SPY 要十几分钟）
+    if not m or date.fromisoformat(m.get("end", "1900-01-01")) < end - timedelta(days=7):
+        m = build_meta(src, u, start, end)
+        m["end"] = end.isoformat()
+        cache.write_text(json.dumps(m))
+    (root / "meta" / f"closes_{u}.json").write_text(json.dumps(m["closes"]))
+    (root / "meta" / f"needed_{u}.json").write_text(json.dumps(m["needed"]))
+    monthly = defaultdict(set)
+    for ds, syms in m["needed"].items():
+        monthly[month_of(ds)].update(syms)
+    (root / "meta" / f"needed_monthly_{u}.json").write_text(json.dumps({k: sorted(v) for k, v in sorted(monthly.items())}))
+    del monthly
+    reqs = build_requests(u, m["needed"], close_times)
+    reqs = [r for r in reqs if not month_path(root, u, r["month"]).exists()]      # 已下载的月份不再计费
+    out(f"[{u}] 交易日 {len(m['closes'])}，合约 {m['n_contracts']}，待下载请求 {len(reqs)}")
+    del m
+    return reqs
+
+
 def run(settings, src, db, unds: list[str], start: date, end: date, mode: str, yes: bool = False,
         root: Path | None = None, out=print, workers: int = MAX_WORKERS, exact: bool = False, sleep=time.sleep) -> int:
+    """一只标的一只标的地做（2GB 服务器：同时把 8 只的合约清单放进内存会被系统杀掉）。
+    plan：逐只估价，最后出总表。download：逐只估价 → 累计（×安全边际）不超上限才下这一只 → 下完释放内存再下一只。"""
+    import gc
     root = root or (settings.data / "opra")
     (root / "meta").mkdir(parents=True, exist_ok=True)
-    close_times = src.close_times(start, end)
-    reqs_all = []
-    for u in unds:
-        out(f"[{u}] 读取收盘价和合约列表（Alpaca，免费）…")
-        cache = root / "meta" / f"meta_{u}_{start}.json"
-        m = json.loads(cache.read_text()) if cache.exists() else None
-        # 断点续跑：合约清单拉过、而且截止日离现在不超过 7 天就直接用（Alpaca 限速，重拉 QQQ/SPY 要十几分钟）
-        if not m or date.fromisoformat(m.get("end", "1900-01-01")) < end - timedelta(days=7):
-            m = build_meta(src, u, start, end)
-            m["end"] = end.isoformat()
-            cache.write_text(json.dumps(m))
-        (root / "meta" / f"closes_{u}.json").write_text(json.dumps(m["closes"]))
-        (root / "meta" / f"needed_{u}.json").write_text(json.dumps(m["needed"]))
-        monthly = defaultdict(set)
-        for ds, syms in m["needed"].items():
-            monthly[month_of(ds)].update(syms)
-        (root / "meta" / f"needed_monthly_{u}.json").write_text(json.dumps({k: sorted(v) for k, v in sorted(monthly.items())}))
-        reqs = build_requests(u, m["needed"], close_times)
-        # 已下载的月份不再计费
-        reqs = [r for r in reqs if not month_path(root, u, r["month"]).exists()]
-        out(f"[{u}] 交易日 {len(m['closes'])}，合约 {m['n_contracts']}，待下载请求 {len(reqs)}")
-        reqs_all += reqs
-    n_calls = len(reqs_all) if exact else sum(1 for _ in _picked_count(reqs_all))
-    out(f"向 Databento 询价（metadata.get_cost，不扣费；{'逐个请求精确' if exact else '每标的每月抽 3 天估算'}，约 {n_calls} 次调用）…")
-    est = estimate(db, reqs_all, exact, workers, sleep)
-    table, total = plan_table(est, 1.0 if exact else SAFETY)
     cap = max_cost(settings)
+    if mode != "plan" and not yes:
+        out("中止：下载要加 --yes 确认。")
+        return 2
+    close_times = src.close_times(start, end)
+    margin = 1.0 if exact else SAFETY
+    est_all: dict = {}
+    spent = 0.0
+    done = skipped = 0
+    for u in unds:
+        reqs = _prep(settings, src, root, u, start, end, close_times, out)
+        if not reqs:
+            continue
+        n_calls = len(reqs) if exact else sum(1 for _ in _picked_count(reqs))
+        out(f"[{u}] 向 Databento 询价（不扣费，约 {n_calls} 次调用）…")
+        est = estimate(db, reqs, exact, workers, sleep)
+        est_all.update(est)
+        _, u_total = plan_table(est, margin)
+        if mode != "plan":
+            if spent + u_total > cap:
+                out(f"中止：累计预计 ${spent + u_total:,.2f}（含安全边际）会超过上限 ${cap:,.2f}，{u} 及之后的不下载。")
+                return 2
+            res = download(db, reqs, root, out, est)
+            spent += u_total
+            done += res["downloaded"]
+            skipped += res["skipped"]
+        del reqs, est
+        gc.collect()
+    table, total = plan_table(est_all, margin)
     out(table)
     out(f"上限 ${cap:,.2f}（config.toml [opra] max_cost_usd）；已下载的月份已排除。")
     if mode == "plan":
-        out("只是计划，没有下载，没有扣费。")
+        out("只是计划，没有下载，没有扣费。" + ("" if total <= cap else f"注意：超过上限，下载会在超限的那只标的前停下。"))
         return 0
-    if total > cap:
-        out(f"中止：预计 ${total:,.2f} 超过上限 ${cap:,.2f}。缩小标的/日期范围，或在 config.toml 调高 [opra] max_cost_usd。")
-        return 2
-    if not yes:
-        out("中止：下载要加 --yes 确认。")
-        return 2
-    res = download(db, reqs_all, root, out, est)
-    out(f"完成：新下载 {res['downloaded']} 个月文件，跳过已有 {res['skipped']} 个，预计花费 ${res['est_spent']:,.2f}（API 不返回实扣金额，实际以 Databento 账单为准）。")
+    out(f"完成：新下载 {done} 个月文件，跳过已有 {skipped} 个（API 不返回实扣金额，实际以 Databento 账单为准）。")
     return 0
 
 
