@@ -136,11 +136,11 @@ class AlpacaSource:
                     raise
                 self._sleep(15)
 
-    def closes(self, und: str, start: date, end: date) -> dict[str, float]:
+    def closes(self, und: str, start: date, end: date, adjustment: str = "raw") -> dict[str, float]:
         out, tok = {}, None
         for _ in range(100):
             p = {"timeframe": "1Day", "start": start.isoformat(), "end": end.isoformat(), "limit": 10000,
-                 "adjustment": "raw", "feed": "iex"}
+                 "adjustment": adjustment, "feed": "iex"}
             if tok:
                 p["page_token"] = tok
             d = self._get(f"{ax.DATA_URL}/v2/stocks/{und}/bars", p)
@@ -342,8 +342,8 @@ def _picked_count(reqs):
             yield from days[d]
 
 
-def month_path(root: Path, und: str, month: str) -> Path:
-    return root / "cbbo1m" / und / f"{month}.parquet"
+def month_path(root: Path, und: str, month: str, sub: str = "cbbo1m") -> Path:
+    return root / sub / und / f"{month}.parquet"
 
 
 def fetch_month(db, reqs: list[dict]):
@@ -373,14 +373,14 @@ def fetch_month(db, reqs: list[dict]):
     return pd.concat(frames, ignore_index=True)
 
 
-def download(db, reqs: list[dict], root: Path, log=print, est: dict | None = None) -> dict:
+def download(db, reqs: list[dict], root: Path, log=print, est: dict | None = None, sub: str = "cbbo1m") -> dict:
     by = defaultdict(list)
     for r in reqs:
         by[(r["und"], r["month"])].append(r)
     done = skipped = 0
     spent = 0.0
     for (und, month), rs in sorted(by.items()):
-        p = month_path(root, und, month)
+        p = month_path(root, und, month, sub)
         if p.exists():
             skipped += 1
             continue
@@ -448,6 +448,48 @@ def run(settings, src, db, unds: list[str], start: date, end: date, mode: str, y
     return 0
 
 
+def run_extra(settings, src, db, unds: list[str], mode: str, yes: bool = False, root: Path | None = None,
+              out=print, workers: int = MAX_WORKERS, sleep=time.sleep) -> int:
+    """卡 A4 补数据：读 meta/extra_needed.json（回测第一遍写的 {标的: {日期: [OCC]}}），同一 15:30–16:00 窗口、raw_symbol、
+    每块 ≤2000、按日分组，逐请求精确询价（便宜），同一个费用上限 / --yes，存到 cbbo1m_extra/<UND>/<YYYY-MM>.parquet。
+    续跑：已有的月文件跳过（删掉才会重拉）；解析不了的批次和主下载一样跳过。"""
+    root = root or (settings.data / "opra")
+    p = root / "meta" / "extra_needed.json"
+    if not p.exists():
+        out("没找到 meta/extra_needed.json：先跑 python -m desk.options_rules_backtest 的第一遍。")
+        return 1
+    need = json.loads(p.read_text())
+    reqs_all = []
+    for u in unds:
+        days = need.get(u) or {}
+        if not days:
+            out(f"[{u}] 没有需要补的报价")
+            continue
+        ct = src.close_times(date.fromisoformat(min(days)), date.fromisoformat(max(days)))
+        reqs = [r for r in build_requests(u, days, ct) if not month_path(root, u, r["month"], "cbbo1m_extra").exists()]
+        out(f"[{u}] 需补 {sum(len(v) for v in days.values())} 个(合约,日)，待下载请求 {len(reqs)}")
+        reqs_all += reqs
+    out(f"向 Databento 询价（metadata.get_cost，不扣费；逐个请求精确，{len(reqs_all)} 次）…")
+    est = estimate(db, reqs_all, True, workers, sleep)
+    table, total = plan_table(est, 1.0)
+    cap = max_cost(settings)
+    out(table)
+    out(f"上限 ${cap:,.2f}（config.toml [opra] max_cost_usd）；已下载的月份已排除。")
+    if mode == "plan":
+        out("只是计划，没有下载，没有扣费。")
+        return 0
+    if total > cap:
+        out(f"中止：预计 ${total:,.2f} 超过上限 ${cap:,.2f}。")
+        return 2
+    if not yes:
+        out("中止：下载要加 --yes 确认。")
+        return 2
+    (root / "meta").mkdir(parents=True, exist_ok=True)
+    res = download(db, reqs_all, root, out, est, sub="cbbo1m_extra")
+    out(f"完成：新下载 {res['downloaded']} 个月文件，跳过已有 {res['skipped']} 个，预计花费 ${res['est_spent']:,.2f}。")
+    return 0
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="desk.opra_fetch")
     g = ap.add_mutually_exclusive_group(required=True)
@@ -455,6 +497,7 @@ def main(argv=None) -> int:
     g.add_argument("--download", action="store_true", help="下载（需 --yes 且总价不超上限）")
     g.add_argument("--diagnose", action="store_true", help="看 Databento 的 OPRA 符号格式并试询价一个合约")
     ap.add_argument("--yes", action="store_true")
+    ap.add_argument("--extra", action="store_true", help="补数据：读 meta/extra_needed.json（期权回测第一遍产出），下到 cbbo1m_extra/；配合 --plan / --download")
     ap.add_argument("--exact", action="store_true", help="逐个请求精确询价（慢，调用很多）；默认抽样估算 x1.2")
     ap.add_argument("--underlyings", nargs="+", default=UNDERLYINGS)
     ap.add_argument("--start", default=DEFAULT_START)
@@ -483,6 +526,11 @@ def main(argv=None) -> int:
                 print(f"{u} 诊断出错：{str(e)[:300]}")
         return 0
     src = AlpacaSource(ax.Client(kid, sec, paper=paper))
+    if a.extra:
+        if a.diagnose:
+            print("--extra 要配 --plan 或 --download", file=sys.stderr)
+            return 1
+        return run_extra(s, src, db, a.underlyings, "plan" if a.plan else "download", a.yes)
     return run(s, src, db, a.underlyings, date.fromisoformat(a.start), date.fromisoformat(a.end),
                "plan" if a.plan else "download", a.yes, exact=a.exact)
 

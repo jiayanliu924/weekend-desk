@@ -52,3 +52,4 @@ E6 pairs_lab 用 pairs_gate，让实验室报告覆盖新配对。
 - 决定（Opus）：B、S 合并上线；B 默认开启（期权真钱本来就还关着，先在纸面账户跑）。回滚：[debate] enabled=false / [supervisor] enabled=false。
 - A3（Opus，2026-10-22）：预先登记 4 条买方规则 knowledge/options_triggers_v1.toml，sha256 前 16 位 b58dd4dc8d78e6c0。改任何数字 = v2，尝试次数累加。
 - D2 中 / Sonnet 写（抽样估价 + $100 上限 + 需 --yes）。等服务器 --plan 实测。
+- A4 中 / Sonnet 写（两遍：主数据 + 持仓合约补拉 --extra）→ A5 回测诚实审 Sonnet（4 条：缺买价被跳过、出场无价差/时效检查、贵合约被跳过的选择偏差、均线含当天）→ 全部按保守方向修 / 2 轮。

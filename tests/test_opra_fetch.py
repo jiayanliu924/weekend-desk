@@ -226,3 +226,26 @@ def test_alpaca_source_retries_network_errors():
                 raise ConnectError("Temporary failure in name resolution")
             return {"ok": 1}
     assert of.AlpacaSource(C(), sleep=sleeps.append, min_gap_s=0.0)._get("u", {}) == {"ok": 1} and sleeps.count(15) == 2
+
+
+def test_extra_mode_plan_cap_download_resume(tmp_path):
+    import json
+    root = tmp_path / "opra"
+    (root / "meta").mkdir(parents=True)
+    st = Settings(tmp_path)
+    assert of.run_extra(st, FakeSrc(), FakeDB(), ["SOXX"], "plan") == 1          # 没有 extra_needed.json
+    need = {"SOXX": {"2025-09-10": ["SOXX251024P00270000"], "2025-09-11": ["SOXX251024P00270000", "SOXX251024C00295000"],
+                     "2025-10-01": ["SOXX251024P00270000"]}}
+    (root / "meta" / "extra_needed.json").write_text(json.dumps(need))
+    db = FakeDB(per=1.0)
+    assert of.run_extra(st, FakeSrc(), db, ["SOXX"], "plan") == 0
+    assert db.cost_calls == 3 and db.get_calls == 0                              # 逐请求精确询价：3 个(标的,日)请求
+    assert of.run_extra(st, FakeSrc(), FakeDB(per=1.0), ["SOXX"], "download") == 2   # 没 --yes
+    assert of.run_extra(st, FakeSrc(), FakeDB(per=60.0), ["SOXX"], "download", yes=True) == 2   # 超上限 100
+    db = FakeDB(per=1.0)
+    assert of.run_extra(st, FakeSrc(), db, ["SOXX"], "download", yes=True) == 0
+    assert (root / "cbbo1m_extra" / "SOXX" / "2025-09.parquet").exists() and (root / "cbbo1m_extra" / "SOXX" / "2025-10.parquet").exists()
+    assert not (root / "cbbo1m").exists()
+    n = db.get_calls
+    assert of.run_extra(st, FakeSrc(), db, ["SOXX"], "download", yes=True) == 0   # 续跑：已有月份不再请求
+    assert db.get_calls == n
