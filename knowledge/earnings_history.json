@@ -1,0 +1,310 @@
+[
+  {
+    "ticker": "NVDA",
+    "date": "2024-02-21",
+    "timing": "amc",
+    "fiscal_quarter": "FY2024Q4",
+    "source": "https://www.alphaquery.com/stock/NVDA/earnings-history"
+  },
+  {
+    "ticker": "NVDA",
+    "date": "2024-05-22",
+    "timing": "amc",
+    "fiscal_quarter": "FY2025Q1",
+    "source": "https://www.alphaquery.com/stock/NVDA/earnings-history"
+  },
+  {
+    "ticker": "NVDA",
+    "date": "2024-08-28",
+    "timing": "amc",
+    "fiscal_quarter": "FY2025Q2",
+    "source": "https://www.alphaquery.com/stock/NVDA/earnings-history"
+  },
+  {
+    "ticker": "NVDA",
+    "date": "2024-11-20",
+    "timing": "amc",
+    "fiscal_quarter": "FY2025Q3",
+    "source": "https://www.alphaquery.com/stock/NVDA/earnings-history"
+  },
+  {
+    "ticker": "NVDA",
+    "date": "2025-02-26",
+    "timing": "amc",
+    "fiscal_quarter": "FY2025Q4",
+    "source": "https://www.alphaquery.com/stock/NVDA/earnings-history"
+  },
+  {
+    "ticker": "NVDA",
+    "date": "2025-05-28",
+    "timing": "amc",
+    "fiscal_quarter": "FY2026Q1",
+    "source": "https://www.alphaquery.com/stock/NVDA/earnings-history"
+  },
+  {
+    "ticker": "NVDA",
+    "date": "2025-08-27",
+    "timing": "amc",
+    "fiscal_quarter": "FY2026Q2",
+    "source": "https://www.alphaquery.com/stock/NVDA/earnings-history"
+  },
+  {
+    "ticker": "NVDA",
+    "date": "2025-11-19",
+    "timing": "amc",
+    "fiscal_quarter": "FY2026Q3",
+    "source": "https://www.alphaquery.com/stock/NVDA/earnings-history"
+  },
+  {
+    "ticker": "NVDA",
+    "date": "2026-02-25",
+    "timing": "amc",
+    "fiscal_quarter": "FY2026Q4",
+    "source": "https://www.alphaquery.com/stock/NVDA/earnings-history"
+  },
+  {
+    "ticker": "NVDA",
+    "date": "2026-05-20",
+    "timing": "amc",
+    "fiscal_quarter": "FY2027Q1",
+    "source": "https://nvidianews.nvidia.com/news/nvidia-announces-financial-results-for-first-quarter-fiscal-2027"
+  },
+  {
+    "ticker": "NVDA",
+    "date": "2026-08-26",
+    "timing": "amc",
+    "fiscal_quarter": "FY2027Q2",
+    "source": "https://nvidianews.nvidia.com/news/nvidia-announces-financial-results-for-second-quarter-fiscal-2027"
+  },
+  {
+    "ticker": "AMD",
+    "date": "2024-01-30",
+    "timing": "amc",
+    "fiscal_quarter": "FY2023Q4",
+    "source": "https://www.alphaquery.com/stock/AMD/earnings-history"
+  },
+  {
+    "ticker": "AMD",
+    "date": "2024-04-30",
+    "timing": "amc",
+    "fiscal_quarter": "FY2024Q1",
+    "source": "https://www.alphaquery.com/stock/AMD/earnings-history"
+  },
+  {
+    "ticker": "AMD",
+    "date": "2024-07-30",
+    "timing": "amc",
+    "fiscal_quarter": "FY2024Q2",
+    "source": "https://www.alphaquery.com/stock/AMD/earnings-history"
+  },
+  {
+    "ticker": "AMD",
+    "date": "2024-10-29",
+    "timing": "amc",
+    "fiscal_quarter": "FY2024Q3",
+    "source": "https://www.alphaquery.com/stock/AMD/earnings-history"
+  },
+  {
+    "ticker": "AMD",
+    "date": "2025-02-04",
+    "timing": "amc",
+    "fiscal_quarter": "FY2024Q4",
+    "source": "https://www.alphaquery.com/stock/AMD/earnings-history"
+  },
+  {
+    "ticker": "AMD",
+    "date": "2025-05-06",
+    "timing": "amc",
+    "fiscal_quarter": "FY2025Q1",
+    "source": "https://www.alphaquery.com/stock/AMD/earnings-history"
+  },
+  {
+    "ticker": "AMD",
+    "date": "2025-08-05",
+    "timing": "amc",
+    "fiscal_quarter": "FY2025Q2",
+    "source": "https://www.alphaquery.com/stock/AMD/earnings-history"
+  },
+  {
+    "ticker": "AMD",
+    "date": "2025-11-04",
+    "timing": "amc",
+    "fiscal_quarter": "FY2025Q3",
+    "source": "https://www.alphaquery.com/stock/AMD/earnings-history"
+  },
+  {
+    "ticker": "AMD",
+    "date": "2026-02-03",
+    "timing": "amc",
+    "fiscal_quarter": "FY2025Q4",
+    "source": "https://www.alphaquery.com/stock/AMD/earnings-history"
+  },
+  {
+    "ticker": "AMD",
+    "date": "2026-05-05",
+    "timing": "amc",
+    "fiscal_quarter": "FY2026Q1",
+    "source": "https://www.alphaquery.com/stock/AMD/earnings-history"
+  },
+  {
+    "ticker": "AMD",
+    "date": "2026-08-04",
+    "timing": "amc",
+    "fiscal_quarter": "FY2026Q2",
+    "source": "https://ir.amd.com/news-events/press-releases/detail/1295/amd-reports-second-quarter-2026-financial-results"
+  },
+  {
+    "ticker": "MU",
+    "date": "2024-03-20",
+    "timing": "amc",
+    "fiscal_quarter": "FY2024Q2",
+    "source": "https://www.alphaquery.com/stock/MU/earnings-history"
+  },
+  {
+    "ticker": "MU",
+    "date": "2024-06-26",
+    "timing": "amc",
+    "fiscal_quarter": "FY2024Q3",
+    "source": "https://www.alphaquery.com/stock/MU/earnings-history"
+  },
+  {
+    "ticker": "MU",
+    "date": "2024-09-25",
+    "timing": "amc",
+    "fiscal_quarter": "FY2024Q4",
+    "source": "https://www.alphaquery.com/stock/MU/earnings-history"
+  },
+  {
+    "ticker": "MU",
+    "date": "2024-12-18",
+    "timing": "amc",
+    "fiscal_quarter": "FY2025Q1",
+    "source": "https://www.alphaquery.com/stock/MU/earnings-history"
+  },
+  {
+    "ticker": "MU",
+    "date": "2025-03-20",
+    "timing": "amc",
+    "fiscal_quarter": "FY2025Q2",
+    "source": "https://www.alphaquery.com/stock/MU/earnings-history"
+  },
+  {
+    "ticker": "MU",
+    "date": "2025-06-25",
+    "timing": "amc",
+    "fiscal_quarter": "FY2025Q3",
+    "source": "https://www.alphaquery.com/stock/MU/earnings-history"
+  },
+  {
+    "ticker": "MU",
+    "date": "2025-09-23",
+    "timing": "amc",
+    "fiscal_quarter": "FY2025Q4",
+    "source": "https://www.alphaquery.com/stock/MU/earnings-history"
+  },
+  {
+    "ticker": "MU",
+    "date": "2025-12-17",
+    "timing": "amc",
+    "fiscal_quarter": "FY2026Q1",
+    "source": "https://www.alphaquery.com/stock/MU/earnings-history"
+  },
+  {
+    "ticker": "MU",
+    "date": "2026-03-18",
+    "timing": "amc",
+    "fiscal_quarter": "FY2026Q2",
+    "source": "https://www.alphaquery.com/stock/MU/earnings-history"
+  },
+  {
+    "ticker": "MU",
+    "date": "2026-06-24",
+    "timing": "amc",
+    "fiscal_quarter": "FY2026Q3",
+    "source": "https://www.alphaquery.com/stock/MU/earnings-history"
+  },
+  {
+    "ticker": "MU",
+    "date": "2026-09-30",
+    "timing": "amc",
+    "fiscal_quarter": "FY2026Q4",
+    "source": "https://www.sec.gov/Archives/edgar/data/0000723125/000072312526000018/a2026q4ex991-pressrelease.htm"
+  },
+  {
+    "ticker": "INTC",
+    "date": "2024-01-25",
+    "timing": "amc",
+    "fiscal_quarter": "FY2023Q4",
+    "source": "https://www.alphaquery.com/stock/INTC/earnings-history"
+  },
+  {
+    "ticker": "INTC",
+    "date": "2024-04-25",
+    "timing": "amc",
+    "fiscal_quarter": "FY2024Q1",
+    "source": "https://www.alphaquery.com/stock/INTC/earnings-history"
+  },
+  {
+    "ticker": "INTC",
+    "date": "2024-08-01",
+    "timing": "amc",
+    "fiscal_quarter": "FY2024Q2",
+    "source": "https://www.alphaquery.com/stock/INTC/earnings-history"
+  },
+  {
+    "ticker": "INTC",
+    "date": "2024-10-31",
+    "timing": "amc",
+    "fiscal_quarter": "FY2024Q3",
+    "source": "https://www.alphaquery.com/stock/INTC/earnings-history"
+  },
+  {
+    "ticker": "INTC",
+    "date": "2025-01-30",
+    "timing": "amc",
+    "fiscal_quarter": "FY2024Q4",
+    "source": "https://www.alphaquery.com/stock/INTC/earnings-history"
+  },
+  {
+    "ticker": "INTC",
+    "date": "2025-04-24",
+    "timing": "amc",
+    "fiscal_quarter": "FY2025Q1",
+    "source": "https://www.alphaquery.com/stock/INTC/earnings-history"
+  },
+  {
+    "ticker": "INTC",
+    "date": "2025-07-24",
+    "timing": "amc",
+    "fiscal_quarter": "FY2025Q2",
+    "source": "https://www.alphaquery.com/stock/INTC/earnings-history"
+  },
+  {
+    "ticker": "INTC",
+    "date": "2025-10-23",
+    "timing": "amc",
+    "fiscal_quarter": "FY2025Q3",
+    "source": "https://www.alphaquery.com/stock/INTC/earnings-history"
+  },
+  {
+    "ticker": "INTC",
+    "date": "2026-01-22",
+    "timing": "amc",
+    "fiscal_quarter": "FY2025Q4",
+    "source": "https://www.alphaquery.com/stock/INTC/earnings-history"
+  },
+  {
+    "ticker": "INTC",
+    "date": "2026-04-23",
+    "timing": "amc",
+    "fiscal_quarter": "FY2026Q1",
+    "source": "https://www.alphaquery.com/stock/INTC/earnings-history"
+  },
+  {
+    "ticker": "INTC",
+    "date": "2026-07-23",
+    "timing": "amc",
+    "fiscal_quarter": "FY2026Q2",
+    "source": "https://www.intc.com/news-events/press-releases/detail/1776/intel-reports-second-quarter-2026-financial-results"
+  }
+]
