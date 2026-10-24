@@ -91,3 +91,20 @@ def test_expiry_window_from_strategy_and_debit_vertical(tmp_path):
     s3 = dict(STRAT["F1_put_spread"], expiry={"min_dte": 30, "max_dte": 40, "target_dte": 36})
     assert v2.pick_expiry([e], d0, SPEC, s3) == e
     assert v2.pick_expiry([e], d0, SPEC, STRAT["F1_put_spread"]) == e         # 没有 expiry 字段：照 toml（30–45）
+
+
+def test_close_entry_day_at_end_flag(tmp_path):
+    """卡 L1 第 2 轮：数据截止日当天才入场的仓位——默认（B2 行为）按最大亏损记；研究室开发段打开 close_entry_day_at_end 后，用入场当天同一组报价按主口径平掉。"""
+    q = quotes_from(spread_rows(range(0, 3)), tmp_path)
+    ctx = mkctx(q, days=DAYS[:3], adj=[100.0] * 3, raw=[100.0] * 3)
+    s = always("F1_put_spread")
+    cand = [c for c in v2.scan_entries(s, ctx) if c["i"] == 2][0]
+    t, _ = v2.build_trade(s, ctx, cand, SPEC)
+    assert t["reason"] == "no_more_quotes" and t["pnl"] == pytest.approx(-t["max_loss"] - 1.3, abs=0.01)
+    s2 = dict(s, close_entry_day_at_end=True)
+    t2, _ = v2.build_trade(s2, ctx, cand, SPEC)
+    credit = 1.00 * 0.99 - 0.35 * 1.01
+    exit_cost = 1.05 * 1.01 - 0.30 * 0.99
+    assert t2["reason"] == "open_at_end" and t2["exit_idx"] == 2 and t2["entry_date"] == t2["exit_date"]
+    assert t2["pnl"] == pytest.approx(100 * credit - 1.30 - 100 * exit_cost - 1.30, abs=0.01)
+    assert t2["pnl"] > t["pnl"]

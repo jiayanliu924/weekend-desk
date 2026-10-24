@@ -5,6 +5,7 @@ import math
 import os
 import shutil
 from bisect import bisect_right
+from collections import Counter
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -286,46 +287,248 @@ def test_pbo_degenerate_inputs():
 
 
 # ---------------------------------------------------------------- 打分
-def dev_stub(dsr=1.0, cx=2, ov=(0.0, 0.0), aml=300.0):
-    return {"dsr": dsr, "complexity": cx, "overlap": {"2024-08-01..2024-08-16": ov[0], "2025-04-01..2025-04-30": ov[1]}, "avg_max_loss": aml}
+NORMAL = __import__("statistics").NormalDist()
+
+
+def dev_stub(dsr=1.0, cx=2, ov=(0.0, 0.0), aml=300.0, n=25, cl=12, by=None, incomplete=False):
+    d = {"dsr": dsr, "complexity": cx, "overlap": {"2024-08-01..2024-08-16": ov[0], "2025-04-01..2025-04-30": ov[1]}, "avg_max_loss": aml,
+         "n_trades": n, "n_clusters": cl, "data_incomplete": incomplete}
+    if by is not None:
+        d["crash_by_und"] = by
+    return d
 
 
 def test_score_dev():
     assert lab.score_dev(None, None)[0] == -1.0 and lab.score_dev({"invalid": "bad"}, None)[0] == -1.0
     pts, why = lab.score_dev(dev_stub(1.0), None)
-    assert pts == 1.0 and "DSR +1.00" in why                                     # 没有当前最好 -> 基线 0
+    assert pts == 1.0 and "置信度 84%" in why and "z +1.00" in why and "DSR" not in why         # 没有当前最好 -> 基线 0；文字用置信度
     assert lab.score_dev(dev_stub(1.0), {"dsr": 0.4})[0] == pytest.approx(0.6)
     assert lab.score_dev(dev_stub(1.0), 0.4)[0] == pytest.approx(0.6)
     assert lab.score_dev(dev_stub(50.0), {"dsr": 0.0})[0] == 5.0                  # 封顶 +5
     assert lab.score_dev(dev_stub(-50.0), {"dsr": 0.0})[0] == -5.0                # 封顶 −5
     assert lab.score_dev(dev_stub(2.0, cx=3), None)[0] == 2.0                    # 复杂度 ≤ 3 不罚
     assert lab.score_dev(dev_stub(2.0, cx=7), None)[0] == pytest.approx(2.0 - 0.5 * 4)
-    assert lab.score_dev(dev_stub(2.0, ov=(-901.0, 0.0), aml=300.0), None)[0] == pytest.approx(2.0 - lab.CRASH_PENALTY)    # < −3 × 300
-    assert lab.score_dev(dev_stub(2.0, ov=(-900.0, -899.0), aml=300.0), None)[0] == 2.0                                     # 刚好 3 倍不罚
     assert lab.score_dev(dev_stub(None), None)[0] == lab.NO_DSR_POINTS
 
 
+def test_score_dev_sample_floor_and_incomplete():
+    """#1：< 20 笔或 < 10 簇 = 0 分，原因"样本太少"（哪怕 DSR 看起来很高）；#8：数据不全 = 0 分待定。"""
+    for n, cl in ((19, 12), (25, 9), (0, 0), (5, 5)):
+        assert lab.score_dev(dev_stub(9.0, n=n, cl=cl), None) == (0.0, "样本太少")
+    assert lab.score_dev(dev_stub(9.0, n=20, cl=10), None)[0] == 5.0              # 刚好够
+    pts, why = lab.score_dev(dev_stub(9.0, incomplete=True), None)
+    assert pts == 0.0 and "数据不全" in why
+
+
+def test_crash_penalty_per_underlying_summed_and_capped():
+    """#5：points −= min(5, 亏损 ÷ 平均最大亏损)，按标的算再相加，总罚分封顶 −5。"""
+    base = lab.score_dev(dev_stub(2.0), None)[0]
+    assert base == 2.0
+    pen = lambda by: base - lab.score_dev(dev_stub(2.0, by=by), None)[0]           # noqa: E731
+    assert pen({"SPY": {"loss": 600.0, "avg_max_loss": 300.0}}) == pytest.approx(2.0)
+    assert pen({"SPY": {"loss": 600.0, "avg_max_loss": 300.0}, "QQQ": {"loss": 450.0, "avg_max_loss": 300.0}}) == pytest.approx(3.5)       # 2 + 1.5
+    assert pen({"SPY": {"loss": 3000.0, "avg_max_loss": 300.0}}) == pytest.approx(5.0)                                                   # 单个标的 10 倍 -> 封顶 5
+    assert pen({"SPY": {"loss": 900.0, "avg_max_loss": 300.0}, "QQQ": {"loss": 900.0, "avg_max_loss": 300.0}}) == pytest.approx(5.0)       # 3 + 3 = 6 -> 封顶 5
+    assert pen({"SPY": {"loss": 0.0, "avg_max_loss": 300.0}}) == 0.0
+    assert pen({"SPY": {"loss": -50.0, "avg_max_loss": 300.0}}) == 0.0                                                                    # 盈利不加分
+    # 没有逐标的数据：整体 overlap 里亏损的窗口加总 ÷ 平均最大亏损；盈利窗口不抵消
+    assert pen(None) == 0.0
+    old = lab.score_dev(dev_stub(2.0, ov=(-600.0, 900.0), aml=300.0), None)[0]
+    assert base - old == pytest.approx(2.0)
+
+
+def test_dev_metrics_crash_by_underlying():
+    def tr(und, ent, ext, pnl, ml=300.0, i=0):
+        return {"und": und, "entry_date": ent, "exit_date": ext, "pnl": pnl, "max_loss": ml, "ret": pnl / ml, "entry_idx": i, "reason": "take_profit", "legs": "x"}
+    trades = [tr("SPY", "2024-08-02", "2024-08-09", -600.0, i=1), tr("SPY", "2025-04-03", "2025-04-10", -150.0, i=30),     # SPY：−750 亏损
+              tr("QQQ", "2024-08-02", "2024-08-09", -300.0, i=1), tr("QQQ", "2025-04-03", "2025-04-10", 500.0, i=30),       # QQQ：第一个窗口亏 300，第二个窗口赚 500（不抵消）
+              tr("QQQ", "2024-03-01", "2024-03-08", 50.0, i=60)]
+    sim = {"trades": trades, "per_und": {}, "skips": Counter(), "unresolved": 0}
+    d, weekly, _ = lab._dev_metrics(sim, lab.validate_proposal(put_spread())[0])
+    assert d["crash_by_und"]["SPY"] == {"loss": 750.0, "avg_max_loss": 300.0, "ratio": 2.5}
+    assert d["crash_by_und"]["QQQ"]["loss"] == 300.0 and d["crash_by_und"]["QQQ"]["ratio"] == 1.0
+    assert lab.score_dev(dict(d, dsr=2.0, n_trades=25, n_clusters=12), None)[0] == pytest.approx(2.0 - 3.5)
+    assert all(k in d for k in ("sr", "T", "skew", "kurt")) and d["T"] == 79                    # #2：原始统计量随结果一起存
+
+
+def crafted_entry(h, weekly, points=0.0, who="w", n_trades=25, n_clusters=12, status="scored", **extra):
+    """日志里一行"合格的开发段方案"：原始 SR / T / 偏度 / 峰度由 weekly 算出来存好（和 run_dev 存的一样）。"""
+    st = lab.weekly_stats(list(weekly))
+    e = {"who": who, "ts": "2025-09-01T00:00:00+00:00", "hash": h, "spec": {"structure": "vertical", "underlyings": ["SPY"], "dte": 38, "legs": [], "conditions": [], "exit": {"mode": "next_session_close"}},
+         "why": "x", "valid": True, "reason": "", "duplicate_of": None, "backtested": True, "status": status,
+         "dev": {"n_trades": n_trades, "n_clusters": n_clusters, "dsr": 99.0, "dsr_prob": 1.0, "complexity": 2, "overlap": {}, "avg_max_loss": 300.0, "avg_ret": 0.1, "total_pnl": 1.0,
+                 "boot_p": 0.1, "worst_trade": {"pnl": -1.0}, "sr": st["sr"], "T": st["T"], "skew": st["skew"], "kurt": st["kurt"], "data_incomplete": False},
+         "weekly": [round(float(x), 2) for x in weekly], "points": points, "points_reason": "crafted"}
+    e.update(extra)
+    return e
+
+
+def test_baseline_recomputed_at_current_N_and_V_not_stored(env):
+    """#2：best_so_far = 日志里全部合格方案在当前 N、V 下的 z 的最大值；存的旧 dsr（这里故意存成 99）不算数。"""
+    rng = np.random.default_rng(3)
+    wk = rng.normal(0.6, 1.0, 79)
+    lab._append(env.log_path, crafted_entry("A", wk, points=4.0))
+    N0 = lab.n_trials(env)
+    sc0, V0 = lab.current_scores(lab.read_log(env), N0)
+    st = lab.weekly_stats(list(wk))
+    assert sc0["A"]["z"] == pytest.approx(lab.deflated_sharpe(st["sr"], 79, st["skew"], st["kurt"], N0, V0)["z"]) and sc0["A"]["z"] < 99
+    sc1, _ = lab.current_scores(lab.read_log(env), N0 + 500)
+    assert sc1["A"]["z"] < sc0["A"]["z"]                                      # N 越大门槛越高：同一个方案的 z 变低
+    assert lab.best_dev(env=env)["dsr"] == pytest.approx(sc0["A"]["z"]) and lab.best_dev(env=env)["hash"] == "A"
+    assert lab.top_dev(3, env)[0]["dsr"] == pytest.approx(sc0["A"]["z"])
+    # 新方案的打分用 A 的**当前** z 做基线
+    r = lab.run_dev(put_spread(), "alice", env)
+    assert r["status"] == "scored"
+    scn, Vn = lab.current_scores(lab.read_log(env), lab.n_trials(env))
+    zA = scn["A"]["z"]
+    assert r["points"] == lab.score_dev(r["dev"], zA)[0] and r["points"] != lab.score_dev(r["dev"], 99.0)[0]
+    assert r["dev"]["var_sr"] == pytest.approx(Vn) and r["dev"]["dsr"] == pytest.approx(scn[r["hash"]]["z"])
+    assert r["dev"]["dsr_prob"] == pytest.approx(NORMAL.cdf(r["dev"]["dsr"])) and f"z {zA:+.2f}" in r["points_reason"]
+    # 日志里存了原始统计量
+    d = lab.read_log(env)[-1]["dev"]
+    assert d["T"] == 79 and d["sr"] is not None and d["skew"] is not None and d["kurt"] is not None and d["n_trials"] == lab.n_trials(env)
+
+
+def test_V_floor():
+    """#3：V = max(合格方案周夏普的样本方差, 1/(T−1))。"""
+    assert lab._var_sr([0.30, 0.3001, 0.2999], 79) == pytest.approx(1 / 78)       # 几乎一样的夏普 -> 方差接近 0 -> 取下限
+    assert lab._var_sr([0.9], 79) == pytest.approx(1 / 78) and lab._var_sr([], 79) == pytest.approx(1 / 78)
+    big = [0.0, 1.0, 2.0]
+    assert lab._var_sr(big, 79) == pytest.approx(1.0)                              # 方差 1 > 下限
+    rng = np.random.default_rng(1)
+    base = rng.normal(0.3, 1, 79)
+    log = [crafted_entry(f"x{k}", base + rng.normal(0, 0.01, 79)) for k in range(3)]
+    sc, V = lab.current_scores(log, 100)
+    assert V == pytest.approx(1 / 78)
+    # 不合格 / 近似重复以外的方案不进 V：不合格的（n_trades < 20）不影响 V
+    log2 = log + [crafted_entry("tiny", rng.normal(5, 1, 79), n_trades=3)]
+    assert lab.current_scores(log2, 100)[1] == V and "tiny" not in lab.current_scores(log2, 100)[0]
+
+
+def test_ineligible_small_sample_logged_counted_not_best_or_promotable(env):
+    """#1：< 20 笔 -> 0 分、原因"样本太少"、写日志、照样记试验；不进当前最好、不能晋级。"""
+    n0 = lab.n_trials(env)
+    r = lab.run_dev(put_spread(entry=[{"name": "iv_pct_ge", "value": 0.9}]), "small", env)
+    assert r["status"] == "ineligible" and r["points"] == 0.0 and r["points_reason"] == "样本太少" and r["dev"]["n_trades"] < 20
+    assert r["dev"]["dsr"] is None and lab.n_trials(env) == n0 + 1
+    line = lab.read_log(env)[-1]
+    assert line["backtested"] and line["status"] == "ineligible" and "sr" in line["dev"] and line["dev"]["T"] == 79
+    assert lab.best_dev(env=env) is None and lab.top_dev(5, env) == [] and lab.current_scores(lab.read_log(env), 100)[0] == {}
+    txt = lab.history_for("small", 5, env)
+    assert "样本太少" in txt and "0 points" in txt
+    assert lab.status(env)["too_small"] == 1 and lab.status(env)["eligible"] == 0
+    # 够格的方案才进最好榜
+    ok = lab.run_dev(put_spread(), "ok", env)
+    assert ok["status"] == "scored" and lab.best_dev(env=env)["hash"] == ok["hash"]
+    # 19 笔也不行：实测一个 19 笔的方案
+    r19 = lab.run_dev(put_spread(entry=[{"name": "weekday_eq", "value": 2}], cooldown_days=5), "s19", env)
+    assert r19["status"] == "ineligible" and r19["dev"]["n_trades"] == 19
+
+
+def test_near_duplicate_identical_trade_set(env):
+    """#4：成交明细完全相同（这里 iv_rv_ge 1.5 在合成数据里恒成立 = always）-> −0.5、原因固定、照样记试验、不进最好、不能晋级。"""
+    a = lab.run_dev(put_spread(), "alice", env)
+    n1 = lab.n_trials(env)
+    b = lab.run_dev(put_spread(entry=[{"name": "iv_rv_ge", "value": 1.5}]), "bob", env)
+    assert a["hash"] != b["hash"] and b["status"] == "near_duplicate" and b["points"] == -0.5 and b["points_reason"] == "结果和已测方案几乎一样"
+    assert lab.n_trials(env) == n1 + 1 and b["dev"]["dsr"] is None
+    line = lab.read_log(env)[-1]
+    assert line["near_duplicate_of"]["hash"] == a["hash"] and line["trade_sig"] == lab.read_log(env)[0]["trade_sig"]
+    assert lab.best_dev(env=env)["hash"] == a["hash"] and [r["hash"] for r in lab.top_dev(5, env)] == [a["hash"]]
+    sc, _ = lab.current_scores(lab.read_log(env), lab.n_trials(env))
+    assert sc[a["hash"]]["promotable"] and not sc[b["hash"]]["promotable"]
+    assert "几乎一样" in lab.history_for("bob", 3, env)
+
+
+def test_near_duplicate_helper_correlation_threshold():
+    rng = np.random.default_rng(2)
+    base = rng.normal(0, 100, 79)
+    other = crafted_entry("O", base)
+    mine = base + rng.normal(0, 10, 79)                    # 相关系数 ≈ 0.995
+    assert np.corrcoef(base, mine)[0, 1] > 0.95
+    assert lab._near_duplicate(list(mine), "zz", [other], "N")["hash"] == "O"
+    weak = base + rng.normal(0, 150, 79)                   # 相关 ≈ 0.55
+    assert np.corrcoef(base, weak)[0, 1] < 0.95 and lab._near_duplicate(list(weak), "zz", [other], "N") is None
+    assert lab._near_duplicate(list(mine), "zz", [other], "O") is None            # 同一个哈希（自己）不比
+    flat = crafted_entry("F", np.zeros(79))
+    assert lab._near_duplicate([0.0] * 79, "zz", [flat], "N") is None             # 常数序列算不出相关，不算重复
+    same_sig = crafted_entry("S", rng.normal(0, 1, 79), trade_sig="abc123")
+    assert lab._near_duplicate(list(rng.normal(0, 1, 79)), "abc123", [same_sig], "N")["hash"] == "S"
+    # 比对对象包含不合格 / 数据不全的方案（"日志里任一方案"）
+    small = crafted_entry("T", base, n_trades=3)
+    assert lab._near_duplicate(list(mine), "zz", [small], "N")["hash"] == "T"
+
+
+def test_earnings_cooldown_is_stripped_before_hashing():
+    """#4：引擎用不上的参数（财报单的冷却天数、出场参数）在哈希前规范化掉。"""
+    ea = {"why": "x", "underlyings": ["NVDA"], "dte": 20, "entry": {"earnings_eve": True},
+          "legs": [{"side": "buy", "type": "call", "strike_pct": 1.0}, {"side": "buy", "type": "put", "strike_pct": 1.0}]}
+    hs = set()
+    for cd in (1, 2, 5):
+        n, why = lab.validate_proposal(dict(ea, cooldown_days=cd))
+        assert n and n["cooldown_days"] == 1
+        hs.add(lab.spec_hash(n))
+    assert len(hs) == 1 and lab.spec_hash(lab.validate_proposal(ea)[0]) in hs
+    n_, why = lab.validate_proposal(dict(ea, cooldown_days=3))                 # 不在档上的照样拒绝
+    assert n_ is None and "cooldown_days" in why
+    normal = put_spread()
+    assert lab.validate_proposal(dict(normal, cooldown_days=2))[0]["cooldown_days"] == 2 and lab.spec_hash(lab.validate_proposal(dict(normal, cooldown_days=2))[0]) != lab.spec_hash(lab.validate_proposal(normal)[0])
+
+
+# ---------------------------------------------------------------- 平稳块自助法
+def test_block_bootstrap_own_vs_arch_similar_p():
+    """#7：平稳块自助（平均块长 4 周）。装了 arch 就和 arch 的结果比；自带实现对自相关序列给出比整周 iid 自助更大的 p。"""
+    rng = np.random.default_rng(4)
+    e = rng.normal(0, 1, 120)
+    x = np.convolve(e, np.ones(5) / 5, mode="valid")[:79] + 0.12                  # 强自相关、均值略正
+    p_own = lab.block_boot_p(x, impl="own", n=20000, seed=1)
+    assert 0.0 < p_own < 1.0
+    assert lab.block_boot_p(x, impl="own", n=20000, seed=1) == p_own                # 种子固定可复现
+    p_iid = v2.boot_p(list(x), n=20000)
+    assert p_own > p_iid                                                           # 块自助保留了自相关，p 更保守（更大）
+    arch = pytest.importorskip("arch.bootstrap")
+    assert lab._arch_bootstrap_cls() is arch.StationaryBootstrap
+    p_arch = lab.block_boot_p(x, impl="arch", n=20000, seed=1)
+    assert abs(p_arch - p_own) < 0.04, (p_arch, p_own)
+    assert lab.block_boot_p(x) == pytest.approx(lab.block_boot_p(x, impl="arch"))   # 默认：装了 arch 就用 arch
+
+
+def test_block_bootstrap_edge_cases_and_fallback(monkeypatch):
+    zero = np.random.default_rng(5).normal(0, 1, 79)
+    ps = [lab.block_boot_p(np.random.default_rng(s).normal(0, 1, 79), impl="own", n=2000, seed=s) for s in range(30)]
+    assert 0.35 < float(np.mean(ps)) < 0.65                                         # 纯噪声：p 均匀，平均约 0.5
+    assert lab.block_boot_p(np.random.default_rng(6).normal(1.5, 1, 79), impl="own", n=2000) < 0.01
+    assert lab.block_boot_p([1.0], impl="own") is None and lab.block_boot_p([], impl="own") is None
+    monkeypatch.setattr(lab, "_arch_bootstrap_cls", lambda: None)                  # arch 导不进来：默认走自带实现，不报错
+    assert lab.block_boot_p(zero, n=2000) == lab.block_boot_p(zero, impl="own", n=2000)
+    with pytest.raises(RuntimeError):
+        lab.block_boot_p(zero, impl="arch", n=100)
+
+
+def test_dev_boot_p_uses_stationary_block_bootstrap(monkeypatch):
+    seen = []
+    monkeypatch.setattr(lab, "block_boot_p", lambda x, *a, **k: seen.append(len(x)) or 0.1234)
+    trades = [{"und": "SPY", "entry_date": "2024-03-01", "exit_date": "2024-03-08", "pnl": 10.0, "max_loss": 300.0, "ret": 0.03, "entry_idx": 1, "reason": "take_profit", "legs": "x"}]
+    d, *_ = lab._dev_metrics({"trades": trades, "per_und": {}, "skips": Counter(), "unresolved": 0}, lab.validate_proposal(put_spread())[0])
+    assert d["boot_p"] == 0.1234 and seen == [79]
+    assert lab.BOOT_MEAN_BLOCK == 4
+
+
 # ---------------------------------------------------------------- 开发段回测：硬锁
-def D_END_for(allow):
-    n = bisect_right(ALL_DAYS, lab.DEV_END)
-    return ALL_DAYS[n + allow - 1]
-
-
 def test_run_dev_basic_metrics_and_log(env):
     r = lab.run_dev(put_spread(), "alice", env)
-    assert r["valid"] and not r["duplicate"] and r["hash"] and r["dev"]["n_trades"] >= 8
+    assert r["valid"] and not r["duplicate"] and r["hash"] and r["dev"]["n_trades"] >= 20 and r["status"] == "scored"
     d = r["dev"]
-    assert d["complexity"] == 2 and d["n_weeks"] == len(lab.DEV_WEEKS) == 79 and d["n_clusters"] >= 1
+    assert d["complexity"] == 2 and d["n_weeks"] == len(lab.DEV_WEEKS) == 79 and d["n_clusters"] >= 10
     line = lab.read_log(env)[0]
     assert len(line["weekly"]) == 79 and sum(line["weekly"]) == pytest.approx(d["total_pnl"], abs=0.2)
     assert set(d["overlap"]) == {"2024-08-01..2024-08-16", "2025-04-01..2025-04-30"}
-    assert d["worst_trade"]["pnl"] <= 0 or d["worst_trade"]["pnl"] == min(x for x in [d["worst_trade"]["pnl"]])
     assert d["n_trials"] == 61 and lab.n_trials(env) == 61                       # 种子 60 + 本次 1
-    assert d["sharpe_ann"] == pytest.approx(d["sharpe_wk"] * math.sqrt(52))
-    assert r["points"] == lab.score_dev(d, None)[0] or r["points_reason"]
+    assert d["sharpe_ann"] == pytest.approx(d["sharpe_wk"] * math.sqrt(52)) and d["sr"] == d["sharpe_wk"]
+    assert d["dsr_prob"] == pytest.approx(NORMAL.cdf(d["dsr"])) and 0 < d["boot_p"] <= 1
     trials = [json.loads(l) for l in env.trials_path.read_text().splitlines()]
     assert trials[-1]["kind"] == "dev" and trials[-1]["who"] == "alice" and trials[-1]["hash"] == r["hash"] and trials[-1]["ts"]
-    assert line["who"] == "alice" and line["valid"] and line["spec"]["structure"] == "vertical" and line["backtested"]
+    assert line["who"] == "alice" and line["valid"] and line["spec"]["structure"] == "vertical" and line["backtested"] and line["status"] == "scored"
     # 开发段指标和直接用引擎算的一致（引擎复用，不是复制）
     norm, _ = lab.validate_proposal(put_spread())
     sim = lab._simulate(norm, env, SPEC, lab.DEV_START, lab.DEV_END)
@@ -333,77 +536,71 @@ def test_run_dev_basic_metrics_and_log(env):
     ov = v2.window_pnl(sim["trades"], "2024-08-01", "2024-08-16")["overlap_pnl"]
     assert d["overlap"]["2024-08-01..2024-08-16"] == ov
     assert d["worst_trade"]["pnl"] == min(t["pnl"] for t in sim["trades"])
+    assert "DSR" not in r["points_reason"] and "置信度" in r["points_reason"]
 
 
-def test_dev_never_enters_after_2025_06_30_and_ignores_vault_quotes(tmp_path, shared_opra, env):
+def test_dev_reads_no_quote_from_july_2025_and_closes_open_positions_at_0630(tmp_path, shared_opra, env, monkeypatch):
+    """#10：run_dev 一条 7 月以后的报价都不读（连文件都不打开）；2025-06-30 仍开着的仓位用 06-30 主口径价格强制平仓。"""
     norm, _ = lab.validate_proposal(put_spread())
+    opened = []
+    orig = v2.read_month
+    monkeypatch.setattr(v2, "read_month", lambda path: opened.append(Path(path).stem) or orig(path))
     base = lab._simulate(norm, env, SPEC, lab.DEV_START, lab.DEV_END)
-    assert base["trades"] and all(t["entry_date"] <= lab.DEV_END for t in base["trades"])
-    last_dev_day = max(t["entry_date"] for t in base["trades"])
-    assert last_dev_day >= "2025-06-01"                                          # 样本确实一路开到开发段末尾
-    # 没有"2025-07-01 之后入场"的交易：就算 7 月以后的报价非常诱人
+    assert opened and max(opened) == "2025-06"                                       # 7 月及以后的月文件一个都没打开
+    assert base["trades"] and all(t["entry_date"] <= lab.DEV_END and t["exit_date"] <= lab.DEV_END for t in base["trades"])
+    assert max(t["entry_date"] for t in base["trades"]) >= "2025-06-01"
+    forced = [t for t in base["trades"] if t["reason"] == "open_at_end"]
+    assert forced and all(t["exit_date"] == lab.DEV_END for t in forced)             # 强制平仓：都在 06-30
     full = lab._simulate(norm, env, SPEC)
-    assert any(t["entry_date"] >= lab.VAULT_START for t in full["trades"])        # 对照：不设限的话金库段有入场
-    # 1) 改写 / 删掉所有"截止日之后"的报价（含 7 月里晚于 max_hold 的）-> 开发段结果逐笔不变
-    dend = D_END_for(25)
-    assert dend > lab.VAULT_START
-
-    def wreck(d, row):
-        if d > dend:
-            row = dict(row)
-            row["bid_px"], row["ask_px"] = 0.0, 50.0
-        return row
-    root2 = tmp_path / "wrecked" / "opra"
-    build_data(root2, mutate=wreck)
+    assert any(t["entry_date"] >= lab.VAULT_START for t in full["trades"]) and any(t["exit_date"] > lab.DEV_END for t in full["trades"])    # 对照：不设限就会跑到 7 月
+    # 7 月及以后的 parquet 全换成垃圾、报价全改坏：开发段结果逐笔不变（打开了就会抛异常）
+    root2 = tmp_path / "junk" / "opra"
+    shutil.copytree(shared_opra, root2, symlinks=True)
+    for m in ("2025-07", "2025-08", "2025-09"):
+        (root2 / "cbbo1m" / "SPY" / f"{m}.parquet").write_bytes(b"junk, opening this means the vault leaked")
     (tmp_path / "e2").mkdir()
     env2 = make_env(tmp_path / "e2", root2)
     t2 = lab._simulate(norm, env2, SPEC, lab.DEV_START, lab.DEV_END)["trades"]
     assert [(t["entry_date"], t["exit_date"], t["pnl"]) for t in t2] == [(t["entry_date"], t["exit_date"], t["pnl"]) for t in base["trades"]]
-    # 2) 截止日所在月以后的 parquet 一个字节都不许打开（max_hold 25 个交易日 = 8 月初，所以 9 月的文件是垃圾也照常）：打开就会抛异常
-    assert dend[:7] == "2025-08"
-    root3 = tmp_path / "junk" / "opra"
-    shutil.copytree(shared_opra, root3, symlinks=True)
-    (root3 / "cbbo1m" / "SPY" / "2025-09.parquet").write_bytes(b"junk, opening this means the vault leaked")
-    (tmp_path / "e3").mkdir()
-    env3 = make_env(tmp_path / "e3", root3)
-    t3 = lab._simulate(norm, env3, SPEC, lab.DEV_START, lab.DEV_END)["trades"]
-    assert [t["pnl"] for t in t3] == [t["pnl"] for t in base["trades"]]
     with pytest.raises(Exception):
-        lab._simulate(norm, env3, SPEC)                                           # 对照：金库口径要读它们，所以会炸
+        lab._simulate(norm, env2, SPEC)                                                # 对照：金库口径要读它们
+    r = lab.run_dev(put_spread(), "alice", env2)                                       # 完整的 run_dev 也一样
+    assert r["status"] == "scored" and r["dev"]["n_trades"] == len(base["trades"])
 
 
-def test_vault_period_pnl_enters_dev_only_through_closing_trades(tmp_path, env):
-    """7 月（截止日内）的报价只影响"开发段入场、7 月才平"的那几笔；其余开发段交易、逐周盈亏（按入场周）一分不动；没有 7 月入场。"""
+def test_forced_close_at_0630_uses_primary_prices_or_max_loss(tmp_path, env):
     norm, _ = lab.validate_proposal(put_spread())
     base = lab._simulate(norm, env, SPEC, lab.DEV_START, lab.DEV_END)
-
-    def rig(d, row):
-        if lab.VAULT_START <= d <= "2025-07-31":
-            row = dict(row)
-            row["bid_px"], row["ask_px"] = 0.01, 0.03                  # 7 月报价全部"便宜"：买回成本极低 -> 跨月仓位会大赚
-        return row
-    root2 = tmp_path / "rigged" / "opra"
-    build_data(root2, mutate=rig)
+    f = [t for t in base["trades"] if t["reason"] == "open_at_end" and t["entry_date"] < lab.DEV_END]
+    assert f
+    t0 = f[0]
+    # 06-30 的报价整体抬高：强制平仓买回更贵 -> 这几笔亏得更多，其它笔不变
+    def pricey(d, row):
+        return dict(row, bid_px=row["bid_px"] + 0.5, ask_px=row["ask_px"] + 0.5) if d == lab.DEV_END else row
+    root2 = tmp_path / "pricey" / "opra"
+    build_data(root2, mutate=pricey)
     (tmp_path / "e2").mkdir()
-    env2 = make_env(tmp_path / "e2", root2)
-    alt = lab._simulate(norm, env2, SPEC, lab.DEV_START, lab.DEV_END)["trades"]
-    assert len(alt) == len(base["trades"]) and all(t["entry_date"] <= lab.DEV_END for t in alt)
-    changed = [(a, b) for a, b in zip(alt, base["trades"]) if a["pnl"] != b["pnl"]]
-    assert changed, "7 月报价应当影响跨月仓位的平仓"
-    assert all(b["exit_date"] >= lab.VAULT_START and a["exit_date"] >= lab.VAULT_START for a, b in changed)    # 只有 7 月才平的仓位受影响
-    wk_a, wk_b = v2.weekly_pnl(alt, lab.DEV_WEEKS), v2.weekly_pnl(base["trades"], lab.DEV_WEEKS)
-    diff_weeks = [w for w in lab.DEV_WEEKS if abs(wk_a[w] - wk_b[w]) > 1e-9]
-    assert diff_weeks and max(diff_weeks) >= "2025-W24" and min(diff_weeks) >= "2025-W20"           # 只在末尾那几周（入场周）有差别
-    assert set(wk_a) == set(lab.DEV_WEEKS)                                                          # 没有 7 月的周
+    alt = lab._simulate(norm, make_env(tmp_path / "e2", root2), SPEC, lab.DEV_START, lab.DEV_END)["trades"]
+    by = {(t["entry_date"], t["exit_date"]): t for t in alt}
+    for t in f:
+        assert by[(t["entry_date"], t["exit_date"])]["pnl"] != t["pnl"]
+    assert [t["pnl"] for t in base["trades"] if t["reason"] != "open_at_end"] == [t["pnl"] for t in alt if t["reason"] != "open_at_end"]
+    # 06-30 没有报价：按最大亏损（信用价差 pnl = −max_loss − 平仓手续费 1.3）
+    root3 = tmp_path / "noquote" / "opra"
+    build_data(root3, mutate=lambda d, row: None if d == lab.DEV_END else row)
+    (tmp_path / "e3").mkdir()
+    nq = lab._simulate(norm, make_env(tmp_path / "e3", root3), SPEC, lab.DEV_START, lab.DEV_END)["trades"]
+    mx = [t for t in nq if t["reason"] == "no_more_quotes"]
+    assert mx and all(t["exit_date"] <= lab.DEV_END and t["pnl"] == pytest.approx(-t["max_loss"] - 1.3, abs=0.01) for t in mx)
+    assert t0["entry_date"] in {t["entry_date"] for t in mx}
 
 
-def test_dev_window_is_max_hold_days_after_cutoff(env):
-    norm, _ = lab.validate_proposal(put_spread(max_hold_days=10))
-    s = lab._simulate(norm, env, SPEC, lab.DEV_START, lab.DEV_END)
-    assert max(t["exit_date"] for t in s["trades"]) <= D_END_for(10)
-    norm25, _ = lab.validate_proposal(put_spread(max_hold_days=25))
-    s25 = lab._simulate(norm25, env, SPEC, lab.DEV_START, lab.DEV_END)
-    assert max(t["exit_date"] for t in s25["trades"]) <= D_END_for(25)
+def test_dev_window_ends_exactly_at_cutoff(env):
+    for mh in (10, 25):
+        norm, _ = lab.validate_proposal(put_spread(max_hold_days=mh))
+        s = lab._simulate(norm, env, SPEC, lab.DEV_START, lab.DEV_END)
+        assert max(t["exit_date"] for t in s["trades"]) <= lab.DEV_END and max(t["entry_date"] for t in s["trades"]) <= lab.DEV_END
+        assert s["last_day"] == lab.DEV_END
 
 
 def test_duplicate_is_not_run_not_counted_and_scored_minus_one(env):
@@ -411,7 +608,7 @@ def test_duplicate_is_not_run_not_counted_and_scored_minus_one(env):
     n1 = lab.n_trials(env)
     assert n1 == 61
     r2 = lab.run_dev(put_spread(why="other words", name="again"), "bob", env)         # 别人提同一个方案
-    assert r2["duplicate"] and r2["points"] == -1.0 and r2["dev"] is None and r2["hash"] == r1["hash"]
+    assert r2["duplicate"] and r2["points"] == -1.0 and r2["dev"] is None and r2["hash"] == r1["hash"] and r2["status"] == "duplicate"
     assert lab.n_trials(env) == n1
     log = lab.read_log(env)
     assert len(log) == 2 and log[1]["duplicate_of"]["who"] == "alice" and not log[1]["backtested"]
@@ -440,6 +637,7 @@ def test_pooled_two_underlyings_cluster_counts_per_underlying(tmp_path):
     assert r["dev"]["n_trades"] > one["dev"]["n_trades"]
     per = sum(len(v2.clusters([t["entry_idx"] for t in sim["trades"] if t["und"] == u])) for u in unds)
     assert r["dev"]["n_clusters"] == per
+    assert set(r["dev"]["crash_by_und"]) <= {"SPY", "QQQ"}
 
 
 # ---------------------------------------------------------------- 条件
@@ -576,7 +774,7 @@ def test_history_for_dev_numbers_only_and_vault_flag_only(env):
     lab.run_dev(put_spread(take_profit=0.25), "bob", env)
     lab.run_dev({"why": "x"}, "alice", env)
     h = lab.history_for("alice", 10, env)
-    assert h.count("\n") == 2 and "bob" not in h and "trades" in h and "DSR" in h and "INVALID" in h
+    assert h.count("\n") == 2 and "bob" not in h and "trades" in h and "置信度" in h and "DSR" not in h and "INVALID" in h
     assert "bob" not in lab.history_for("bob", 1, env) and lab.history_for("nobody", 5, env) == "(no proposals yet)"
     assert lab.history_for("alice", 1, env).count("\n") == 0
     # 金库数字绝不出现：往 vault.jsonl 塞哨兵数字，摘要里不得出现；只出现"过 / 没过"
@@ -603,7 +801,7 @@ def test_vault_exam_end_to_end(env):
     assert v[0]["eval"]["test"]["trades"] >= 1 and v[0]["n_trials"] == n_before + 1 and v[0]["bonferroni"] == pytest.approx(0.05 / (n_before + 1))
     rep = env.reports / f"lab_vault_{r['hash']}.md"
     assert rep.exists() and r["hash"] in rep.read_text() and "金库" in rep.read_text()
-    # 金库口径 = 全样本，考试段入场确实在 7 月以后；开发段那部分和开发段回测的成交一致
+    # 金库口径 = 全样本，考试段入场确实在 7 月以后
     norm, _ = lab.validate_proposal(put_spread())
     full = lab._simulate(norm, env, SPEC)
     assert v[0]["eval"]["test"]["trades"] == len([t for t in full["trades"] if t["entry_date"] >= lab.VAULT_START])
@@ -613,6 +811,52 @@ def test_vault_exam_end_to_end(env):
     with pytest.raises(ValueError):
         lab.vault_exam("deadbeefdeadbeef", env)
     assert "vault: " in lab.history_for("alice", 5, env)
+
+
+def test_vault_error_records_trial_and_error_line_and_blocks_promotion(env, monkeypatch):
+    """#9：金库考试出错 -> 记试验 + 错误行（vault_error），该哈希以后不再晋级；占用本 ISO 周。"""
+    r = lab.run_dev(put_spread(), "alice", env)
+    other = lab.run_dev(put_spread(take_profit=0.75), "bob", env)
+    n0 = lab.n_trials(env)
+    real = lab._simulate
+
+    def boom(norm, env_, spec, entry_first=None, entry_last=None):
+        if entry_last is None:
+            raise RuntimeError("parquet exploded")
+        return real(norm, env_, spec, entry_first, entry_last)
+    monkeypatch.setattr(lab, "_simulate", boom)
+    now = datetime(2025, 10, 6, 12, tzinfo=timezone.utc)
+    with pytest.raises(RuntimeError):
+        lab.vault_exam(r["hash"], env, now=now)
+    assert lab.n_trials(env) == n0 + 1                                                  # 试验照记
+    trials = [json.loads(l) for l in env.trials_path.read_text().splitlines()]
+    assert trials[-1]["kind"] == "vault" and trials[-1]["hash"] == r["hash"]
+    v = [json.loads(l) for l in env.vault_path.read_text().splitlines()]
+    assert len(v) == 1 and v[0]["vault_error"] is True and v[0]["hash"] == r["hash"] and "parquet exploded" in v[0]["error"] and v[0]["passed"] is False and v[0]["iso_week"] == "2025-W41"
+    assert lab.vault_exam(r["hash"], env) == {"hash": r["hash"], "passed": False} and lab.n_trials(env) == n0 + 1     # 不重试、不再加试验
+    assert "vault: ERROR" in lab.history_for("alice", 5, env) and "PASSED" not in lab.history_for("alice", 5, env)
+    st = lab.status(env)
+    assert st["vault_errors"] == 1 and st["vault_exams"] == 0 and st["vault_passed"] == 0
+    # 晋级：本周已占用；下周起这个哈希永远跳过，轮到别的候选
+    monkeypatch.setattr(lab, "_simulate", real)
+    called = []
+    monkeypatch.setattr(lab, "vault_exam", lambda h, env=None, now=None: called.append(h) or {"hash": h, "passed": False})
+    monkeypatch.setattr(lab, "current_pbo", lambda env=None, log=None: 0.1)
+    monkeypatch.setattr(lab, "current_scores", lambda log, N: ({r["hash"]: {"z": 9.0, "prob": 1.0, "promotable": True},
+                                                                other["hash"]: {"z": 3.0, "prob": 0.99, "promotable": True}}, 0.1))
+    assert "already promoted" in lab.weekly_promotion(env, now=now)["skipped"] and called == []
+    assert lab.weekly_promotion(env, now=datetime(2025, 10, 13, 12, tzinfo=timezone.utc)) == {"hash": other["hash"], "passed": False} and called == [other["hash"]]
+
+
+def test_weekly_promotion_catches_vault_error(env, monkeypatch):
+    r = lab.run_dev(put_spread(), "alice", env)
+    monkeypatch.setattr(lab, "current_pbo", lambda env=None, log=None: 0.1)
+    monkeypatch.setattr(lab, "current_scores", lambda log, N: ({r["hash"]: {"z": 9.0, "prob": 1.0, "promotable": True}}, 0.1))
+    real = lab._simulate
+    monkeypatch.setattr(lab, "_simulate", lambda norm, env_, spec, entry_first=None, entry_last=None: (_ for _ in ()).throw(OSError("disk")) if entry_last is None else real(norm, env_, spec, entry_first, entry_last))
+    res = lab.weekly_promotion(env, now=datetime(2025, 10, 6, tzinfo=timezone.utc))
+    assert "hash" not in res and "disk" in res["error"] and res["vault_error_hash"] == r["hash"]
+    assert json.loads(env.vault_path.read_text().splitlines()[0])["vault_error"] is True
 
 
 def test_vault_incomplete_data_never_passes(env, tmp_path):
@@ -627,21 +871,45 @@ def test_vault_incomplete_data_never_passes(env, tmp_path):
     assert rec["eval"]["n_no_more_quotes"] >= 1 and rec["complete"] is False and out["passed"] is False
 
 
-def crafted_entry(h, weekly, points, who="w", n_trades=20):
-    return {"who": who, "ts": "2025-09-01T00:00:00+00:00", "hash": h, "spec": {"structure": "vertical", "underlyings": ["SPY"], "dte": 38, "legs": [], "conditions": [], "exit": {"mode": "next_session_close"}},
-            "why": "x", "valid": True, "reason": "", "duplicate_of": None, "backtested": True,
-            "dev": {"n_trades": n_trades, "n_clusters": 10, "dsr": 1.0, "complexity": 2, "overlap": {}, "avg_max_loss": 300.0, "avg_ret": 0.1, "total_pnl": 1.0,
-                    "boot_p": 0.1, "worst_trade": {"pnl": -1.0}},
-            "weekly": [round(float(x), 2) for x in weekly], "points": points, "points_reason": "crafted"}
+# ---------------------------------------------------------------- 数据不全：待定与补数据后重算
+def test_incomplete_run_is_pending_not_eligible_then_rescored_without_new_trial(tmp_path):
+    """#8：> 5% 的笔以 no_more_quotes / stop_on_missing 收尾 -> incomplete、0 分待定、不合格；补数据后 rescore 不加试验、新行取代旧行（旧行留着）。"""
+    root = tmp_path / "opra"
+    build_data(root, mutate=lambda d, row: None if d >= "2024-06-03" else row)
+    (tmp_path / "e").mkdir()
+    env = make_env(tmp_path / "e", root)
+    r = lab.run_dev(put_spread(), "alice", env)
+    assert r["status"] == "incomplete" and r["points"] == 0.0 and "数据不全" in r["points_reason"] and r["dev"]["data_incomplete"] is True
+    n1 = lab.n_trials(env)
+    assert n1 == 61                                                                    # 回测跑了，试验计 1 次
+    assert lab.best_dev(env=env) is None and lab.top_dev(5, env) == [] and lab.current_scores(lab.read_log(env), n1)[0] == {}
+    pend = lab.pending_rescore(env)
+    assert [p["hash"] for p in pend] == [r["hash"]] and pend[0]["who"] == "alice" and pend[0]["bad_frac"] > 0.05
+    assert lab.status(env)["pending_rescore"] == 1 and "PENDING" in lab.history_for("alice", 3, env)
+    # 数据还是不全：重算也不动日志、不加试验
+    assert lab.rescore_pending(env) == [{"hash": r["hash"], "status": "incomplete", "points": 0.0, "points_reason": lab.REASON_INCOMPLETE}]
+    assert len(lab.read_log(env)) == 1 and lab.n_trials(env) == n1
+    # 补数据（重建完整数据）：rescore 重新打分
+    build_data(root)
+    out = lab.rescore_pending(env)
+    assert len(out) == 1 and out[0]["hash"] == r["hash"] and out[0]["status"] == "scored" and out[0]["points"] != 0.0
+    assert lab.n_trials(env) == n1                                                     # 不加试验
+    raw = lab.read_log(env)
+    assert len(raw) == 2 and raw[0]["status"] == "incomplete" and raw[1]["rescored"] is True and raw[1]["supersedes"] == [raw[0]["ts"]]    # 旧行保留，新行取代
+    assert [e["status"] for e in lab._eff(raw)] == ["scored"] and lab.pending_rescore(env) == []
+    assert lab.best_dev(env=env)["hash"] == r["hash"] and lab.status(env)["pending_rescore"] == 0
+    assert lab.history_for("alice", 5, env).count("\n") == 0 and "PENDING" not in lab.history_for("alice", 5, env)     # 历史只显示取代后的那行
+    assert lab.rescore_pending(env) == []                                              # 没有待处理的了
 
 
-def test_weekly_promotion_one_per_iso_week(env, monkeypatch):
+# ---------------------------------------------------------------- 晋级
+def test_weekly_promotion_one_per_iso_week_and_picks_max_current_z_not_points(env, monkeypatch):
     rng = np.random.default_rng(11)
     lab.ensure_ledger(env)
     for k in range(28):
-        lab._append(env.log_path, crafted_entry(f"noise{k:02d}", rng.normal(0, 1, 79), 0.0))
-    lab._append(env.log_path, crafted_entry("strongA", rng.normal(2, 1, 79), 3.0))
-    lab._append(env.log_path, crafted_entry("strongB", rng.normal(2, 1, 79), 2.0))
+        lab._append(env.log_path, crafted_entry(f"noise{k:02d}", rng.normal(0, 1, 79)))
+    lab._append(env.log_path, crafted_entry("strongA", rng.normal(2.5, 1, 79), points=1.0))          # z 最高、得分低
+    lab._append(env.log_path, crafted_entry("strongB", rng.normal(2.0, 1, 79), points=3.0))          # z 次高、得分高
     calls = []
 
     def fake_vault(h, env=None, now=None):
@@ -650,9 +918,9 @@ def test_weekly_promotion_one_per_iso_week(env, monkeypatch):
         lab.record_trial(env, "vault", "w", h, now)
         return {"hash": h, "passed": True}
     monkeypatch.setattr(lab, "vault_exam", fake_vault)
-    assert lab.current_pbo(env) is not None and lab.current_pbo(env) < 0.5
+    assert lab.current_pbo(env) is not None and lab.current_pbo(env) <= 0.30
     wed = datetime(2025, 10, 1, 12, tzinfo=timezone.utc)                   # 2025-W40
-    assert lab.weekly_promotion(env, now=wed) == {"hash": "strongA", "passed": True}           # 得分最高、DSR > 0、PBO < 0.5
+    assert lab.weekly_promotion(env, now=wed) == {"hash": "strongA", "passed": True}           # 按当前 z，不按得分
     thu = datetime(2025, 10, 2, 12, tzinfo=timezone.utc)
     sk = lab.weekly_promotion(env, now=thu)
     assert "skipped" in sk and "2025-W40" in sk["skipped"] and calls == ["strongA"]            # 同一个 ISO 周不再来
@@ -660,27 +928,55 @@ def test_weekly_promotion_one_per_iso_week(env, monkeypatch):
     assert lab.weekly_promotion(env, now=nxt) == {"hash": "strongB", "passed": True}           # strongA 已考过，轮到 B
     third = datetime(2025, 10, 15, 12, tzinfo=timezone.utc)
     sk3 = lab.weekly_promotion(env, now=third)
-    assert "skipped" in sk3 and calls == ["strongA", "strongB"]            # 噪声方案 DSR < 0：没人可晋级
+    assert "skipped" in sk3 and "no unvaulted candidate" in sk3["skipped"] and "置信度" in sk3["skipped"] and calls == ["strongA", "strongB"]
     assert lab.status(env)["vault_exams"] == 2
 
 
-def test_weekly_promotion_gates_dsr_and_pbo(env, monkeypatch):
-    rng = np.random.default_rng(5)
+def test_weekly_promotion_bar_z_1645_and_pbo_030(env, monkeypatch):
+    """#6：z ≥ 1.645（dsr_prob ≥ 0.95）且 PBO ≤ 0.30。"""
     called = []
     monkeypatch.setattr(lab, "vault_exam", lambda h, env=None, now=None: called.append(h) or {"hash": h, "passed": False})
     now = datetime(2025, 10, 1, tzinfo=timezone.utc)
+
+    def with_scores(sc):
+        monkeypatch.setattr(lab, "current_scores", lambda log, N: (sc, 0.1))
+    monkeypatch.setattr(lab, "current_pbo", lambda env=None, log=None: 0.0)
+    with_scores({"h": {"z": 1.644, "prob": 0.9499, "promotable": True}})
+    assert "no unvaulted candidate" in lab.weekly_promotion(env, now=now)["skipped"] and called == []
+    with_scores({"h": {"z": 1.6449, "prob": 0.95005, "promotable": True}})                       # prob 够了但 z 还没到 1.645：不行
+    assert "skipped" in lab.weekly_promotion(env, now=now) and called == []
+    with_scores({"h": {"z": 1.645, "prob": 0.94, "promotable": True}})                           # z 到了但 prob < 0.95：不行
+    assert "skipped" in lab.weekly_promotion(env, now=now) and called == []
+    with_scores({"h": {"z": 3.0, "prob": 0.99, "promotable": False}})                            # 近似重复：不能晋级
+    assert "skipped" in lab.weekly_promotion(env, now=now) and called == []
+    with_scores({"h": {"z": 1.7, "prob": 0.955, "promotable": True}})
+    for pb, ok in ((0.31, False), (0.3001, False), (None, False), (0.30, True)):
+        monkeypatch.setattr(lab, "current_pbo", lambda env=None, log=None, pb=pb: pb)
+        res = lab.weekly_promotion(env, now=now)
+        if ok:
+            assert res == {"hash": "h", "passed": False} and called == ["h"]
+        else:
+            assert "PBO" in res["skipped"] and called == []
+    # 晋级后写进 vault.jsonl（这里 vault_exam 是假的，不写）：真实 z 数值的边界交给上面的 z / prob 双条件
+    assert lab.Z_PROMOTE == 1.645 and lab.PROB_PROMOTE == 0.95 and lab.PBO_MAX == 0.30
+    assert NORMAL.cdf(lab.Z_PROMOTE) >= 0.95
+
+
+def test_weekly_promotion_gates_candidates(env, monkeypatch):
+    """合格 / 数据完整 / 近似重复 / 样本太少的方案都进不了候选；候选的 dsr_prob 随结果存好。"""
+    rng = np.random.default_rng(5)
+    called = []
+    monkeypatch.setattr(lab, "vault_exam", lambda h, env=None, now=None: called.append(h) or {"hash": h, "passed": False})
+    monkeypatch.setattr(lab, "current_pbo", lambda env=None, log=None: 0.1)
+    now = datetime(2025, 10, 1, tzinfo=timezone.utc)
     assert "skipped" in lab.weekly_promotion(env, now=now)                  # 日志是空的
-    for k in range(20):                                                     # 全是噪声：DSR > 0 的不存在
-        lab._append(env.log_path, crafted_entry(f"n{k}", rng.normal(0, 1, 79), 1.0))
-    assert "no unvaulted candidate" in lab.weekly_promotion(env, now=now)["skipped"]
-    lab._append(env.log_path, crafted_entry("good", rng.normal(2, 1, 79), 0.2))                  # DSR > 0，但分数不是最高
-    lab._append(env.log_path, crafted_entry("zerotrades", np.zeros(79), 9.0, n_trades=0))      # 分数最高但没交易：不能晋级
-    lab._append(env.log_path, crafted_entry("flat", np.zeros(79), 9.0))                          # 周盈亏方差 0：DSR 算不出
-    monkeypatch.setattr(lab, "current_pbo", lambda env=None, log=None: 0.5)
-    assert "PBO" in lab.weekly_promotion(env, now=now)["skipped"] and called == []             # PBO 必须 < 0.5（= 0.5 不行）
-    monkeypatch.setattr(lab, "current_pbo", lambda env=None, log=None: None)
-    assert "PBO n/a" in lab.weekly_promotion(env, now=now)["skipped"] and called == []        # 算不出 PBO = 不晋级
-    monkeypatch.setattr(lab, "current_pbo", lambda env=None, log=None: 0.49)
+    lab._append(env.log_path, crafted_entry("tiny", rng.normal(3, 1, 79), n_trades=19))
+    lab._append(env.log_path, crafted_entry("fewclusters", rng.normal(3, 1, 79), n_clusters=9))
+    lab._append(env.log_path, crafted_entry("pending", rng.normal(3, 1, 79), status="incomplete"))
+    lab._append(env.log_path, crafted_entry("dup", rng.normal(3, 1, 79), status="near_duplicate"))
+    lab._append(env.log_path, crafted_entry("flat", np.zeros(79)))
+    assert "no unvaulted candidate" in lab.weekly_promotion(env, now=now)["skipped"] and called == []
+    lab._append(env.log_path, crafted_entry("good", rng.normal(3, 1, 79)))
     assert lab.weekly_promotion(env, now=now) == {"hash": "good", "passed": False} and called == ["good"]
 
 
@@ -689,22 +985,81 @@ def test_status_shape(env):
     lab.run_dev({"why": "x"}, "a", env)
     st = lab.status(env)
     assert st["n_trials"] == 61 and st["proposals"] == 2 and st["invalid"] == 1 and st["backtested"] == 1 and st["vault_exams"] == 0
-    assert "pbo" in st and "best_dev_dsr" in st
+    assert st["eligible"] == 1 and st["pending_rescore"] == 0 and st["best_confidence"] > 0.9 and "pbo" in st and "best_dev_dsr" in st
 
 
-def test_cli_validate_and_status(tmp_path, capsys, env):
-    p = tmp_path / "p.json"
-    p.write_text(json.dumps(put_spread()))
-    assert lab.main(["--validate", str(p)]) == 0
+# ---------------------------------------------------------------- CLI：同一把锁 / 精简环境变量 / 内存上限
+def _write(tmp_path, obj, name="p.json"):
+    p = tmp_path / name
+    p.write_text(json.dumps(obj))
+    return str(p)
+
+
+def test_cli_validate_status_dev_promote_rescore(tmp_path, capsys, env):
+    p = _write(tmp_path, put_spread())
+    assert lab.main(["--validate", p], env=env, limits=False) == 0
     out = json.loads(capsys.readouterr().out)
     assert out["ok"] and out["hash"] == lab.spec_hash(out["normalized"])
-    p.write_text(json.dumps({"why": "x", "underlyings": ["SPY"], "dte": 30, "legs": [{"side": "sell", "type": "call", "strike_pct": 1.0}]}))
-    assert lab.main(["--validate", str(p)]) == 1
+    p2 = _write(tmp_path, {"why": "x", "underlyings": ["SPY"], "dte": 30, "legs": [{"side": "sell", "type": "call", "strike_pct": 1.0}]}, "bad.json")
+    assert lab.main(["--validate", p2], env=env, limits=False) == 1
     assert "naked_short" in json.loads(capsys.readouterr().out)["reason"]
-    assert lab.main(["--status", "--data", str(env.data_dir)]) == 0
+    assert lab.main(["--status"], env=env, limits=False) == 0
     assert json.loads(capsys.readouterr().out)["n_trials"] == 60
-    p.write_text(json.dumps(put_spread()))
-    assert lab.main(["--dev", str(p), "--who", "cli", "--data", str(env.data_dir)]) == 0
+    assert lab.main(["--dev", p, "--who", "cli"], env=env, limits=False) == 0
     assert json.loads(capsys.readouterr().out)["dev"]["n_trades"] > 0
-    assert lab.main(["--promote", "--data", str(env.data_dir)]) == 0
+    assert lab.main(["--promote"], env=env, limits=False) == 0
     assert "skipped" in json.loads(capsys.readouterr().out)
+    assert lab.main(["--rescore"], env=env, limits=False) == 0
+    assert json.loads(capsys.readouterr().out) == []
+
+
+def test_cli_takes_the_round_lock_shared_with_lab_room(tmp_path, capsys, env):
+    from desk import lab_room
+    p = _write(tmp_path, put_spread())
+    with lab_room.round_lock(env) as got:
+        assert got
+        for argv in (["--dev", p, "--who", "cli"], ["--promote"], ["--rescore"]):
+            assert lab.main(argv, env=env, limits=False) == 0
+            assert json.loads(capsys.readouterr().out) == {"skipped": "another round is running"}
+        assert lab.read_log(env) == [] and lab.n_trials(env) == 60                   # 什么都没写
+        assert lab.main(["--status"], env=env, limits=False) == 0                    # 只读的不加锁
+        capsys.readouterr()
+    assert lab.main(["--dev", p, "--who", "cli"], env=env, limits=False) == 0        # 锁放开后可以跑
+    assert len(lab.read_log(env)) == 1
+    capsys.readouterr()
+    with lab_room.round_lock(env) as got:                                              # CLI 跑完把锁放了
+        assert got
+
+
+def test_cli_applies_limits_and_reexecs_with_lean_env(tmp_path, capsys, env, monkeypatch):
+    from desk import lab_room
+    p = _write(tmp_path, put_spread())
+    monkeypatch.setenv("DESK_DATA", str(env.data_dir))
+    applied = []
+    monkeypatch.setattr(lab_room, "apply_limits", lambda mb, niceness=19: applied.append(mb))
+    for k in lab_room.LEAN_ENV:
+        monkeypatch.setenv(k, lab_room.LEAN_ENV[k])
+    monkeypatch.delenv(lab.LEAN_REEXEC_FLAG, raising=False)
+    assert lab.main(["--dev", p, "--who", "cli"], env=env, limits=True) == 0          # 精简环境变量齐全：不重启，直接加限制后跑
+    capsys.readouterr()
+    assert applied == [lab_room.DEFAULTS["mem_limit_mb"]]
+    assert lab.main(["--status"], env=env, limits=True) == 0 and len(applied) == 1     # 只读命令不加限制
+    capsys.readouterr()
+    # 缺精简环境变量 + 真正的命令行入口（env=None）：带上环境变量重启自己一次（execve 被替换成记录）
+    monkeypatch.delenv("ARROW_DEFAULT_MEMORY_POOL")
+    seen = {}
+
+    class Stop(Exception):
+        pass
+
+    def fake_execve(path, argv, envp):
+        seen.update(argv=argv, envp=envp)
+        raise Stop()
+    monkeypatch.setattr(os, "execve", fake_execve)
+    with pytest.raises(Stop):
+        lab.main(["--promote"], limits=True)
+    assert seen["argv"][1:4] == ["-m", "desk.options_lab", "--promote"] and seen["envp"]["ARROW_DEFAULT_MEMORY_POOL"] == "system" and seen["envp"][lab.LEAN_REEXEC_FLAG] == "1"
+    monkeypatch.setenv(lab.LEAN_REEXEC_FLAG, "1")                                      # 已经重启过：不再重启（不会死循环）
+    monkeypatch.setattr(lab, "default_env", lambda: env)
+    assert lab.main(["--promote"], limits=True) == 0
+    assert len(applied) == 2

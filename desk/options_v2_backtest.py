@@ -463,6 +463,12 @@ def find_exit(strat: dict, legs: list[dict], ser: list[dict], entry_idx: int, or
         cost, flag = cost_at(legs, [(a, b, 0) for a, b in quotes], L_ps)
         return {"idx": k, "reason": "open_at_end", "quotes": quotes, "flag": flag, "never": False, "marks": marks,
                 "last_full": last_full, "missing": 0}
+    if entry_idx == n_days - 1 and strat.get("close_entry_day_at_end"):
+        # 卡 L1 第 2 轮：开发段最后一天（数据截止日）才入场的仓位，用入场当天的同一组报价按主口径平掉（只有研究室开发段打开这个开关）
+        quotes = [(l["bid"], l["ask"]) for l in legs]
+        _, flag = cost_at(legs, [(a, b, 0) for a, b in quotes], L_ps)
+        return {"idx": entry_idx, "reason": "open_at_end", "quotes": quotes, "flag": flag, "never": False, "marks": marks,
+                "last_full": None, "missing": 0}
     # 之后再也没有完整可用报价：从“第一天开始没有报价”那天起按最大亏损记（不拖到到期）
     first_dark = (last_full[0] if last_full else entry_idx) + 1
     return {"idx": min(first_dark, n_days - 1), "reason": "no_more_quotes", "quotes": None, "flag": False,

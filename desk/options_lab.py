@@ -41,17 +41,28 @@ agents 提方案（dict）-> 代码校验 + 查重 -> 开发段真实报价回�
 
 ========================================================================================================================
 三段数据（§1）：开发段 2024-01-02 → 2025-06-30（agents 每轮可看，打分只用它）；金库段 2025-07-01 → 最近（agents 永远看不到）。
-run_dev 的硬锁：入场只在开发段；报价只加载到"开发段最后一个交易日之后再 max_hold_days 个交易日"（财报单 1 个）——
-  **为什么要多读这几天**：开发段最后几天开的仓位要平仓，平仓价必须有报价；多读的只是这些仓位的出场，入场、信号、
-  逐周盈亏（按入场周归属）都不碰 2025-07-01 之后的任何东西。月文件名晚于这个截止日的 parquet 根本不打开；打开的月文件里晚于截止日的行丢掉。
-  到截止日仓位仍没平：沿用 v2 引擎规则（最后一次完整报价平仓 open_at_end；一直没报价按最大亏损 no_more_quotes，保守）。
+run_dev 的硬锁（第 2 轮审计 #10）：入场只在开发段；日线和报价**只加载到 2025-06-30**（月文件名晚于 2025-06 的 parquet 根本不打开，
+  打开的月文件里晚于 06-30 的行丢掉）——run_dev 永远读不到 7 月及以后的任何报价。到 2025-06-30 仍没平的仓位**强制平仓**：
+  用 06-30 当天的主口径价格（卖 bid / 买 ask + 滑点 + 手续费）；那天没有完整新鲜报价 = 按最大亏损记（v2 引擎 open_at_end / no_more_quotes 规则）；
+  06-30 当天入场的仓位同一天按同一组报价平掉（strat["close_entry_day_at_end"]，只对研究室开发段打开）。
+
+样本门槛与打分口径（第 2 轮审计）：
+- 合格 = 开发段 ≥20 笔交易且 ≥10 个簇（簇按标的分别数）且数据完整。不合格：0 分，原因"样本太少"，照样写日志、照样记 1 次试验，不进"当前最好"、不能晋级。
+- 每次打分、每次晋级，都用**当前**试验次数 N 和**当前** V 重算日志里全部合格方案的去运气夏普 z；"当前最好" = 当前 z 的最大值（不用当时存的数）。
+  V = max(合格方案周夏普的样本方差, 1/(T−1))。晋级挑当前 z 最高的（不看得分）。每个方案的原始 SR、T、偏度、峰度都存在日志里。
+- 近似重复：新的合格方案的逐周盈亏和日志里任一方案相关系数 > 0.95，或成交明细完全相同 -> −0.5 分，原因"结果和已测方案几乎一样"（照样记试验，不能晋级）。
+- 暴跌罚分：对每个标的，两个暴跌窗口里持仓期间的亏损合计 ÷ 该标的平均最大亏损，单个标的封顶 5，各标的相加后总罚分封顶 5。
+- 晋级门槛：z ≥ 1.645（置信度 ≥ 95%）且全局 PBO ≤ 0.30。
+- 周盈亏 p 值用平稳块自助法（平均块长 4 周；装了 arch 就用 arch.bootstrap.StationaryBootstrap，没装用本文件自带实现）。
+- 数据不全（> 5% 的笔以没报价收尾）：状态 incomplete，0 分待定，不合格；补数据后 rescore_pending() 重算（不加试验次数，旧行保留、新行取代它）。
+- 金库考试出错：记 1 次试验 + 一行错误（vault_error），该哈希以后不再被晋级。
 
 统计口径（可核对的出处）：
 - Deflated Sharpe Ratio：Bailey & López de Prado (2014), "The Deflated Sharpe Ratio: Correcting for Selection Bias, Backtest Overfitting and
   Non-Normality", Journal of Portfolio Management 40(5), 94–107。见 deflated_sharpe()。
 - PBO（回测过拟合概率）、CSCV：Bailey, Borwein, López de Prado & Zhu (2017), "The Probability of Backtest Overfitting",
   Journal of Computational Finance 20(4), 39–69。见 pbo()。
-- 周块自助 p：v2 的 boot_p（H0 均值 = 0，按 ISO 日历周整周重抽，含空周）。
+- 周盈亏 p：Politis & Romano (1994) 平稳块自助法，H0 均值 = 0（去均值后重抽），按 ISO 日历周，含空周，平均块长 4 周。金库考试仍用 v2.evaluate 自带的整周自助 p（v2 登记的过关逻辑，不动）。
 """
 from __future__ import annotations
 
@@ -115,9 +126,16 @@ ALLOWED_KEYS = {"name", "why", "underlyings", "legs", "dte", "entry", "exit_dte"
 # 打分（§2.5）
 DSR_CAP = 5.0
 COMPLEXITY_FREE, COMPLEXITY_COST = 3, 0.5
-CRASH_MULT, CRASH_PENALTY = 3.0, 2.0          # 任一暴跌窗口持仓盈亏 < −3 × 平均最大亏损 -> 一次性扣 2 分（toml/设计没给数，取 2）
-INVALID_POINTS, NO_DSR_POINTS = -1.0, -2.0    # 无效/重复 −1；跑了但没有交易 / 算不出 DSR（周盈亏方差为 0）−2
-PBO_BLOCKS, PBO_MAX = 8, 0.5
+CRASH_CAP = 5.0                               # 暴跌罚分：每个标的 min(5, 亏损÷平均最大亏损)，各标的相加后总计封顶 5
+INVALID_POINTS, NO_DSR_POINTS = -1.0, -2.0    # 无效/重复 −1；合格但算不出 DSR（周盈亏方差为 0）−2
+NEAR_DUP_POINTS, NEAR_DUP_CORR = -0.5, 0.95
+MIN_TRADES, MIN_CLUSTERS = 20, 10             # 开发段合格线
+REASON_SMALL, REASON_NEAR_DUP = "样本太少", "结果和已测方案几乎一样"
+REASON_INCOMPLETE = "数据不全，待补数据后重新打分"
+Z_PROMOTE, PROB_PROMOTE = 1.645, 0.95         # 晋级：置信度 ≥ 95%
+PBO_BLOCKS, PBO_MAX = 8, 0.30
+BOOT_MEAN_BLOCK, BOOT_N = 4, 10000
+LEAN_REEXEC_FLAG = "LAB_ROOM_REEXEC"
 EULER_GAMMA = 0.5772156649015329
 WEEKS_PER_YEAR = 52
 
@@ -407,6 +425,7 @@ def _validate(p) -> dict:
     cd = int(_on_grid(cd, COOLDOWN_GRID))
     if earn:
         ex = {"mode": "next_session_close"}
+        cd = 1                              # 财报单每季一笔，冷却天数引擎用不上：规范化成固定值，免得不同写法拿到不同哈希
     else:
         ed = p.get("exit_dte", DEFAULTS["exit_dte"])
         ed = _int_like(ed)
@@ -550,9 +569,56 @@ def pbo(matrix, S: int = PBO_BLOCKS) -> float | None:
     return below / n
 
 
+# ---------------------------------------------------------------- 平稳块自助法
+def _arch_bootstrap_cls():
+    try:
+        from arch.bootstrap import StationaryBootstrap
+        return StationaryBootstrap
+    except Exception:  # noqa: BLE001 - 没装 arch / 版本不兼容：用自带实现
+        return None
+
+
+def block_boot_p(x, mean_block: int = BOOT_MEAN_BLOCK, n: int = BOOT_N, seed: int = 0, impl: str | None = None) -> float | None:
+    """平稳块自助法（Politis & Romano 1994）的单边 p：H0 均值 = 0（先去均值再重抽），p = (#{重抽均值 ≥ 实际均值} + 1) / (n + 1)。
+    x = 按时间顺序的周盈亏（含空周）；块长几何分布、平均 mean_block 周，首尾相接（循环）。
+    impl = "arch"（arch.bootstrap.StationaryBootstrap）/ "own"（自带，向量化）/ None（装了 arch 就用 arch，否则自带）。少于 2 周 -> None。"""
+    a = np.asarray(x, float)
+    if len(a) < 2:
+        return None
+    if impl is None:
+        impl = "arch" if _arch_bootstrap_cls() is not None else "own"
+    obs = float(a.mean())
+    c = a - obs
+    if impl == "arch":
+        cls = _arch_bootstrap_cls()
+        if cls is None:
+            raise RuntimeError("arch is not importable")
+        bs = cls(mean_block, c, seed=seed)
+        m = np.asarray(bs.apply(lambda y: y.mean(), reps=n)).reshape(-1)
+    else:
+        rng = np.random.default_rng(seed)
+        T = len(c)
+        restart = rng.random((n, T)) < 1.0 / mean_block
+        restart[:, 0] = True
+        fresh = rng.integers(0, T, size=(n, T))
+        idx = np.empty((n, T), dtype=np.int64)
+        idx[:, 0] = fresh[:, 0]
+        for t in range(1, T):
+            idx[:, t] = np.where(restart[:, t], fresh[:, t], (idx[:, t - 1] + 1) % T)
+        m = c[idx].mean(axis=1)
+    return float((np.sum(m >= obs - 1e-12) + 1) / (n + 1))
+
+
 # ---------------------------------------------------------------- 研究日志
 def read_log(env: LabEnv | None = None) -> list[dict]:
+    """日志全部行（含被 rescore 取代的旧 incomplete 行；历史都在）。统计一律走 _eff() 过滤后的有效行。"""
     return _read(_env(env).log_path)
+
+
+def _eff(log: list[dict]) -> list[dict]:
+    """去掉被取代的行：新行的 supersedes = [旧行的 ts]，旧行（同一哈希）不再算数。"""
+    gone = {(e.get("hash"), t) for e in log for t in (e.get("supersedes") or [])}
+    return [e for e in log if (e.get("hash"), e.get("ts")) not in gone]
 
 
 def _ran(e: dict) -> bool:
@@ -560,31 +626,60 @@ def _ran(e: dict) -> bool:
     return bool(e.get("backtested")) and isinstance(e.get("dev"), dict) and isinstance(e.get("weekly"), list)
 
 
-def _sr_pop(log: list[dict]) -> list[float]:
-    out = []
-    for e in log:
-        if _ran(e):
-            sr = weekly_stats(e["weekly"])["sr"]
-            if sr is not None:
-                out.append(sr)
-    return out
+def _sample_ok(d: dict) -> bool:
+    return (d.get("n_trades") or 0) >= MIN_TRADES and (d.get("n_clusters") or 0) >= MIN_CLUSTERS
+
+
+def _incomplete(e: dict) -> bool:
+    return e.get("status") == "incomplete" or bool((e.get("dev") or {}).get("data_incomplete"))
+
+
+def _eligible(e: dict) -> bool:
+    """合格：跑过、数据完整、≥20 笔且 ≥10 簇。合格的才进 V、才有 z。"""
+    return _ran(e) and not _incomplete(e) and _sample_ok(e["dev"])
+
+
+def _promotable(e: dict) -> bool:
+    return _eligible(e) and e.get("status") != "near_duplicate"
+
+
+def _raw_stats(e: dict) -> dict:
+    d = e["dev"]
+    if all(d.get(k) is not None for k in ("sr", "T", "skew", "kurt")):
+        return {"sr": d["sr"], "T": d["T"], "skew": d["skew"], "kurt": d["kurt"]}
+    return weekly_stats(e["weekly"])
 
 
 def _var_sr(srs: list[float], T: int) -> float:
-    """全部开发段回测的每周夏普的样本方差；不足 2 个时退回 1/(T−1)（iid 正态、真实夏普 ≈ 0 时夏普估计量的渐近方差）。"""
-    if len(srs) >= 2:
-        return float(np.var(srs, ddof=1))
-    return 1.0 / max(T - 1, 1)
+    """V = max(合格方案周夏普的样本方差, 1/(T−1))。后者是 iid 正态、真实夏普 ≈ 0 时夏普估计量的渐近方差，当下限，防止方案少时 V 虚低、门槛虚低。"""
+    floor = 1.0 / max(T - 1, 1)
+    return max(float(np.var(srs, ddof=1)), floor) if len(srs) >= 2 else floor
 
 
-def best_dev(env: LabEnv | None = None, log: list[dict] | None = None) -> dict | None:
-    """日志里开发段 DSR 最高的一行的 dev 指标（当时算的）；没有 -> None。"""
+def current_scores(log: list[dict], N: int) -> tuple[dict[str, dict], float]:
+    """日志里全部合格方案在**当前** N 和**当前** V 下的去运气夏普：({哈希: {z, prob, sr0, sr, T, promotable}}, V)。
+    V 用全部合格方案（含近似重复）的周夏普；T 取它们里最小的（门槛更高）。"""
+    elig = [(e, _raw_stats(e)) for e in _eff(log) if _eligible(e)]
+    elig = [(e, st) for e, st in elig if st["sr"] is not None]
+    if not elig:
+        return {}, 1.0 / max(len(DEV_WEEKS) - 1, 1)
+    T = min(int(st["T"]) for _, st in elig)
+    V = _var_sr([st["sr"] for _, st in elig], T)
+    out = {}
+    for e, st in elig:
+        d = deflated_sharpe(st["sr"], int(st["T"]), st["skew"], st["kurt"], N, V)
+        if d["z"] is not None:
+            out[e["hash"]] = {"z": d["z"], "prob": d["prob"], "sr0": d["sr0"], "sr": st["sr"], "T": st["T"], "promotable": _promotable(e)}
+    return out, V
+
+
+def best_dev(env: LabEnv | None = None, log: list[dict] | None = None, N: int | None = None) -> dict | None:
+    """当前最好的方案：合格、非近似重复、当前 z 最高。{"hash","dsr"（= 当前 z）,"dsr_prob"}；没有 -> None。"""
+    env = _env(env)
     log = read_log(env) if log is None else log
-    best = None
-    for e in log:
-        if _ran(e) and e["dev"].get("dsr") is not None and (best is None or e["dev"]["dsr"] > best["dsr"]):
-            best = e["dev"]
-    return best
+    sc, _ = current_scores(log, n_trials(env) if N is None else N)
+    best = max(((v["z"], h, v["prob"]) for h, v in sc.items() if v["promotable"]), default=None)
+    return None if best is None else {"hash": best[1], "dsr": best[0], "dsr_prob": best[2]}
 
 
 def brief_spec(norm: dict | None) -> str:
@@ -593,47 +688,66 @@ def brief_spec(norm: dict | None) -> str:
 
 
 def top_dev(k: int = 5, env: LabEnv | None = None, log: list[dict] | None = None) -> list[dict]:
-    """日志里开发段 DSR 最高的 k 个方案（跑过回测、DSR 算得出），只含开发段数字：
-    {"hash","who","brief","n_trades","dsr","boot_p","total_pnl","worst","points"}。金库数字不在这里（也不会进来）。"""
+    """当前 z 最高的 k 个合格方案（只含开发段数字；金库数字不在这里）：
+    {"hash","who","brief","n_trades","dsr"（= 当前 z）,"boot_p","total_pnl","worst","points"}。"""
+    env = _env(env)
     log = read_log(env) if log is None else log
+    sc, _ = current_scores(log, n_trials(env))
+    by = {e["hash"]: e for e in _eff(log) if _ran(e)}
     rows = []
-    for e in log:
-        if _ran(e) and e["dev"].get("dsr") is not None:
-            d = e["dev"]
-            rows.append({"hash": e["hash"], "who": e.get("who"), "brief": _brief(e.get("spec")), "n_trades": d["n_trades"],
-                         "dsr": d["dsr"], "boot_p": d.get("boot_p"), "total_pnl": d["total_pnl"],
-                         "worst": (d.get("worst_trade") or {}).get("pnl"), "points": e.get("points")})
+    for h, v in sc.items():
+        if not v["promotable"]:
+            continue
+        e = by[h]
+        d = e["dev"]
+        rows.append({"hash": h, "who": e.get("who"), "brief": _brief(e.get("spec")), "n_trades": d["n_trades"], "dsr": v["z"],
+                     "boot_p": d.get("boot_p"), "total_pnl": d["total_pnl"], "worst": (d.get("worst_trade") or {}).get("pnl"), "points": e.get("points")})
     rows.sort(key=lambda r: -r["dsr"])
     return rows[:max(0, k)]
 
 
 def score_dev(result: dict | None, best_so_far: dict | float | None) -> tuple[float, str]:
-    """§2.5 开发段打分（返回 (分, 原因)）：
-    分 = clip(DSR − 当前最好的 DSR, ±5) − 0.5 × max(0, 复杂度 − 3) − 暴跌罚分；格式错 / 越界 / 重复 = −1。
-    best_so_far = 当前最好方案的 dev 指标 dict（取 "dsr"）或数字；没有最好方案 = 以 DSR 0（刚好超过去膨胀基准）为基线。
-    复杂度 = 入场条件数 + 腿数。暴跌罚分：两个暴跌窗口里任一个的持仓期间盈亏 < −3 × 平均最大亏损 -> 扣 2 分（一次）。
-    跑了但没有交易 / DSR 算不出 = −2（比无效更差：无效至少是格式问题，这是"提了个不交易的方案"）。"""
+    """开发段打分（返回 (分, 原因)）。result = 开发段指标 dict（见 _dev_metrics），其中 dsr = 该方案**当前**的去运气夏普 z。
+    - 无效 / 重复 = −1；数据不全 = 0（待定）；不合格（< 20 笔或 < 10 簇）= 0，原因"样本太少"；合格但 z 算不出 = −2。
+    - 否则 分 = clip(z − 当前最好的 z, ±5) − 0.5 × max(0, 复杂度 − 3) − 暴跌罚分；复杂度 = 入场条件数 + 腿数。
+    - 暴跌罚分：每个标的 min(5, 两个暴跌窗口里持仓期间的亏损合计 ÷ 该标的平均最大亏损)，各标的相加，总罚分封顶 5
+      （result["crash_by_und"] = {标的: {"loss", "avg_max_loss"}}；没有这个字段就用整体的 overlap / avg_max_loss 当作一个标的）。
+    best_so_far = 当前最好方案的 z（数字，或带 "dsr" 键的 dict）；没有最好方案 = 基线 0。原因里的置信度 = Φ(z)。"""
     if result is None or result.get("invalid"):
         return INVALID_POINTS, f"invalid: {(result or {}).get('invalid') or 'invalid proposal'}"
-    dsr = result.get("dsr")
-    if dsr is None:
-        return NO_DSR_POINTS, "no measurable DSR (no trades or zero weekly variance)"
+    if result.get("data_incomplete"):
+        return 0.0, REASON_INCOMPLETE
+    if not _sample_ok(result):
+        return 0.0, REASON_SMALL
+    z = result.get("dsr")
+    if z is None:
+        return NO_DSR_POINTS, "no measurable 置信度 (zero weekly variance)"
     base = best_so_far.get("dsr") if isinstance(best_so_far, dict) else best_so_far
     base = 0.0 if base is None else float(base)
-    imp = max(-DSR_CAP, min(DSR_CAP, dsr - base))
+    imp = max(-DSR_CAP, min(DSR_CAP, z - base))
     cx = int(result.get("complexity", 0))
     cpen = COMPLEXITY_COST * max(0, cx - COMPLEXITY_FREE)
-    why = [f"DSR {dsr:+.2f} vs best {base:+.2f} -> {imp:+.2f}"]
+    why = [f"置信度 {NormalDist().cdf(z):.0%}（z {z:+.2f}）vs 当前最好 z {base:+.2f} -> {imp:+.2f}"]
     if cpen:
         why.append(f"complexity {cx} -> -{cpen:.2f}")
-    crash = 0.0
-    aml = result.get("avg_max_loss")
-    if aml:
-        bad = [k for k, v in (result.get("overlap") or {}).items() if v < -CRASH_MULT * aml]
-        if bad:
-            crash = CRASH_PENALTY
-            why.append(f"crash loss beyond {CRASH_MULT:g}x avg max loss in {', '.join(bad)} -> -{crash:.2f}")
+    crash = _crash_penalty(result)
+    if crash:
+        why.append(f"暴跌期间亏损 -> -{crash:.2f}")
     return round(imp - cpen - crash, 3), "; ".join(why)
+
+
+def _crash_penalty(result: dict) -> float:
+    by = result.get("crash_by_und")
+    if by is None:
+        aml = result.get("avg_max_loss")
+        loss = sum(max(0.0, -v) for v in (result.get("overlap") or {}).values())
+        by = {"ALL": {"loss": loss, "avg_max_loss": aml}} if aml else {}
+    tot = 0.0
+    for v in by.values():
+        aml = v.get("avg_max_loss")
+        if aml and aml > 0:
+            tot += min(CRASH_CAP, max(0.0, v.get("loss", 0.0)) / aml)
+    return min(CRASH_CAP, tot)
 
 
 # ---------------------------------------------------------------- 条件（入场信号）
@@ -711,7 +825,7 @@ def cond_signal(strat: dict, ctx: LabCtx, i: int) -> bool | None:
 
 
 # ---------------------------------------------------------------- 方案 -> v2 引擎的 strategy dict
-def to_strategy(norm: dict) -> dict:
+def to_strategy(norm: dict, close_last_day: bool = False) -> dict:
     h = spec_hash(norm)
     dte = norm["dte"]
     s = {"id": f"LAB_{h}", "underlyings": list(norm["underlyings"]), "legs": [dict(l) for l in norm["legs"]],
@@ -721,6 +835,8 @@ def to_strategy(norm: dict) -> dict:
          "cooldown_days": norm["cooldown_days"]}
     if norm["kind"] == "debit" and norm["structure"] == "vertical":
         s["net_debit_ok"] = True
+    if close_last_day:
+        s["close_entry_day_at_end"] = True
     ex = norm["exit"]
     if ex["mode"] == "next_session_close":
         s["exit"] = "next_session_close"
@@ -738,9 +854,9 @@ def to_strategy(norm: dict) -> dict:
 
 # ---------------------------------------------------------------- 回测驱动（共用：开发段 / 金库）
 def _simulate(norm: dict, env: LabEnv, spec: dict, entry_first: str | None = None, entry_last: str | None = None) -> dict:
-    """entry_last 给了（开发段）：报价和日线只保留到 entry_last 之后再 max_hold_days 个交易日（财报单 1 个），
-    入场只到 entry_last。没给（金库）：全部数据，入场从样本起点到最新（金库成绩单靠入场日切分）。"""
-    strat = to_strategy(norm)
+    """entry_last 给了（开发段）：日线和报价只加载到 entry_last（含）当天，入场也只到 entry_last；那天仍没平的仓位由 v2 引擎按
+    entry_last 当天的主口径价格强制平仓（没有完整新鲜报价 = 最大亏损）。没给（金库）：全部数据，入场从样本起点到最新。"""
+    strat = to_strategy(norm, close_last_day=entry_last is not None)
     root = env.opra
     earn_mode = strat["entry"] == "earnings_eve"
     earn = v2.load_earnings(env.earnings_path) if earn_mode else None
@@ -762,8 +878,7 @@ def _simulate(norm: dict, env: LabEnv, spec: dict, entry_first: str | None = Non
         days = sorted(set(adj_d) & set(raw_d))
         last_day = None
         if entry_last is not None:
-            allow = 1 if earn_mode else strat["max_hold_days"]
-            days = days[:bisect_right(days, entry_last) + allow]
+            days = days[:bisect_right(days, entry_last)]
             last_day = days[-1] if days else None
             if last_day is None:
                 out["per_und"][u] = {"status": "no_data", "trades": 0}
@@ -805,36 +920,60 @@ def _simulate(norm: dict, env: LabEnv, spec: dict, entry_first: str | None = Non
     return out
 
 
-def _dev_metrics(sim: dict, norm: dict, srs_before: list[float], n_trials_now: int) -> tuple[dict, list[float]]:
+def _dev_metrics(sim: dict, norm: dict) -> tuple[dict, list[float], list[float]]:
+    """开发段指标（不含 DSR：DSR 要用日志里全部合格方案的当前 N、V，在 _score_new 里算）。返回 (指标, 逐周盈亏（取两位小数，写日志用）, 逐周盈亏（原值）)。"""
     trades = sim["trades"]
     wk = v2.weekly_pnl(trades, DEV_WEEKS)
     wvals = [wk[w] for w in DEV_WEEKS]
     st = weekly_stats(wvals)
-    var_sr = _var_sr(srs_before + ([st["sr"]] if st["sr"] is not None else []), len(DEV_WEEKS))
-    d = {"sr0": None, "z": None, "prob": None}
-    if st["sr"] is not None:
-        d = deflated_sharpe(st["sr"], st["T"], st["skew"], st["kurt"], n_trials_now, var_sr)
     cl = sum(len(v1.clusters([t["entry_idx"] for t in trades if t["und"] == u])) for u in {t["und"] for t in trades})
     rets = [t["ret"] for t in trades]
     reasons = Counter(t["reason"] for t in trades)
     bad = reasons.get("no_more_quotes", 0) + reasons.get("stop_on_missing", 0)
     worst = min(trades, key=lambda t: t["pnl"]) if trades else None
+    crash_by_und = {}
+    for u in sorted({t["und"] for t in trades}):
+        tu = [t for t in trades if t["und"] == u]
+        loss = sum(max(0.0, -v2.window_pnl(tu, a, b)["overlap_pnl"]) for a, b in v2.CRASH_WINDOWS.values())
+        aml = float(np.mean([t["max_loss"] for t in tu]))
+        crash_by_und[u] = {"loss": round(loss, 2), "avg_max_loss": round(aml, 2), "ratio": round(loss / aml, 4) if aml > 0 else None}
     return {
         "n_trades": len(trades), "n_clusters": cl,
         "avg_ret": float(np.mean(rets)) if rets else None,
         "total_pnl": round(sum(t["pnl"] for t in trades), 2),
-        "boot_p": v2.boot_p(wvals) if trades else None, "tstat": v2.tstat(wvals) if trades else None,
-        "sharpe_wk": st["sr"], "sharpe_ann": (st["sr"] * math.sqrt(WEEKS_PER_YEAR)) if st["sr"] is not None else None,
-        "skew": st["skew"], "kurt": st["kurt"], "n_weeks": st["T"],
-        "n_trials": n_trials_now, "var_sr": var_sr, "sr0": d["sr0"], "dsr": d["z"], "dsr_prob": d["prob"],
+        "boot_p": block_boot_p(wvals) if trades else None, "tstat": v2.tstat(wvals) if trades else None,
+        "sr": st["sr"], "T": st["T"], "skew": st["skew"], "kurt": st["kurt"],             # 原始统计量，每次重算 DSR 都从这里取
+        "sharpe_wk": st["sr"], "sharpe_ann": (st["sr"] * math.sqrt(WEEKS_PER_YEAR)) if st["sr"] is not None else None, "n_weeks": st["T"],
+        "n_trials": None, "var_sr": None, "sr0": None, "dsr": None, "dsr_prob": None,   # dsr = 去运气夏普 z；dsr_prob = Φ(z)，只有合格方案才有
         "overlap": {k: v2.window_pnl(trades, a, b)["overlap_pnl"] for k, (a, b) in v2.CRASH_WINDOWS.items()},
+        "crash_by_und": crash_by_und,
         "worst_trade": ({"pnl": worst["pnl"], "ret": worst["ret"], "entry_date": worst["entry_date"], "und": worst["und"]} if worst else None),
         "avg_max_loss": float(np.mean([t["max_loss"] for t in trades])) if trades else None,
         "complexity": len(norm["conditions"]) + len(norm["legs"]),
         "reasons": dict(reasons), "n_no_more_quotes": reasons.get("no_more_quotes", 0), "n_stop_on_missing": reasons.get("stop_on_missing", 0),
+        "bad_frac": (bad / len(trades)) if trades else 0.0,
         "data_incomplete": bool(trades and bad / len(trades) > v2.INCOMPLETE_FRAC), "unresolved_quotes": sim["unresolved"],
         "per_und": sim["per_und"], "skips": dict(sim["skips"]),
-    }, [round(x, 2) for x in wvals]
+    }, [round(x, 2) for x in wvals], wvals
+
+
+def _trade_sig(trades: list[dict]) -> str:
+    rows = sorted((t["und"], t["entry_date"], t["exit_date"], t["legs"], round(t["pnl"], 2)) for t in trades)
+    return hashlib.sha256(json.dumps(rows, ensure_ascii=False).encode()).hexdigest()[:16]
+
+
+def _near_duplicate(wvals: list[float], sig: str, log: list[dict], h: str) -> dict | None:
+    """日志里（有效行、跑过回测的、哈希不同的）第一个和这个结果几乎一样的方案：成交明细完全相同，或逐周盈亏相关系数 > 0.95。"""
+    a = np.asarray(wvals, float)
+    for e in _eff(log):
+        if not _ran(e) or e.get("hash") == h:
+            continue
+        if sig and e.get("trade_sig") == sig:
+            return e
+        b = np.asarray(e["weekly"], float)
+        if len(b) == len(a) and a.std() > 1e-12 and b.std() > 1e-12 and float(np.corrcoef(a, b)[0, 1]) > NEAR_DUP_CORR:
+            return e
+    return None
 
 
 def _brief(norm: dict | None) -> str:
@@ -848,48 +987,106 @@ def _brief(norm: dict | None) -> str:
 
 
 # ---------------------------------------------------------------- 开发段
-def run_dev(p: dict, who: str, env: LabEnv | None = None, now: datetime | None = None) -> dict:
-    """校验 -> 查重 -> 开发段回测（只 2024-01-02 … 2025-06-30 入场）-> 记试验账本 -> 打分 -> 写研究日志。
-    返回 {"hash","valid","reason","duplicate","points","points_reason","dev"}（dev = 开发段指标；无效 / 重复时为 None）。
-    无效 -> −1；哈希和日志里已跑过的重复（不管谁提的）-> 不跑、不记试验、−1；引擎抛异常（不该发生）-> 记 error 行、不记试验、0 分。"""
-    env = _env(env)
-    ensure_ledger(env)
-    ts = _ts(now)
-    line = {"who": who, "ts": ts, "hash": None, "spec": None, "why": (p.get("why") if isinstance(p, dict) and isinstance(p.get("why"), str) else None),
-            "valid": False, "reason": "", "duplicate_of": None, "backtested": False, "dev": None, "weekly": None, "points": INVALID_POINTS, "points_reason": ""}
-    norm, reason = validate_proposal(p)
-    if norm is None:
-        line.update(reason=reason, points_reason=f"invalid: {reason}")
-        _append(env.log_path, line)
-        return _result(line)
-    h = spec_hash(norm)
-    line.update(hash=h, spec=norm, valid=True)
-    log = read_log(env)
-    first = next((e for e in log if e.get("hash") == h and e.get("backtested")), None)
-    if first:
-        line.update(duplicate_of={"who": first.get("who"), "ts": first.get("ts")}, reason="duplicate of an already-tested spec",
-                    points_reason="duplicate: not run, -1")
-        _append(env.log_path, line)
-        return _result(line)
+def _new_line(who: str, now, p=None, norm=None, h=None) -> dict:
+    return {"who": who, "ts": _ts(now), "hash": h, "spec": norm,
+            "why": (p.get("why") if isinstance(p, dict) and isinstance(p.get("why"), str) else None),
+            "valid": norm is not None, "reason": "", "duplicate_of": None, "backtested": False, "dev": None, "weekly": None,
+            "status": None, "points": INVALID_POINTS, "points_reason": ""}
+
+
+def _backtest_and_log(line: dict, env: LabEnv, now, count_trial: bool = True, supersedes: str | None = None) -> dict | None:
+    """跑开发段回测并按状态打分写日志。count_trial = False（rescore）不加试验次数。supersedes = 被取代的旧 incomplete 行的 ts。
+    返回结果 dict；rescore 时仍不完整 -> 不写新行，返回 None。"""
+    norm, h = line["spec"], line["hash"]
     spec = v2.load_spec(env.spec_path)
     try:
         sim = _simulate(norm, env, spec, entry_first=DEV_START, entry_last=DEV_END)
     except Exception as e:  # noqa: BLE001
-        line.update(reason=f"engine_error: {type(e).__name__}: {e}", points=0.0, points_reason="engine error (not counted as a trial)")
+        line.update(status="error", reason=f"engine_error: {type(e).__name__}: {e}", points=0.0, points_reason="engine error (not counted as a trial)")
         _append(env.log_path, line)
         return _result(line)
-    record_trial(env, "dev", who, h, now)
-    dev, weekly = _dev_metrics(sim, norm, _sr_pop(log), n_trials(env))
-    best = best_dev(log=log)
-    pts, why = score_dev(dev, best)
-    line.update(backtested=True, dev=dev, weekly=weekly, points=pts, points_reason=why)
+    if count_trial:
+        record_trial(env, "dev", line["who"], h, now)
+    N = n_trials(env)
+    dev, weekly, wvals = _dev_metrics(sim, norm)
+    dev["n_trials"] = N
+    if supersedes and dev["data_incomplete"]:
+        return None
+    log = read_log(env)
+    line.update(backtested=True, dev=dev, weekly=weekly, trade_sig=_trade_sig(sim["trades"]))
+    if supersedes:
+        line.update(supersedes=[supersedes], rescored=True)
+    if dev["data_incomplete"]:
+        line.update(status="incomplete", points=0.0, points_reason=REASON_INCOMPLETE)
+    elif not _sample_ok(dev):
+        line.update(status="ineligible", points=0.0, points_reason=REASON_SMALL, reason=f"{dev['n_trades']} trades / {dev['n_clusters']} clusters (need >= {MIN_TRADES} / >= {MIN_CLUSTERS})")
+    else:
+        dup = _near_duplicate(wvals, line["trade_sig"], log, h)
+        if dup is not None:
+            line.update(status="near_duplicate", points=NEAR_DUP_POINTS, points_reason=REASON_NEAR_DUP,
+                        near_duplicate_of={"hash": dup.get("hash"), "who": dup.get("who")})
+        else:
+            line["status"] = "scored"
+            sc, V = current_scores(log + [line], N)                    # 新方案也进 V；所有合格方案按当前 N、V 重算
+            me = sc.get(h)
+            if me is not None:
+                dev.update(var_sr=V, sr0=me["sr0"], dsr=me["z"], dsr_prob=me["prob"])
+            best_prev = max((v["z"] for k, v in sc.items() if k != h and v["promotable"]), default=None)
+            line["points"], line["points_reason"] = score_dev(dev, best_prev)
     _append(env.log_path, line)
     return _result(line)
 
 
+def run_dev(p: dict, who: str, env: LabEnv | None = None, now: datetime | None = None) -> dict:
+    """校验 -> 查重 -> 开发段回测（只 2024-01-02 … 2025-06-30 入场，只读到 06-30 的报价）-> 记试验账本 -> 打分 -> 写研究日志。
+    返回 {"hash","valid","reason","duplicate","status","points","points_reason","dev"}（dev = 开发段指标；无效 / 重复时为 None）。
+    状态 status：invalid / duplicate / error / incomplete（数据不全：0 分待定）/ ineligible（样本太少：0 分）/ near_duplicate（−0.5）/ scored。
+    无效 -> −1；哈希和日志里已跑过的重复（不管谁提的）-> 不跑、不记试验、−1；引擎抛异常（不该发生）-> 记 error 行、不记试验、0 分；
+    其余（含 incomplete / ineligible / near_duplicate）都记 1 次试验。"""
+    env = _env(env)
+    ensure_ledger(env)
+    norm, reason = validate_proposal(p)
+    if norm is None:
+        line = _new_line(who, now, p)
+        line.update(status="invalid", reason=reason, points_reason=f"invalid: {reason}")
+        _append(env.log_path, line)
+        return _result(line)
+    h = spec_hash(norm)
+    line = _new_line(who, now, p, norm, h)
+    first = next((e for e in read_log(env) if e.get("hash") == h and e.get("backtested")), None)
+    if first:
+        line.update(status="duplicate", duplicate_of={"who": first.get("who"), "ts": first.get("ts")}, reason="duplicate of an already-tested spec",
+                    points_reason="duplicate: not run, -1")
+        _append(env.log_path, line)
+        return _result(line)
+    return _backtest_and_log(line, env, now)
+
+
 def _result(line: dict) -> dict:
     return {"hash": line["hash"], "valid": line["valid"], "reason": line["reason"], "duplicate": bool(line["duplicate_of"]),
-            "points": line["points"], "points_reason": line["points_reason"], "dev": line["dev"]}
+            "status": line.get("status"), "points": line["points"], "points_reason": line["points_reason"], "dev": line["dev"]}
+
+
+def pending_rescore(env: LabEnv | None = None) -> list[dict]:
+    """数据不全（status = incomplete）、还没被 rescore 取代的方案：[{"hash","who","ts","bad_frac"}]。补完数据后调 rescore_pending()。"""
+    return [{"hash": e["hash"], "who": e.get("who"), "ts": e.get("ts"), "bad_frac": e["dev"].get("bad_frac")}
+            for e in _eff(read_log(env)) if _ran(e) and _incomplete(e)]
+
+
+def rescore_pending(env: LabEnv | None = None, now: datetime | None = None) -> list[dict]:
+    """重新回测每个 incomplete 方案（补数据之后）。不加试验次数。仍不完整 -> 日志不动（返回 status incomplete）；
+    完整了 -> 追加新行取代旧的 incomplete 行（旧行留在日志里当历史）并按新状态打分。返回 [{"hash","status","points","points_reason"}]。"""
+    env = _env(env)
+    ensure_ledger(env)
+    out = []
+    for pend in pending_rescore(env):
+        old = next(e for e in _eff(read_log(env)) if e.get("hash") == pend["hash"] and _ran(e) and _incomplete(e))
+        line = _new_line(old.get("who", "?"), now, None, old["spec"], old["hash"])
+        line["why"] = old.get("why")
+        res = _backtest_and_log(line, env, now, count_trial=False, supersedes=old["ts"])
+        out.append({"hash": pend["hash"], "status": "incomplete", "points": 0.0, "points_reason": REASON_INCOMPLETE} if res is None
+                   else {"hash": pend["hash"], "status": res["status"], "points": res["points"], "points_reason": res["points_reason"]})
+    return out
 
 
 def vaulted_hashes(env: LabEnv | None = None) -> dict[str, dict]:
@@ -897,15 +1094,16 @@ def vaulted_hashes(env: LabEnv | None = None) -> dict[str, dict]:
 
 
 def history_for(who: str, n: int = 10, env: LabEnv | None = None) -> str:
-    """who 最近 n 个提案的紧凑文字摘要（给提示词用）：方案、开发段数字、得分。金库只给"过 / 没过"，**永远不含金库数字**。"""
+    """who 最近 n 个提案的紧凑文字摘要（给提示词用）：方案、开发段数字、得分。金库只给"过 / 没过"（或"出错"），**永远不含金库数字**。"""
     env = _env(env)
     vault = vaulted_hashes(env)
-    mine = [e for e in read_log(env) if e.get("who") == who][-max(0, n):]
+    mine = [e for e in _eff(read_log(env)) if e.get("who") == who][-max(0, n):]
     if not mine:
         return "(no proposals yet)"
     lines = []
     for e in mine:
         head = f"- {str(e.get('ts', ''))[:10]} {_brief(e.get('spec'))}: " if e.get("spec") else f"- {str(e.get('ts', ''))[:10]} (invalid proposal): "
+        st = e.get("status")
         if not e.get("valid"):
             body = f"INVALID, {e.get('reason', '')}"
         elif e.get("duplicate_of"):
@@ -914,27 +1112,32 @@ def history_for(who: str, n: int = 10, env: LabEnv | None = None) -> str:
             body = f"not scored ({e.get('reason', '')})"
         else:
             d = e["dev"]
+            ov = list(d["overlap"].values())
             if d["n_trades"] == 0:
                 body = "0 trades in dev"
             else:
-                ov = list(d["overlap"].values())
-                dsr = "n/a" if d["dsr"] is None else format(d["dsr"], "+.2f")
                 body = (f"{d['n_trades']} trades ({d['n_clusters']} clusters), avg ret on max loss {d['avg_ret']:+.1%}, total ${d['total_pnl']:+.0f}/contract, "
-                        f"weekly-block p {d['boot_p']:.2f}, DSR {dsr}, "
-                        f"crash overlap ${ov[0]:+.0f}/${ov[1]:+.0f}, worst ${d['worst_trade']['pnl']:+.0f}")
-            body += f"; points {e['points']:+.2f} ({e.get('points_reason', '')})"
-            if d.get("data_incomplete"):
-                body += "; WARNING: many trades closed without exit quotes"
-        if e.get("hash") in vault:
-            body += f"; vault: {'PASSED' if vault[e['hash']].get('passed') else 'FAILED'}"
+                        f"weekly-block p {d['boot_p']:.2f}, crash overlap ${ov[0]:+.0f}/${ov[1]:+.0f}, worst ${d['worst_trade']['pnl']:+.0f}")
+            if st == "incomplete" or d.get("data_incomplete"):
+                body += "; PENDING: too many trades closed without exit quotes, 0 points until more data arrives"
+            elif st == "ineligible" or not _sample_ok(d):
+                body += f"; {REASON_SMALL} (need >= {MIN_TRADES} trades and >= {MIN_CLUSTERS} clusters), 0 points"
+            elif st == "near_duplicate":
+                body += f"; {REASON_NEAR_DUP}, points {e['points']:+.2f}"
+            else:
+                conf = "n/a" if d.get("dsr_prob") is None else f"{d['dsr_prob']:.0%}"
+                body += f"; 置信度 {conf} when scored; points {e['points']:+.2f} ({e.get('points_reason', '')})"
+        v = vault.get(e.get("hash"))
+        if v:
+            body += "; vault: ERROR (not retried)" if v.get("vault_error") else f"; vault: {'PASSED' if v.get('passed') else 'FAILED'}"
         lines.append(head + body)
     return "\n".join(lines)
 
 
 def current_pbo(env: LabEnv | None = None, log: list[dict] | None = None) -> float | None:
-    """全部（有交易的）开发段回测的逐周盈亏矩阵的 PBO。"""
+    """全部（有交易、数据完整的）开发段回测的逐周盈亏矩阵的 PBO。"""
     log = read_log(env) if log is None else log
-    rows = [e["weekly"] for e in log if _ran(e) and e["dev"]["n_trades"] > 0 and len(e["weekly"]) == len(DEV_WEEKS)]
+    rows = [e["weekly"] for e in _eff(log) if _ran(e) and not _incomplete(e) and e["dev"]["n_trades"] > 0 and len(e["weekly"]) == len(DEV_WEEKS)]
     return pbo(rows) if len(rows) >= 2 else None
 
 
@@ -942,35 +1145,44 @@ def current_pbo(env: LabEnv | None = None, log: list[dict] | None = None) -> flo
 def vault_exam(h: str, env: LabEnv | None = None, now: datetime | None = None) -> dict:
     """金库考试：2025-07-01 … 最新，v2 影子档过关逻辑（v2.evaluate：考试段主口径总盈亏 > 0、考试段簇数 ≥ 10、整样本净盈亏 > 0 且开发段总盈亏 > 0、
     考试段周块自助 p < 0.10、不是"好得离谱"），再加完整性闸门（> 5% 的笔以没报价收尾 = 不过）。全局 Bonferroni（0.05 / 累计试验次数）只报告不强求。
-    一个哈希只考一次（再考直接返回上次结果，不加试验）。**返回值只有 {"hash","passed"}**；全部数字写 vault.jsonl 和 reports/lab_vault_<hash>.md，给人看。"""
+    一个哈希只考一次（再考直接返回上次结果，不加试验）。**返回值只有 {"hash","passed"}**；全部数字写 vault.jsonl 和 reports/lab_vault_<hash>.md，给人看。
+    考试过程出错：试验次数照记（考试开始时就记了），vault.jsonl 追加一行 {"vault_error": true, "error": ...}，该哈希以后不再被晋级，然后把异常抛出去。"""
     env = _env(env)
     ensure_ledger(env)
     done = vaulted_hashes(env).get(h)
     if done:
-        return {"hash": h, "passed": bool(done["passed"])}
-    ent = next((e for e in read_log(env) if e.get("hash") == h and _ran(e)), None)
+        return {"hash": h, "passed": bool(done.get("passed")) and not done.get("vault_error")}
+    ent = next((e for e in _eff(read_log(env)) if e.get("hash") == h and _ran(e)), None)
     if ent is None:
         raise ValueError(f"no dev-tested proposal with hash {h}")
     norm = ent["spec"]
-    spec = v2.load_spec(env.spec_path)
     record_trial(env, "vault", ent.get("who", "?"), h, now)
-    sim = _simulate(norm, env, spec)
-    trades = sim["trades"]
-    days_end = sim["last_day"] or VAULT_START
-    weeks = v2.weeks_between(VAULT_START, days_end) if days_end >= VAULT_START else []
-    ev = v2.evaluate(sim["strat"], "POOL", trades, list(range(sim["n_sig"])), dict(sim["skips"]), spec, weeks=weeks)
-    reasons = Counter(t["reason"] for t in trades)
-    bad = reasons.get("no_more_quotes", 0) + reasons.get("stop_on_missing", 0)
-    complete = not (trades and bad / len(trades) > v2.INCOMPLETE_FRAC)
-    passed = bool(ev["shadow_pass"] and complete)
-    nt = n_trials(env)
-    bonf = 0.05 / nt
-    p = ev["test_week_boot_p"]
-    rec = {"hash": h, "who": ent.get("who"), "ts": _ts(now), "iso_week": v2.week_key(_now(now).date().isoformat()), "passed": passed,
-           "complete": complete, "n_trials": nt, "bonferroni": bonf, "bonferroni_ok": bool(p is not None and p < bonf),
-           "spec": norm, "eval": ev, "per_und": sim["per_und"], "unresolved_quotes": sim["unresolved"]}
+    try:
+        spec = v2.load_spec(env.spec_path)
+        sim = _simulate(norm, env, spec)
+        trades = sim["trades"]
+        days_end = sim["last_day"] or VAULT_START
+        weeks = v2.weeks_between(VAULT_START, days_end) if days_end >= VAULT_START else []
+        ev = v2.evaluate(sim["strat"], "POOL", trades, list(range(sim["n_sig"])), dict(sim["skips"]), spec, weeks=weeks)
+        reasons = Counter(t["reason"] for t in trades)
+        bad = reasons.get("no_more_quotes", 0) + reasons.get("stop_on_missing", 0)
+        complete = not (trades and bad / len(trades) > v2.INCOMPLETE_FRAC)
+        passed = bool(ev["shadow_pass"] and complete)
+        nt = n_trials(env)
+        bonf = 0.05 / nt
+        p = ev["test_week_boot_p"]
+        rec = {"hash": h, "who": ent.get("who"), "ts": _ts(now), "iso_week": v2.week_key(_now(now).date().isoformat()), "passed": passed,
+               "complete": complete, "n_trials": nt, "bonferroni": bonf, "bonferroni_ok": bool(p is not None and p < bonf),
+               "spec": norm, "eval": ev, "per_und": sim["per_und"], "unresolved_quotes": sim["unresolved"]}
+    except Exception as e:  # noqa: BLE001
+        _append(env.vault_path, {"hash": h, "who": ent.get("who"), "ts": _ts(now), "iso_week": v2.week_key(_now(now).date().isoformat()),
+                                 "passed": False, "vault_error": True, "error": f"{type(e).__name__}: {e}"[:300]})
+        raise
     _append(env.vault_path, rec)
-    _write_vault_report(env, rec)
+    try:
+        _write_vault_report(env, rec)
+    except Exception:  # noqa: BLE001 - 报告写不出来不影响已经落盘的考试结果
+        pass
     return {"hash": h, "passed": passed}
 
 
@@ -1000,9 +1212,11 @@ def _write_vault_report(env: LabEnv, rec: dict) -> Path:
 
 
 def weekly_promotion(env: LabEnv | None = None, now: datetime | None = None) -> dict:
-    """每周最多 1 个方案进金库（读 vault.jsonl 的 iso_week 强制）：候选 = 还没考过的、跑过开发段的方案；
-    按**现在**的试验次数和方差重算 DSR（试验越多门槛越高），留下 DSR > 0 的，全局 PBO（所有有交易的开发段回测）必须 < 0.5（算不出 = 不晋级），
-    在剩下的里取日志里开发段得分最高的（同分取 DSR 高的）-> vault_exam。返回 {"hash","passed"}（晋级了）或 {"skipped": 原因}。"""
+    """每周最多 1 个方案进金库（读 vault.jsonl 的 iso_week 强制；出错的考试也占这一周）。
+    候选 = 合格（≥20 笔、≥10 簇、数据完整）、不是近似重复、还没考过（含 vault_error）的方案；
+    用**现在**的试验次数 N 和 V 重算全部合格方案的去运气夏普 z，留下 z ≥ 1.645（置信度 ≥ 95%）的；
+    全局 PBO（所有有交易的开发段回测）必须 ≤ 0.30（算不出 = 不晋级）；在剩下的里取当前 z 最高的（不看得分）-> vault_exam。
+    返回 {"hash","passed"}（晋级了）、{"skipped": 原因}、或 {"error": ..., "vault_error_hash": h}（考试出错，该哈希以后不再晋级）。"""
     env = _env(env)
     ensure_ledger(env)
     wk = v2.week_key(_now(now).date().isoformat())
@@ -1010,65 +1224,83 @@ def weekly_promotion(env: LabEnv | None = None, now: datetime | None = None) -> 
     if any(v.get("iso_week") == wk for v in vault.values()):
         return {"skipped": f"already promoted in {wk}"}
     log = read_log(env)
-    ran = [e for e in log if _ran(e)]
-    srs = _sr_pop(log)
-    nt = n_trials(env)
-    var = _var_sr(srs, len(DEV_WEEKS))
-    cands = []
-    for e in ran:
-        if e["hash"] in vault or e["dev"]["n_trades"] == 0:
-            continue
-        st = weekly_stats(e["weekly"])
-        if st["sr"] is None:
-            continue
-        d = deflated_sharpe(st["sr"], st["T"], st["skew"], st["kurt"], nt, var)
-        if d["z"] is not None and d["z"] > 0:
-            cands.append((e["points"], d["z"], e["hash"]))
+    sc, _ = current_scores(log, n_trials(env))
+    cands = sorted(((v["z"], h) for h, v in sc.items()
+                    if v["promotable"] and h not in vault and v["z"] >= Z_PROMOTE and v["prob"] >= PROB_PROMOTE), reverse=True)
     if not cands:
-        return {"skipped": "no unvaulted candidate with DSR > 0"}
+        return {"skipped": f"no unvaulted candidate with 置信度 >= {PROB_PROMOTE:.0%} (z >= {Z_PROMOTE})"}
     pb = current_pbo(log=log)
-    if pb is None or pb >= PBO_MAX:
-        return {"skipped": f"PBO {'n/a' if pb is None else format(pb, '.2f')} not < {PBO_MAX}"}
-    cands.sort(reverse=True)
-    return vault_exam(cands[0][2], env, now)
+    if pb is None or pb > PBO_MAX:
+        return {"skipped": f"PBO {'n/a' if pb is None else format(pb, '.2f')} not <= {PBO_MAX}"}
+    h = cands[0][1]
+    try:
+        return vault_exam(h, env, now)
+    except Exception as e:  # noqa: BLE001 - vault_exam 已经记了试验和错误行；这里只负责不把异常抛给调用方的主流程
+        return {"error": f"vault_error: {type(e).__name__}: {e}"[:200], "vault_error_hash": h}
 
 
 def status(env: LabEnv | None = None) -> dict:
     """给人看的概览（只含计数和过 / 没过，不含金库数字）。"""
     env = _env(env)
-    log = read_log(env)
+    raw = read_log(env)
+    eff = _eff(raw)
     vault = vaulted_hashes(env)
-    best = best_dev(log=log)
-    return {"n_trials": n_trials(env), "proposals": len(log), "invalid": sum(1 for e in log if not e.get("valid")),
-            "duplicates": sum(1 for e in log if e.get("duplicate_of")), "backtested": sum(1 for e in log if _ran(e)),
-            "best_dev_dsr": None if best is None else best["dsr"], "pbo": current_pbo(log=log),
-            "vault_exams": len(vault), "vault_passed": sum(1 for v in vault.values() if v.get("passed")),
+    best = best_dev(log=raw, env=env)
+    return {"n_trials": n_trials(env), "proposals": len(raw), "invalid": sum(1 for e in raw if not e.get("valid")),
+            "duplicates": sum(1 for e in raw if e.get("duplicate_of")), "backtested": sum(1 for e in eff if _ran(e)),
+            "eligible": sum(1 for e in eff if _eligible(e)), "too_small": sum(1 for e in eff if _ran(e) and not _incomplete(e) and not _sample_ok(e["dev"])),
+            "near_duplicates": sum(1 for e in eff if e.get("status") == "near_duplicate"), "pending_rescore": len(pending_rescore(env)),
+            "best_dev_dsr": None if best is None else best["dsr"], "best_confidence": None if best is None else best["dsr_prob"],
+            "pbo": current_pbo(log=raw),
+            "vault_exams": sum(1 for v in vault.values() if not v.get("vault_error")), "vault_errors": sum(1 for v in vault.values() if v.get("vault_error")),
+            "vault_passed": sum(1 for v in vault.values() if v.get("passed") and not v.get("vault_error")),
             "last_vault_week": max((v.get("iso_week", "") for v in vault.values()), default=None)}
 
 
 # ---------------------------------------------------------------- CLI
-def main(argv=None) -> int:
+def main(argv=None, env: LabEnv | None = None, limits: bool = True) -> int:
+    """--dev / --promote / --rescore 会写日志和试验账本：和 desk.lab_room 同一把文件锁（拿不到 = 另一轮在跑，跳过）、同一套精简环境变量
+    （没带就带上重启一次）和同一个 RLIMIT_AS / nice（helper 都从 desk.lab_room 导入，不另写一份）。--validate / --status 只读，不加锁。"""
     ap = argparse.ArgumentParser(prog="desk.options_lab")
     g = ap.add_mutually_exclusive_group(required=True)
     g.add_argument("--validate", metavar="FILE", help="校验一个方案 json，打印规范化结果和哈希")
     g.add_argument("--dev", metavar="FILE", help="开发段回测一个方案 json（需要 --who）")
     g.add_argument("--promote", action="store_true", help="每周晋级：挑一个方案进金库考试（一周最多一个）")
+    g.add_argument("--rescore", action="store_true", help="补数据之后重算所有 incomplete 方案（不加试验次数）")
     g.add_argument("--status", action="store_true")
     ap.add_argument("--who", default="cli")
     ap.add_argument("--data", help="数据目录，默认 config 的 data")
     a = ap.parse_args(argv)
-    env = LabEnv.at(a.data) if a.data else default_env()
+    writes = bool(a.dev or a.promote or a.rescore)
+    if writes and limits and env is None:
+        from . import lab_room
+        missing = {k: v for k, v in lab_room.LEAN_ENV.items() if k not in os.environ}
+        if missing and not os.environ.get(LEAN_REEXEC_FLAG):
+            os.execve(sys.executable, [sys.executable, "-m", "desk.options_lab", *(sys.argv[1:] if argv is None else argv)],
+                      {**os.environ, **missing, LEAN_REEXEC_FLAG: "1"})
+    if env is None:
+        env = LabEnv.at(a.data) if a.data else default_env()
     if a.validate:
         norm, why = validate_proposal(json.loads(Path(a.validate).read_text()))
         print(json.dumps({"ok": norm is not None, "reason": why, "hash": spec_hash(norm) if norm else None, "normalized": norm}, ensure_ascii=False, indent=2))
         return 0 if norm else 1
-    if a.dev:
-        print(json.dumps(run_dev(json.loads(Path(a.dev).read_text()), a.who, env), ensure_ascii=False, indent=2, default=_jd))
+    if not writes:
+        print(json.dumps(status(env), ensure_ascii=False, indent=2))
         return 0
-    if a.promote:
-        print(json.dumps(weekly_promotion(env)))
-        return 0
-    print(json.dumps(status(env), ensure_ascii=False, indent=2))
+    from . import lab_room
+    if limits:
+        from . import config
+        lab_room.apply_limits(lab_room.cfg(config.load())["mem_limit_mb"])
+    with lab_room.round_lock(env) as got:
+        if not got:
+            print(json.dumps({"skipped": "another round is running"}))
+            return 0
+        if a.dev:
+            print(json.dumps(run_dev(json.loads(Path(a.dev).read_text()), a.who, env), ensure_ascii=False, indent=2, default=_jd))
+        elif a.promote:
+            print(json.dumps(weekly_promotion(env), default=_jd))
+        else:
+            print(json.dumps(rescore_pending(env), ensure_ascii=False, default=_jd))
     return 0
 
 
