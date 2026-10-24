@@ -191,3 +191,24 @@ python3 -m desk.options_backtest --market us --underlying SPY --fee-per-contract
 - 再看最差一笔和权利金的比例：卖跨式尾部一次亏损能吃掉多少次收益。
 - 门槛扫描里，门槛提高后胜率上升但笔数骤减，说明过滤有效；如果胜率不变，过滤没用。
 - 这个回测的结论只用来决定纸面交易员（11a）的选边规则值不值得保留，**不是**实盘依据。备忘第九章：只研究、不做市、不卖期权、不下单。
+
+## 期权策略 v2 回测（卡 B2，`desk/options_v2_backtest.py`）
+
+预先登记的 v2 策略（`knowledge/options_strategies_v2.toml`，sha256 前 16 位 `9531c41e7262e5a1`，改一个数字 = v3）的真实报价回测：put 价差 F1/F1f、铁鹰 F2、便宜时买跨式 F3、财报铁蝶 F4 / 财报买跨式对照 F4c，共 28 个（策略, 标的）组合，累计尝试 60 次（Bonferroni 单次 p < 0.05/60）。
+规格全部读 toml，代码里不写数字；v1（`options_rules_backtest.py`）的 Quotes / 选约 / 簇 / 自助法 / 补数据机制直接复用。口径与解释写在模块文件头，报告里也有“先读这几条”。
+
+```bash
+python -m desk.options_v2_backtest --fetch-closes            # 一次：8 个标的日线收盘（Alpaca 只读，RV20 要 2024 年之前的收盘）
+python -m desk.options_v2_backtest                           # 第一遍：写 data/opra/meta/extra_needed_v2.json，打印下一步命令
+python -m desk.opra_fetch --extra --needed-file extra_needed_v2.json --extra-sub cbbo1m_extra_v2 --plan
+python -m desk.opra_fetch --extra --needed-file extra_needed_v2.json --extra-sub cbbo1m_extra_v2 --download --yes
+python -m desk.options_v2_backtest                           # 第二遍：合并主数据 + 补数据，出报告
+python -m desk.options_v2_backtest --strategies F1 F2 --underlyings SPY QQQ    # 只跑一部分
+```
+
+- 输出：`data/reports/options_v2.md`（顶部 5 行大白话：谁过关、三档月收益、最大回撤）、`options_v2.json`、`options_v2_trades.csv`。
+- 补数据放在 `cbbo1m_extra_v2/`（v1 的 `cbbo1m_extra/` 照读但不写；同一目录下已有的月文件会被 `opra_fetch` 跳过，所以 v2 必须用自己的目录）。补完仍缺的是 Databento 也没有的报价，回测按保守口径处理（空头腿无卖价 = 该价差按最大亏损平仓；多头腿无买价 = 0；一直没完整报价 = 最大亏损），报告里单独计数。
+- 财报单需要 `knowledge/earnings_history.json`（`[{"ticker","date","timing":"amc|bmo","source"}]`，卡 E1 负责）；文件不存在时 F4 / F4c 只报“没有财报日历”，不报错。
+- 参考口径（中间价 ± 75% / 50% 半价差）**仅参考，不作为结论**；“好得离谱”（考试段每笔平均 > 最大亏损的 40%，或胜率 > 95% 且 ≥30 笔）先当 bug 查，不算过关。
+- 仓位换算：三档“每笔最大亏损占账户比例”（2% / 5% / 10%），张数允许小数，同时持仓 ≤ 6，同一天开的 SPY/QQQ/SOXX/SMH 视为完全相关（合计 ≤ 3 笔）；报告给考试段月均 / 中位、最差一周、最大回撤和四分之一凯利。
+- 沙箱没有数据：`python3 -m pytest -q tests/test_options_v2_backtest.py` 全部用合成报价；真数据只能在服务器上跑。

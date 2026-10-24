@@ -251,6 +251,35 @@ def test_extra_mode_plan_cap_download_resume(tmp_path):
     assert db.get_calls == n
 
 
+def test_extra_mode_needed_file_and_sub_keep_v1_and_v2_apart(tmp_path):
+    """卡 B2：v2 回测的清单 extra_needed_v2.json 下到 cbbo1m_extra_v2/，不读不写 v1 的 extra_needed.json / cbbo1m_extra/
+    （同一个 sub 下已有的月文件会被跳过，所以 v2 必须用自己的目录）。"""
+    import json
+    root = tmp_path / "opra"
+    (root / "meta").mkdir(parents=True)
+    st = Settings(tmp_path)
+    v1_need = {"SOXX": {"2025-09-10": ["SOXX251024P00270000"]}}
+    v2_need = {"SOXX": {"2025-09-11": ["SOXX251024P00270000", "SOXX251024C00295000"]}}
+    (root / "meta" / "extra_needed.json").write_text(json.dumps(v1_need))
+    # v2 清单还不存在 -> 退出码 1，并点名文件
+    msgs = []
+    assert of.run_extra(st, FakeSrc(), FakeDB(), ["SOXX"], "plan", needed_file="extra_needed_v2.json", out=msgs.append) == 1
+    assert any("extra_needed_v2.json" in m for m in msgs)
+    (root / "meta" / "extra_needed_v2.json").write_text(json.dumps(v2_need))
+    # v1 已经把 cbbo1m_extra/SOXX/2025-09 下过了：v2 用自己的目录，照样会下
+    (root / "cbbo1m_extra" / "SOXX").mkdir(parents=True)
+    (root / "cbbo1m_extra" / "SOXX" / "2025-09.parquet").write_bytes(b"v1")
+    db = FakeDB(per=1.0)
+    assert of.run_extra(st, FakeSrc(), db, ["SOXX"], "plan", needed_file="extra_needed_v2.json", sub="cbbo1m_extra_v2") == 0
+    assert db.cost_calls == 1                                                    # 只有 v2 清单里的 1 个(标的,日)请求
+    assert of.run_extra(st, FakeSrc(), db, ["SOXX"], "download", yes=True, needed_file="extra_needed_v2.json", sub="cbbo1m_extra_v2") == 0
+    assert (root / "cbbo1m_extra_v2" / "SOXX" / "2025-09.parquet").exists()
+    assert (root / "cbbo1m_extra" / "SOXX" / "2025-09.parquet").read_bytes() == b"v1"      # v1 的文件没动
+    # 默认参数仍是 v1 的行为：读 extra_needed.json，v1 的月文件已存在 -> 没有待下载请求
+    db2 = FakeDB(per=1.0)
+    assert of.run_extra(st, FakeSrc(), db2, ["SOXX"], "download", yes=True) == 0 and db2.get_calls == 0
+
+
 def test_index_cache_roundtrip_gives_same_requests(tmp_path):
     root = tmp_path / "opra"
     (root / "meta").mkdir(parents=True)

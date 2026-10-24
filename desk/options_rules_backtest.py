@@ -417,9 +417,10 @@ def extra_candidates(rule: dict, days: list[str], adj: list[float], raw: list[fl
     return out
 
 
-def write_extra_needed(root: Path, new: dict[str, dict[str, set]]) -> Path:
-    """meta/extra_needed.json = {标的: {日期: [OCC…]}}；和已有文件按标的/日期取并集（子集重跑不丢旧的）。"""
-    p = root / "meta" / "extra_needed.json"
+def write_extra_needed(root: Path, new: dict[str, dict[str, set]], fname: str = "extra_needed.json") -> Path:
+    """meta/<fname>（默认 extra_needed.json）= {标的: {日期: [OCC…]}}；和已有文件按标的/日期取并集（子集重跑不丢旧的）。
+    fname 参数给 v2 回测用（extra_needed_v2.json），默认值保持 v1 行为不变。"""
+    p = root / "meta" / fname
     cur = json.loads(p.read_text()) if p.exists() else {}
     for u, dd in new.items():
         m = {k: set(v) for k, v in cur.get(u, {}).items()}

@@ -528,15 +528,21 @@ def run(settings, src, db, unds: list[str], start: date, end: date, mode: str, y
     return 0
 
 
+EXTRA_SUB = "cbbo1m_extra"
+
+
 def run_extra(settings, src, db, unds: list[str], mode: str, yes: bool = False, root: Path | None = None,
-              out=print, workers: int = MAX_WORKERS, sleep=time.sleep) -> int:
+              out=print, workers: int = MAX_WORKERS, sleep=time.sleep,
+              needed_file: str = "extra_needed.json", sub: str = EXTRA_SUB) -> int:
     """卡 A4 补数据：读 meta/extra_needed.json（回测第一遍写的 {标的: {日期: [OCC]}}），同一 15:30–16:00 窗口、raw_symbol、
     每块 ≤2000、按日分组，逐请求精确询价（便宜），同一个费用上限 / --yes，存到 cbbo1m_extra/<UND>/<YYYY-MM>.parquet。
-    续跑：已有的月文件跳过（删掉才会重拉）；解析不了的批次和主下载一样跳过。"""
+    续跑：已有的月文件跳过（删掉才会重拉）；解析不了的批次和主下载一样跳过。
+    卡 B2：needed_file / sub 让 v2 回测（meta/extra_needed_v2.json -> cbbo1m_extra_v2/）与 v1 的补数据互不覆盖；
+    注意同一个 sub 目录下已有的月文件会被跳过，所以 v2 必须用自己的 sub。"""
     root = root or (settings.data / "opra")
-    p = root / "meta" / "extra_needed.json"
+    p = root / "meta" / needed_file
     if not p.exists():
-        out("没找到 meta/extra_needed.json：先跑 python -m desk.options_rules_backtest 的第一遍。")
+        out(f"没找到 meta/{needed_file}：先跑对应回测（python -m desk.options_rules_backtest 或 desk.options_v2_backtest）的第一遍。")
         return 1
     need = json.loads(p.read_text())
     reqs_all = []
@@ -546,7 +552,7 @@ def run_extra(settings, src, db, unds: list[str], mode: str, yes: bool = False, 
             out(f"[{u}] 没有需要补的报价")
             continue
         ct = src.close_times(date.fromisoformat(min(days)), date.fromisoformat(max(days)))
-        reqs = [r for r in build_requests(u, days, ct) if not month_path(root, u, r["month"], "cbbo1m_extra").exists()]
+        reqs = [r for r in build_requests(u, days, ct) if not month_path(root, u, r["month"], sub).exists()]
         out(f"[{u}] 需补 {sum(len(v) for v in days.values())} 个(合约,日)，待下载请求 {len(reqs)}")
         reqs_all += reqs
     out(f"向 Databento 询价（metadata.get_cost，不扣费；逐个请求精确，{len(reqs_all)} 次）…")
@@ -565,7 +571,7 @@ def run_extra(settings, src, db, unds: list[str], mode: str, yes: bool = False, 
         out("中止：下载要加 --yes 确认。")
         return 2
     (root / "meta").mkdir(parents=True, exist_ok=True)
-    res = download(db, reqs_all, root, out, est, sub="cbbo1m_extra")
+    res = download(db, reqs_all, root, out, est, sub=sub)
     out(f"完成：新下载 {res['downloaded']} 个月文件，跳过已有 {res['skipped']} 个，预计花费 ${res['est_spent']:,.2f}。")
     return 0
 
@@ -578,6 +584,8 @@ def main(argv=None) -> int:
     g.add_argument("--diagnose", action="store_true", help="看 Databento 的 OPRA 符号格式并试询价一个合约")
     ap.add_argument("--yes", action="store_true")
     ap.add_argument("--extra", action="store_true", help="补数据：读 meta/extra_needed.json（期权回测第一遍产出），下到 cbbo1m_extra/；配合 --plan / --download")
+    ap.add_argument("--needed-file", default="extra_needed.json", help="配合 --extra：meta/ 下的清单文件名（v2 回测用 extra_needed_v2.json）")
+    ap.add_argument("--extra-sub", default=EXTRA_SUB, help="配合 --extra：补数据存放的子目录（v2 回测用 cbbo1m_extra_v2，避免和 v1 的月文件互相跳过）")
     ap.add_argument("--exact", action="store_true", help="逐个请求精确询价（慢，调用很多）；默认抽样估算 x1.2")
     ap.add_argument("--underlyings", nargs="+", default=UNDERLYINGS)
     ap.add_argument("--start", default=DEFAULT_START)
@@ -610,7 +618,8 @@ def main(argv=None) -> int:
         if a.diagnose:
             print("--extra 要配 --plan 或 --download", file=sys.stderr)
             return 1
-        return run_extra(s, src, db, a.underlyings, "plan" if a.plan else "download", a.yes)
+        return run_extra(s, src, db, a.underlyings, "plan" if a.plan else "download", a.yes,
+                         needed_file=a.needed_file, sub=a.extra_sub)
     return run(s, src, db, a.underlyings, date.fromisoformat(a.start), date.fromisoformat(a.end),
                "plan" if a.plan else "download", a.yes, exact=a.exact)
 
