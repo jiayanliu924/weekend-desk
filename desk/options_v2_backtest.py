@@ -50,7 +50,7 @@ import numpy as np
 import pandas as pd
 
 from .options_rules_backtest import (SAMPLE_START, TEST_START, TRAIN_END, Quotes, boot_p, clusters, fetch_closes,
-                                     fnum, pct, read_closes, seg_of, split_warnings, tstat, usd, write_extra_needed)
+                                     fnum, pct, read_closes, read_month, seg_of, split_warnings, tstat, usd, write_extra_needed)
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 SPEC_PATH = ROOT_DIR / "knowledge" / "options_strategies_v2.toml"
@@ -180,21 +180,21 @@ def rv20(adj: list[float], i: int, window: int = 20) -> float | None:
     return float(r.std(ddof=1) * math.sqrt(252))
 
 
-def iv30(q: Quotes, day: int, spot: float, spec: dict) -> float | None:
-    """toml [vol]：到期最接近 30 天的两个到期日，各取最接近现价的 call / put（新鲜报价的中间价）反解后平均，按到期天数线性插值到 30 天。"""
+def iv_at(q: Quotes, day: int, spot: float, spec: dict, tgt: int) -> tuple[float | None, tuple[int, ...]]:
+    """(IV, 用到的到期天数们)。toml [vol] 的 IV30 定义推广到任意目标天数 tgt：到期最接近 tgt 天的两个到期日，各取最接近现价的 call / put
+    （新鲜报价的中间价）反解后平均，按到期天数线性插值到 tgt 天（卡 L1 的期限斜率用 tgt=55 与 30；tgt=30 时与 v2 的 IV30 逐位相同）。"""
     v = spec["vol"]
     rows = q.day_rows(day)
     if rows.empty:
-        return None
+        return None, ()
     cut = q.stale_cut(day)
     rows = rows[(rows["qmin"] >= cut) & (rows["bid"] > 0) & rows["ask"].notna() & (rows["ask"] >= rows["bid"])]
     if rows.empty:
-        return None
+        return None, ()
     dte = rows["exp"] - day
     rows = rows[dte >= 1]
     if rows.empty:
-        return None
-    tgt = v["iv_target_days"]
+        return None, ()
     exps = sorted(rows["exp"].unique(), key=lambda e: (abs((int(e) - day) - tgt), int(e)))[:2]
     pts = []
     for e in exps:
@@ -213,16 +213,21 @@ def iv30(q: Quotes, day: int, spot: float, spec: dict) -> float | None:
         if ivs:
             pts.append((int(e) - day, sum(ivs) / len(ivs)))
     if not pts:
-        return None
+        return None, ()
     if len(pts) == 1:
-        return pts[0][1]
+        return pts[0][1], (pts[0][0],)
     (d1, i1), (d2, i2) = sorted(pts)
     if tgt <= d1:
-        return i1
+        return i1, (d1,)
     if tgt >= d2:
-        return i2
+        return i2, (d2,)
     w = (tgt - d1) / (d2 - d1)
-    return i1 + w * (i2 - i1)
+    return i1 + w * (i2 - i1), (d1, d2)
+
+
+def iv30(q: Quotes, day: int, spot: float, spec: dict) -> float | None:
+    """toml [vol]：到期最接近 30 天的两个到期日，各取最接近现价的 call / put（新鲜报价的中间价）反解后平均，按到期天数线性插值到 30 天。"""
+    return iv_at(q, day, spot, spec, spec["vol"]["iv_target_days"])[0]
 
 
 # ---------------------------------------------------------------- 腿选择与流动性
@@ -240,7 +245,7 @@ def pick_expiry(exps: list[int], day: int, spec: dict, strat: dict) -> int | Non
     if ov:
         c = sorted(e for e in exps if ov["min_dte"] <= e - day <= ov["max_dte"])
         return c[0] if c else None           # pick = "nearest"：窗口内最近的那个到期日
-    ex = spec["expiry"]
+    ex = strat.get("expiry") or spec["expiry"]          # 卡 L1：研究室方案自带到期窗口（target_dte ± 7，夹在 14–60 内）
     c = [e for e in exps if ex["min_dte"] <= e - day <= ex["max_dte"]]
     return sorted(c, key=lambda e: (abs((e - day) - ex["target_dte"]), e))[0] if c else None
 
@@ -533,19 +538,45 @@ class Ctx:
     def rv(self, i: int) -> float | None:
         return rv20(self.adj, i, self.spec["vol"]["rv_window"])
 
+    def iv_peek(self, i: int) -> float | None:
+        """只看缓存、不触发计算（给报告里记 iv30 用）。"""
+        return self._iv.get(i)
 
-def scan_entries(strat: dict, ctx: Ctx, earn_events: dict[int, dict] | None = None) -> list[dict]:
-    """每个信号日 -> {i, legs 或 None, why, iv, rv}。不看冷却（冷却在 simulate 里），所以也是补数据清单的超集。"""
+
+def scan_entries(strat: dict, ctx: Ctx, earn_events: dict[int, dict] | None = None, first: str | None = None,
+                 last: str | None = None, signal_fn=None) -> list[dict]:
+    """每个信号日 -> {i, legs 或 None, why, iv, rv}。不看冷却（冷却在 simulate 里），所以也是补数据清单的超集。
+    卡 L1 的两个可选扩展（默认值下行为与 B2 完全一致）：
+    first / last = 入场日的闭区间（YYYY-MM-DD；first 不得早于 SAMPLE_START）；
+    signal_fn(strat, ctx, i) -> True / False / None（None = 算不出，记 no_signal_data）：给了就用它代替 entry 字段的内置信号
+    （研究室的多条件入场；财报入场日（earnings_eve）仍由 earn_events 给出，signal_fn 再叠加其余条件）。"""
     out = []
     for i, d in enumerate(ctx.days):
-        if d < SAMPLE_START:
+        if d < SAMPLE_START or (first is not None and d < first):
             continue
+        if last is not None and d > last:
+            break
         if strat["entry"] == "earnings_eve":
             if earn_events is None or i not in earn_events:
                 continue
             sig, iv, rv = True, None, None
             if i + 1 >= len(ctx.days):
                 out.append({"i": i, "legs": None, "why": "no_next_session"})
+                continue
+            if signal_fn is not None:
+                sig = signal_fn(strat, ctx, i)
+                if sig is None:
+                    out.append({"i": i, "legs": None, "why": "no_signal_data"})
+                    continue
+                if not sig:
+                    continue
+        elif signal_fn is not None:
+            sig = signal_fn(strat, ctx, i)
+            iv, rv = ctx.iv_peek(i), ctx.rv(i)
+            if sig is None:
+                out.append({"i": i, "legs": None, "why": "no_signal_data"})
+                continue
+            if not sig:
                 continue
         else:
             need = strat["entry"] != "always"
@@ -568,9 +599,12 @@ def build_trade(strat: dict, ctx: Ctx, c: dict, spec: dict) -> tuple[dict | None
     slip = fill["slippage_pct"]
     net = entry_net_ps(legs, "primary", slip)
     L = -payoff_min(legs)
-    credit_kind = any(l["side"] == "sell" for l in legs)
-    if credit_kind and net <= 0:
+    has_sell = any(l["side"] == "sell" for l in legs)
+    if has_sell and net <= 0 and not strat.get("net_debit_ok"):
         return None, "no_credit"
+    if strat.get("net_debit_ok") and net > 0:         # 卡 L1：借方价差（多头腿离平值更近）收到权利金 = 报价异常
+        return None, "bad_structure"
+    credit_kind = net > 0
     max_loss_ps = L - net
     if max_loss_ps <= 0:
         return None, "bad_structure"
@@ -983,11 +1017,34 @@ def sizing_report(trades: list[dict], cal: list[str], spec: dict, label: str, in
 
 
 # ---------------------------------------------------------------- 驱动
-def load_quotes(root: Path, und: str) -> Quotes | None:
-    main = Quotes._load(root / "cbbo1m" / und)
+def _load_dir(d: Path, last_day: str | None) -> pd.DataFrame | None:
+    """一个标的目录下的月 parquet -> 报价表。last_day 给了就**不读**文件名月份晚于它的文件，并把读进来的行里晚于 last_day 的丢掉
+    （卡 L1：开发段回测不许加载金库段报价）。"""
+    parts = []
+    if d is not None and d.exists():
+        cut = date.fromisoformat(last_day).toordinal() if last_day else None
+        for p in sorted(d.glob("*.parquet")):
+            if last_day and p.stem[:7] > last_day[:7]:
+                continue
+            m = read_month(p)
+            if cut is not None:
+                m = m[m["day"] <= cut]
+            if len(m):
+                parts.append(m)
+            del m
+    return pd.concat(parts, ignore_index=True) if parts else None
+
+
+def load_quotes(root: Path, und: str, last_day: str | None = None, extra_subs: tuple = EXTRA_SUBS) -> Quotes | None:
+    """last_day（可选）：报价只加载到这一天（含）。默认 None = 全部（B2 行为）。"""
+    if last_day is None:
+        main = Quotes._load(root / "cbbo1m" / und)
+        ex = [x for x in (Quotes._load(root / sub / und) for sub in extra_subs) if x is not None]
+    else:
+        main = _load_dir(root / "cbbo1m" / und, last_day)
+        ex = [x for x in (_load_dir(root / sub / und, last_day) for sub in extra_subs) if x is not None]
     if main is None:
         return None
-    ex = [x for x in (Quotes._load(root / sub / und) for sub in EXTRA_SUBS) if x is not None]
     return Quotes(main, pd.concat(ex, ignore_index=True) if ex else None)
 
 
