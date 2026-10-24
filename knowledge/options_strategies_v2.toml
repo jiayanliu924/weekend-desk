@@ -1,0 +1,143 @@
+# 美股期权策略 v2 —— 预先登记（卡 P2，Opus，2026-10-25，看任何 v2 回测结果之前写死）
+#
+# 为什么换：v1 的 4 条"追趋势买期权"规则 × 8 标的 = 32 次全部没过。文献（knowledge/options_research_v2.md）的
+# 共同结论：买方平均在付"波动风险溢价"（期权平均比事后实际波动贵），趋势之后的期权最贵。v2 换成有长期证据的方向：
+#   F1/F2 定义风险地卖波动（Cboe PUT / CNDR 指数的思路，用价差封顶最大亏损，不裸卖）；
+#   F3 只在期权"便宜"（隐含 < 实际）时才买（Goyal–Saretto 的 IV−RV 缺口当过滤器）；
+#   F4 财报：卖贵的财报波动（封顶），并用"买财报跨式"当对照组。
+#
+# 规则：本文件提交后不许为了回测好看而改。改任何一个数字 = v3，v1/v2 的结果照样要报，尝试次数累加。
+# 尝试次数：v1 32 + v2 28 = 累计 60。多重检验按 60 校正（Bonferroni：单次 p < 0.05/60）。
+#
+# 样本与分段（与 v1 相同）：训练段 2024-01-02 → 2025-06-30；考试段 2025-07-01 → 最近。
+#   样本里必须保留 2024-08-05（日元套息平仓）和 2025-04（关税）两次暴跌；任何"剔除异常"都算作弊。
+#
+# 数据：data/opra/cbbo1m（15:30–16:00 ET 1 分钟 NBBO，到期 14–60 天、行权价 ±10%）+ cbbo1m_extra（持仓合约补拉）+ 日线收盘。
+# 时点：入场、出场、估值都用当天 ≥15:50 ET 的最后一条报价（半天市 ≥12:50）；信号里的实际波动只用 d−1 及以前的收盘。
+
+[universe]
+index_like = ["SPY", "QQQ", "SOXX", "SMH"]
+all = ["SOXX", "SMH", "QQQ", "SPY", "NVDA", "AMD", "MU", "INTC"]
+earnings = ["NVDA", "AMD", "MU", "INTC"]   # 历史财报日期：knowledge/earnings_history.json（卡 E1，带出处）
+
+[vol]
+# 隐含波动 IV30：当天 15:59 前最后报价的中间价，Black–Scholes 反解；取到期最接近 30 天的两个到期日里、
+# 行权价最接近现价的 call 和 put 的 IV 平均，再按到期天数线性插值到 30 天（只有一个到期日就用它）。
+# 利率：固定 4.5%/年（记录为近似）；不考虑分红（ETF 分红对 30 天期 IV 影响小，记录为近似）。
+# 实际波动 RV20：d−20 … d−1 的 20 个日对数收益，年化 ×√252。
+iv_target_days = 30
+rate = 0.045
+rv_window = 20
+
+[fill]
+# 主口径（判定过不过关只看这个）：卖按 bid、买按 ask（= 跨过全部价差），每张每条腿每次 $0.65，再加每条腿权利金 1% 滑点。
+# 参考口径（只报告、不作为结论）：成交价 = 中间价 ± 75% / 50% 的半价差。文献说限价单实际成交约在报价价差的一半；
+#   如果某个策略只在参考口径下才赚钱，它的下一步是在 Alpaca 模拟账户实测成交价，而不是直接上钱。
+fee_per_contract = 0.65
+slippage_pct = 0.01
+ref_fill_fracs = [0.75, 0.5]
+# 流动性：每条腿 (ask − bid) ≤ max(15% × 中间价, $0.05)，否则当天不开这一单。
+max_leg_spread_pct = 0.15
+min_leg_spread_abs = 0.05
+
+[expiry]
+target_dte = 38
+min_dte = 30
+max_dte = 45
+
+# ---------------------------------------------------------------- 策略族（共 28 次尝试）
+# 价差收益口径：每笔"占最大可能亏损（= 保证金）的收益率"。账户层面的周/月收益在 [sizing] 里换算。
+# 同一标的同一策略同时只开 1 笔；平仓后的下一个交易日才能再开（cooldown_days）。
+
+[[strategy]]
+id = "F1_put_spread"
+underlyings = "index_like"          # 4 次
+why = "卖 put 收保险费（Cboe PUT 指数 2007 年来年化约 7%、最大回撤约 −33%）；买更低一档 put 封顶，最坏亏损事先知道。"
+legs = [ { side = "sell", type = "put", strike_pct = 0.95 }, { side = "buy", type = "put", strike_pct = 0.90 } ]
+entry = "always"                    # 没有持仓就开
+take_profit_frac_of_credit = 0.50   # 平仓成本 ≤ 收到权利金的 50% → 止盈
+stop_loss_mult_of_credit = 2.0      # 浮亏 ≥ 2 × 收到的权利金 → 止损
+exit_dte = 7
+max_hold_days = 25
+cooldown_days = 1
+
+[[strategy]]
+id = "F1f_put_spread_rich"
+underlyings = "index_like"          # 4 次
+why = "同 F1，但只在期权贵的时候卖：IV30 ÷ RV20 ≥ 1.2（Goyal–Saretto：IV 相对实际偏高的期权后续收益偏低）。"
+legs = [ { side = "sell", type = "put", strike_pct = 0.95 }, { side = "buy", type = "put", strike_pct = 0.90 } ]
+entry = "iv_rv_ge"
+iv_rv_threshold = 1.2
+take_profit_frac_of_credit = 0.50
+stop_loss_mult_of_credit = 2.0
+exit_dte = 7
+max_hold_days = 25
+cooldown_days = 1
+
+[[strategy]]
+id = "F2_condor_rich"
+underlyings = "index_like"          # 4 次
+why = "铁鹰（Cboe CNDR 思路）：上下两边都卖、都买保护；只在 IV30 ÷ RV20 ≥ 1.2 时开。CNDR 35 年最大月度回撤约 19%。"
+legs = [ { side = "sell", type = "put",  strike_pct = 0.95 }, { side = "buy", type = "put",  strike_pct = 0.90 },
+         { side = "sell", type = "call", strike_pct = 1.05 }, { side = "buy", type = "call", strike_pct = 1.10 } ]
+entry = "iv_rv_ge"
+iv_rv_threshold = 1.2
+take_profit_frac_of_credit = 0.50
+stop_loss_mult_of_credit = 2.0
+exit_dte = 7
+max_hold_days = 25
+cooldown_days = 1
+
+[[strategy]]
+id = "F3_cheap_straddle"
+underlyings = "all"                 # 8 次
+why = "修 v1 的病根：只在期权便宜时买（IV30 ÷ RV20 ≤ 0.85），买平值跨式赌波动放大，不赌方向。"
+legs = [ { side = "buy", type = "call", strike_pct = 1.00 }, { side = "buy", type = "put", strike_pct = 1.00 } ]  # 同一行权价，取最接近现价
+entry = "iv_rv_le"
+iv_rv_threshold = 0.85
+take_profit_frac_of_debit = 0.50    # 涨 50% 卖
+stop_loss_frac_of_debit = 0.35      # 亏 35% 卖
+exit_dte = 7
+max_hold_days = 15
+cooldown_days = 5
+
+[[strategy]]
+id = "F4_earnings_ironfly"
+underlyings = "earnings"            # 4 次（每只约 11 次财报，样本小 → 只能算探索，过不了"簇数 ≥ 10"就标"样本不够"）
+why = "财报前散户高价买期权（de Silva–So–Smith），卖平值跨式收贵的财报波动，买 ±8% 翅膀封顶。"
+legs = [ { side = "sell", type = "call", strike_pct = 1.00 }, { side = "sell", type = "put", strike_pct = 1.00 },
+         { side = "buy",  type = "call", strike_pct = 1.08 }, { side = "buy",  type = "put", strike_pct = 0.92 } ]
+entry = "earnings_eve"              # 盘后公布：当天 15:59 进；盘前公布：前一交易日 15:59 进
+expiry_override = { min_dte = 14, max_dte = 45, pick = "nearest" }   # 数据最短 14 天，取最近的那个到期
+exit = "next_session_close"         # 公布后第一个交易日 15:59 无条件平
+
+[[strategy]]
+id = "F4c_earnings_straddle_control"
+underlyings = "earnings"            # 4 次（对照组：文献预计到期 ≥14 天的财报买方扣成本后亏；如果它反而赚，说明回测有 bug 或口径错）
+why = "对照：和 F4 同时点买平值跨式。"
+legs = [ { side = "buy", type = "call", strike_pct = 1.00 }, { side = "buy", type = "put", strike_pct = 1.00 } ]
+entry = "earnings_eve"
+expiry_override = { min_dte = 14, max_dte = 45, pick = "nearest" }
+exit = "next_session_close"
+
+# ---------------------------------------------------------------- 过关
+[pass]
+# 进影子记账（只记账，不下单）需同时满足：
+#   ① 考试段按主口径扣全部成本后总盈亏 > 0；② 考试段簇数 ≥ 10（同一标的 5 个交易日内的入场算 1 簇）；
+#   ③ 训练段平均每笔同号；④ 考试段按簇自助法 p < 0.10。
+# 上真钱的统计门槛（另加）：校正后显著（p < 0.05/60）；或影子 + Alpaca 模拟账户满 8 周、实际成交价和回测主口径差距 < 30%。
+# 好得离谱（考试段每笔平均 > 最大亏损的 40%，或胜率 > 95% 且样本 ≥ 30）→ 先当 bug 查。
+# 必须同时报告：最差一笔、最大连续亏损笔数、2024-08-05 与 2025-04 两段各自的盈亏、按标的拆分。
+min_clusters = 10
+p_shadow = 0.10
+attempts_cumulative = 60
+
+# ---------------------------------------------------------------- 仓位换算（报告里把"每笔收益率"翻译成"账户周/月收益"）
+[sizing]
+# 每笔最大可能亏损占账户的比例三档，给老板选：
+risk_per_trade = [0.02, 0.05, 0.10]
+# 同时持仓上限：所有策略合计最多 6 笔；同一天开的 index_like 价差视为完全相关（SPY/QQQ/SOXX/SMH 同涨同跌），合计风险 ≤ 单档 × 3。
+max_open = 6
+correlated_cap_mult = 3
+# 另报：按考试段估出的凯利比例的 1/4（"四分之一凯利"），以及在每一档下的最大回撤、最差一周、月化收益。
+kelly_fraction = 0.25
