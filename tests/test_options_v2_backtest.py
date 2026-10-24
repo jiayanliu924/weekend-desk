@@ -83,8 +83,8 @@ def spread_rows(idxs=range(2, 31), p95=(1.00, 1.05), p90=(0.30, 0.35), over=None
     return rows
 
 
-def first_trade(strat, q, i=2):
-    ctx = mkctx(q)
+def first_trade(strat, q, i=2, raw=None):
+    ctx = mkctx(q, raw=raw)
     cands = [c for c in v2.scan_entries(strat, ctx) if c["i"] == i]
     assert cands and cands[0]["legs"], cands
     t, why = v2.build_trade(strat, ctx, cands[0], SPEC)
@@ -348,7 +348,7 @@ def test_earnings_entry_dates_amc_bmo():
           {"date": "2024-01-13", "timing": "amc", "source": "x"}]           # 周六：不是交易日
     out, bad = v2.earnings_entries(ev, DAYS)
     assert {DAYS[i]: e["timing"] for i, e in out.items()} == {"2024-01-10": "amc", "2024-01-11": "bmo"}     # bmo -> 前一交易日
-    assert bad["earnings_date_not_trading_day"] == 1
+    assert bad == {"earnings_date_not_trading_day": ["2024-01-13"]}
 
 
 def test_earnings_straddle_control_trade_dates(tmp_path):
@@ -477,7 +477,7 @@ def test_evaluate_segments_windows_and_flags():
     assert ev["windows"]["2024-08-01..2024-08-16"]["realized_pnl"] == -300 and ev["windows"]["2025-04-01..2025-04-30"]["realized_pnl"] == -80
     assert ev["worst_trade"]["pnl"] == -300 and ev["max_consec_losses"] == 2
     assert ev["crit_test_pnl_positive"] and ev["crit_clusters_ge_min"] and ev["crit_boot_p_lt_shadow"]
-    assert ev["crit_train_same_sign"] is False and ev["shadow_pass"] is False           # 训练段平均每笔为负
+    assert ev["crit_train_total_positive"] is False and ev["shadow_pass"] is False      # 训练段总盈亏为负（-340）：考试段再好也不能过
     assert ev["ref"]["0.75"]["note"] == "仅参考，不作为结论" and ev["bonferroni"] == pytest.approx(0.05 / 60)
     good = [mk("2024-03-01", "2024-03-10", 30, 5)] + trades[3:]
     ev = v2.evaluate(s, "SPY", good, [t["entry_idx"] for t in good], {}, SPEC)
@@ -548,11 +548,14 @@ def test_segment_stats_and_kelly():
 
 
 def test_sizing_report_quarter_kelly_and_tiers():
-    trades = [ft(CAL[40 + 3 * k], "NVDA", pnl=(60.0 if k % 5 else -500.0), exit_=CAL[41 + 3 * k]) for k in range(30)]
+    train = [ft(CAL[1 + 3 * k], "NVDA", pnl=(60.0 if k % 5 else -250.0), exit_=CAL[2 + 3 * k]) for k in range(7)]       # 训练段（到 6/30）
+    trades = train + [ft(CAL[40 + 3 * k], "NVDA", pnl=(60.0 if k % 5 else -500.0), exit_=CAL[41 + 3 * k]) for k in range(30)]
     rep = v2.sizing_report(trades, CAL, SPEC, "t", set())
     assert [t["tier"] for t in rep["tiers"]] == [0.02, 0.05, 0.10]
-    assert rep["kelly_quarter"] == pytest.approx(rep["kelly_full"] * 0.25) and rep["n_test_trades"] == 30
-    assert all(t["test"]["monthly_mean"] is not None for t in rep["tiers"])
+    kc = rep["kelly"]
+    assert kc["label"] == "四分之一凯利（训练段估计）" and kc["n_train_trades"] == 7
+    assert kc["quarter"] == pytest.approx(kc["kelly_full"] * 0.25) and rep["n_test_trades"] == 30
+    assert all(t["test"]["monthly_mean"] is not None and t["integer"]["test"]["monthly_median"] is not None for t in rep["tiers"])
     m = [t["test"]["max_drawdown"] for t in rep["tiers"]]
     assert m[0] < m[1] < m[2]                                                            # 档位越大回撤越大
 
@@ -569,7 +572,9 @@ def test_end_to_end_report_and_json(tmp_path):
     v2.write_outputs(out, trades, SPEC, rdir)
     md = (rdir / "options_v2.md").read_text()
     lines = md.splitlines()
-    assert lines[0].startswith("# ") and [l[:2] for l in lines[2:7]] == ["1.", "2.", "3.", "4.", "5."] and lines[7] == ""
+    k = next(i for i, l in enumerate(lines) if l.startswith("1. "))
+    assert lines[0].startswith("# ") and [l[:2] for l in lines[k:k + 5]] == ["1.", "2.", "3.", "4.", "5."] and lines[k + 5] == ""
+    assert "2.8" in lines[k] and "中位数" in lines[k + 1] and "Opus 裁定 2026-10-25（看结果前）" in md and "两次暴跌窗口" in md
     assert "仅参考" in md and "F1_put_spread" in md and "四分之一凯利" in md
     js = json.loads((rdir / "options_v2.json").read_text())
     assert js["spec_version"] == "v2" and js["n_trials"] == 60 and js["results"][0]["strategy"] == "F1_put_spread"
@@ -587,3 +592,318 @@ def test_main_cli_prints_next_commands(tmp_path, capsys, monkeypatch):
     out = capsys.readouterr().out
     assert "python -m desk.opra_fetch --extra --needed-file extra_needed_v2.json --extra-sub cbbo1m_extra_v2" in out and "--download --yes" in out
     assert (tmp_path / "rep" / "options_v2.md").exists()
+
+
+# ================================================================ B2 第 2 轮：诚实性审计修复
+def _credit_net():
+    return 1.00 * 0.99 - 0.35 * 1.01
+
+
+def rows_missing_p90(missing, idx_range=range(2, 31), over=None, hhmm_stale=None):
+    """put 价差报价，但 `missing` 里的几天缺保护腿 P90。"""
+    rows = []
+    for k in idx_range:
+        rows += qrows(P95, [k], 1.00, 1.05)
+        if k not in missing:
+            rows += qrows(P90, [k], 0.30, 0.35)
+    return rows
+
+
+def spot_with(day_vals):
+    raw = list(RAW)
+    for k, v in day_vals.items():
+        raw[k] = v
+    return raw
+
+
+# ---- 1. 过关标准：训练段总盈亏 > 0、整样本 > 0
+def test_r2_pass_bar_train_total_negative_cannot_pass_and_crash_windows_on_top(tmp_path):
+    s = STRAT["F1_put_spread"]
+    test_tr = [mk(f"2025-{7 + k // 20:02d}-{1 + k % 20:02d}", "2025-12-30", 60 + k % 3, 1000 + 10 * k) for k in range(12)]
+    bad_train = [mk("2024-07-25", "2024-08-05", -300, 1), mk("2025-04-10", "2025-04-20", 20, 50)]       # 训练段合计 -280
+    ev = v2.evaluate(s, "SPY", bad_train + test_tr, [], {}, SPEC)
+    assert ev["test"]["total_pnl"] > 0 and ev["crit_clusters_ge_min"] and ev["crit_boot_p_lt_shadow"]
+    assert ev["train"]["total_pnl"] < 0 and not ev["crit_train_total_positive"] and not ev["shadow_pass"]
+    zero_train = v2.evaluate(s, "SPY", test_tr, [], {}, SPEC)                                           # 训练段一笔没有：总盈亏 0，不 > 0
+    assert not zero_train["crit_train_total_positive"] and not zero_train["shadow_pass"]
+    good_train = [mk("2024-07-25", "2024-08-05", 30, 1)]
+    ev = v2.evaluate(s, "SPY", good_train + test_tr, [], {}, SPEC)
+    assert ev["crit_whole_net_positive"] and ev["crit_train_total_positive"] and ev["shadow_pass"]
+    # 两个暴跌窗口的“持仓期间”盈亏出现在报告顶部（第一个策略小节之前）
+    out = {"results": [ev], "sizing": [], "warnings": [], "spec_sha256_16": "x", "unresolved_extra": {}, "gates": {}}
+    ev["windows"]["2024-08-01..2024-08-16"]["overlap_pnl"] = -123.0
+    ev["windows"]["2025-04-01..2025-04-30"]["overlap_pnl"] = -45.0
+    ev["all"]["trades"] = 13
+    # 报告里没有仓位组时 summary_lines 也要能出
+    out["sizing"] = v2.sizing_sets([], [], [ev], SPEC, set())
+    v2.write_report(out, SPEC, tmp_path / "r.md")
+    md = (tmp_path / "r.md").read_text()
+    top = md.index("## F1_put_spread") if "## F1_put_spread" in md else len(md)
+    assert "两次暴跌窗口" in md[:top] and "-123" in md[:top] and "-45" in md[:top] and "持仓期间" in md[:top]
+    assert "Opus 裁定 2026-10-25（看结果前）" in md[:top]
+
+
+# ---- 2. 凯利：训练段估计、封顶
+def kt(entry, ret):
+    return {"entry_date": entry, "ret": ret}
+
+
+def test_r2_kelly_train_only_and_caps():
+    train = [kt(f"2024-0{3 + k // 28}-{1 + k % 28:02d}", 0.3 if k % 4 else -0.2) for k in range(40)]
+    test_good = [kt("2025-08-01", 0.5)] * 10
+    test_awful = [kt("2025-08-01", -0.95)] * 10
+    a, b = v2.kelly_capped(train + test_good, SPEC), v2.kelly_capped(train + test_awful, SPEC)
+    assert a["kelly_full"] == b["kelly_full"] and a["n_train_trades"] == 40         # 考试段的好坏不影响凯利估计
+    assert a["label"] == "四分之一凯利（训练段估计）" and a["quarter"] == pytest.approx(a["kelly_full"] * 0.25)
+    assert b["cap"] == 0.05 and a["cap"] == 0.10                                    # 有一笔亏 ≥90% -> 封顶 5%
+    huge = [kt("2024-03-05", 0.5)] * 30 + [kt("2024-03-06", 0.3)] * 30              # 赢多输少：凯利很大
+    c = v2.kelly_capped(huge, SPEC)
+    assert c["quarter"] > 0.10 and c["fraction"] == 0.10 and c["capped"]            # 硬封顶 10%
+    d = v2.kelly_capped(huge + [kt("2024-03-07", -0.92)], SPEC)
+    assert d["cap"] == 0.05 and d["fraction"] <= 0.05
+    assert v2.kelly_capped([kt("2025-08-01", 0.1)] * 20, SPEC)["kelly_full"] is None      # 训练段样本不足
+
+
+# ---- 3. 缺腿日：不许止盈；内在价值下界击穿止损就止损
+def test_r2_stop_on_missing_uses_intrinsic_lower_bound(tmp_path):
+    q = quotes_from(rows_missing_p90({5}), tmp_path)
+    t = first_trade(STRAT["F1_put_spread"], q, raw=spot_with({5: 92.0}))
+    credit = _credit_net()
+    assert t["reason"] == "stop_on_missing" and t["exit_idx"] == 5
+    cost = 3.0 + 2 * 0.65 / 100                                        # 空头腿内在价值 95−92 = 3，加平仓手续费；多头腿 90 虚值 = 0
+    assert t["pnl"] == pytest.approx(100 * credit - 1.3 - 100 * cost, abs=0.01)
+    assert t["pnl"] < 100 * (credit - 3 * credit) - 1.3                # 比“刚好在止损线”更差（下界 3 > 止损价 3×权利金 1.9）
+    # 暴跌到底：成本封顶最大亏损
+    q = quotes_from(rows_missing_p90({5}), tmp_path)
+    t = first_trade(STRAT["F1_put_spread"], q, raw=spot_with({5: 80.0}))
+    assert t["reason"] == "stop_on_missing" and t["pnl"] == pytest.approx(-t["max_loss"] - 1.3, abs=0.01)
+    # 下界没击穿：不止损，继续持有（这里一直缺 P90，最后顺延到 7DTE 日之后才有完整报价）
+    q = quotes_from(rows_missing_p90({5}), tmp_path)
+    t = first_trade(STRAT["F1_put_spread"], q, raw=spot_with({5: 96.0}))
+    assert t["reason"] == "exit_dte" and t["exit_idx"] == 23
+    # 计数
+    ctx = mkctx(q, raw=spot_with({5: 92.0}))
+    s = STRAT["F1_put_spread"]
+    tr, sig, sk = v2.simulate(s, ctx, SPEC, [c for c in v2.scan_entries(s, ctx) if c["i"] == 2])
+    assert v2.evaluate(s, "SPY", tr, sig, sk, SPEC)["n_stop_on_missing"] == 1
+
+
+def test_r2_no_take_profit_on_missing_day(tmp_path):
+    rows = []
+    for k in range(2, 31):
+        cheap = k == 5
+        rows += qrows(P95, [k], 0.05 if cheap else 1.00, 0.10 if cheap else 1.05)
+        if k != 5:                                                    # 第 5 天保护腿没有报价，短腿价格已经很便宜
+            rows += qrows(P90, [k], 0.30, 0.35)
+    t = first_trade(STRAT["F1_put_spread"], quotes_from(rows, tmp_path))
+    assert t["reason"] == "exit_dte" and t["exit_idx"] == 23          # 若缺腿日也能止盈，这里会是 take_profit @5
+
+
+# ---- 4. 过期报价：所有出场路径都不认
+def test_r2_stale_quotes_ignored_on_every_exit_path(tmp_path):
+    crash = [row(DAYS[5], "15:40", P95, 3.00, 4.20), row(DAYS[5], "15:40", P90, 0.50, 0.60)]       # 15:40 的“暴跌价”
+    rows = [r for r in spread_rows(range(2, 31)) if r["ts"].tz_convert(ET).date().isoformat() != DAYS[5]] + crash
+    t = first_trade(STRAT["F1_put_spread"], quotes_from(rows, tmp_path))
+    assert t["reason"] == "exit_dte" and t["exit_idx"] == 23          # 过期报价不触发止损（旧逻辑会在 idx 5 止损）
+    # 过期 + 标的暴跌：算缺腿日，走内在价值下界
+    t = first_trade(STRAT["F1_put_spread"], quotes_from(rows, tmp_path), raw=spot_with({5: 92.0}))
+    assert t["reason"] == "stop_on_missing" and t["exit_idx"] == 5
+    # 持满天数 / 临近到期日的报价过期 -> 顺延到下一个新鲜日
+    rows2 = [r for r in spread_rows(range(2, 31)) if r["ts"].tz_convert(ET).date().isoformat() != DAYS[23]] + \
+        [row(DAYS[23], "15:40", P95, 1.0, 1.05), row(DAYS[23], "15:40", P90, 0.3, 0.35)]
+    t = first_trade(STRAT["F1_put_spread"], quotes_from(rows2, tmp_path))
+    assert t["reason"] == "exit_dte" and t["exit_idx"] == 24
+    # 半天市（当天最晚报价 ≤13:00）：12:50 的报价是新鲜的
+    half = [row(DAYS[23], "12:55", P95, 1.0, 1.05), row(DAYS[23], "12:55", P90, 0.3, 0.35)]
+    rows3 = [r for r in spread_rows(range(2, 31)) if r["ts"].tz_convert(ET).date().isoformat() != DAYS[23]] + half
+    t = first_trade(STRAT["F1_put_spread"], quotes_from(rows3, tmp_path))
+    assert t["exit_idx"] == 23
+    # 财报次日出场：过期报价算缺腿
+    exp = "2024-01-26"
+    legs = [("C", 100, 3.0), ("P", 100, 2.9), ("C", 108, 0.6), ("P", 92, 0.5)]
+    rows4 = []
+    for cp, k, mid in legs:
+        rows4 += qrows(osi(exp, cp, k), [6], mid - 0.02, mid + 0.02) + qrows(osi(exp, cp, k), [7], mid - 0.02, mid + 0.02, hhmm="15:30")
+    rows4 += qrows(osi(exp, "C", 105), [7], 1, 1.1)                 # 让 idx 7 当天有别的新鲜报价（不是半天市）
+    q = quotes_from(rows4, tmp_path)
+    ctx = mkctx(q)
+    s = STRAT["F4_earnings_ironfly"]
+    ev, _ = v2.earnings_entries([{"date": "2024-01-10", "timing": "amc", "source": "x"}], DAYS)
+    tr, *_ = v2.simulate(s, ctx, SPEC, v2.scan_entries(s, ctx, ev))
+    assert tr[0]["missing_exit_legs"] == 4 and tr[0]["no_ask_close"]
+
+
+# ---- 5. 盯市：缺腿日用更差的标记；没报价的仓位第一天没报价就按最大亏损记
+def test_r2_mtm_worse_of_on_missing_days_and_no_quotes_booked_early(tmp_path):
+    q = quotes_from(rows_missing_p90({5, 6}), tmp_path)
+    t = first_trade(STRAT["F1_put_spread"], q, raw=spot_with({5: 94.0, 6: 94.0}))
+    credit = _credit_net()
+    # 上一个标记：raw 成本 1.05 − 0.30 = 0.75；内在价值下界 95−94 = 1.0 更差 -> 盯市用 1.0
+    assert t["mtm"][DAYS[5]] == pytest.approx(100 * (credit - 1.0) - 2.6, abs=0.01)
+    assert t["mtm"][DAYS[4]] == pytest.approx(100 * (credit - 0.75) - 2.6, abs=0.01)         # 完整报价日用真实标记
+    # 之后一直没有完整报价：第一个没报价的日子就按最大亏损记，不是拖到到期
+    q = quotes_from(spread_rows(range(2, 6)), tmp_path)
+    t = first_trade(STRAT["F1_put_spread"], q)
+    assert t["reason"] == "no_more_quotes" and t["exit_idx"] == 6 and t["exit_date"] == DAYS[6]
+    assert t["exit_date"] < t["expiry"]
+    assert t["pnl"] == pytest.approx(-t["max_loss"] - 1.3, abs=0.01) and t["mtm"][DAYS[6]] == t["pnl"]
+
+
+# ---- 7. 对照组 / 价差好得离谱
+def _res_for(sid, und, trades):
+    return v2.evaluate(STRAT[sid], und, trades, [], {}, SPEC)
+
+
+def test_r2_control_group_profit_blocks_f4_and_banners():
+    good = [mk("2024-03-01", "2024-03-10", 30, 5)] + [mk(f"2025-{7 + k // 20:02d}-{1 + k % 20:02d}", "2025-12-30", 60 + k % 3, 1000 + 10 * k) for k in range(12)]
+    f4 = _res_for("F4_earnings_ironfly", "NVDA", good)
+    assert f4["shadow_pass"]
+    f4c_loss = _res_for("F4c_earnings_straddle_control", "NVDA", [mk("2025-08-01", "2025-08-02", -50, 1)])
+    g = v2.apply_gates([f4, f4c_loss])
+    assert not g["control"]["alarm"] and f4["shadow_pass"]
+    f4c_win = _res_for("F4c_earnings_straddle_control", "NVDA", [mk("2025-08-01", "2025-08-02", 50, 1)])
+    g = v2.apply_gates([f4, f4c_win])
+    assert g["control"]["alarm"] and not f4["shadow_pass"] and f4["blocked_by"] == ["control_group_profit"] and not f4["live_stat_ok"]
+    f4c_train_only = _res_for("F4c_earnings_straddle_control", "AMD", [mk("2024-03-01", "2024-03-02", 80, 1), mk("2025-08-01", "2025-08-02", -50, 1)])
+    assert v2.apply_gates([f4c_train_only])["control"]["alarm"]                      # 整样本合计 > 0 也报警
+    banners = v2.banner_lines({"gates": g})
+    assert any("红色警报" in b and "对照组赚钱 → 先查 bug" in b for b in banners)
+    f1 = _res_for("F1_put_spread", "SPY", good)
+    assert f1["shadow_pass"]
+    v2.apply_gates([f1, f4c_win])
+    assert f1["shadow_pass"]                                                          # 只挡 F4，不挡别的策略
+
+
+def test_r2_too_good_for_spreads_win_rate_90():
+    def trades(n_win, n_loss, win_pnl):
+        return [mk("2024-03-01", "2024-03-10", 30, 5)] + [mk(f"2025-{7 + k // 20:02d}-{1 + k % 20:02d}", "2025-12-30", win_pnl if k < n_win else -100, 1000 + 10 * k)
+                                                           for k in range(n_win + n_loss)]
+    tr = trades(20, 2, 150)            # 胜率 90.9% > 90%，n=22 ≥ 20，每笔平均 25.5% > 25%；老标准（>40% 或 >95%）都不触发
+    sp = v2.evaluate(STRAT["F1_put_spread"], "SPY", tr, [], {}, SPEC)
+    assert sp["too_good"] and sp["shadow_criteria_met"] and not sp["shadow_pass"]
+    db = v2.evaluate(STRAT["F3_cheap_straddle"], "SPY", tr, [], {}, SPEC)
+    assert not db["too_good"]                                                          # 只针对价差/铁鹰
+    ok = v2.evaluate(STRAT["F1_put_spread"], "SPY", trades(20, 2, 120), [], {}, SPEC)   # 平均 < 25%：不触发
+    assert not ok["too_good"]
+    few = v2.evaluate(STRAT["F1_put_spread"], "SPY", trades(17, 1, 150), [], {}, SPEC)  # 整样本 19 笔 < 20
+    assert not few["too_good"]
+
+
+# ---- 8/9. 周块自助法、整数张、中位数
+def test_r2_week_block_bootstrap_groups_trades_by_week():
+    ts = [mk("2025-08-04", "2025-08-05", 100, 1), mk("2025-08-05", "2025-08-06", 100, 2), mk("2025-08-12", "2025-08-13", -50, 9)]
+    wk = v2.weekly_pnl(ts, ["2025-W32", "2025-W33", "2025-W34"])
+    assert wk == {"2025-W32": 200.0, "2025-W33": -50.0, "2025-W34": 0.0}                # 同一周的盈亏先加总，空周记 0
+    ev = v2.evaluate(STRAT["F1_put_spread"], "SPY", ts, [], {}, SPEC, weeks=["2025-W32", "2025-W33", "2025-W34"])
+    assert ev["test_weeks"] == 3 and ev["test_week_boot_p"] is not None
+    many = [mk(f"2025-{7 + k // 20:02d}-{1 + k % 20:02d}", "2025-12-30", 60, 1000 + 10 * k) for k in range(12)]
+    p_blocks = v2.evaluate(STRAT["F1_put_spread"], "SPY", many, [], {}, SPEC)["test_week_boot_p"]
+    assert p_blocks < 0.10
+
+
+def test_r2_integer_account_rounds_to_zero_contracts():
+    day = "2025-07-01"
+    trades = [ft(CAL[10 + 3 * k], "NVDA", pnl=100.0, ml=500.0, exit_=CAL[11 + 3 * k]) for k in range(10)]
+    low = v2.size_account(trades, CAL, 0.02, SPEC, set(), None, e0=5000.0, integer=True)    # 2% × 5000 = 100 < 500 -> 0 张
+    assert low["taken"] == 0 and low["skipped"]["round_to_0"] == 10 and low["zero_share"] == 1.0
+    hi = v2.size_account(trades, CAL, 0.10, SPEC, set(), None, e0=5000.0, integer=True)      # 10% × 5000 = 500 -> 1 张
+    assert hi["taken"] == 10 and hi["zero_share"] == 0.0
+    rep = v2.sizing_report(trades, CAL, SPEC, "t", set())
+    assert rep["tiers"][0]["integer"]["mostly_zero"] and not rep["tiers"][2]["integer"]["mostly_zero"]
+    out = {"gates": {}, "results": [], "sizing": [dict(rep, passed_set=True)]}
+    lines = v2.summary_lines(out)
+    assert "做不了" in lines[1] and "做不了" not in lines[3]
+    assert all("中位数" in l for l in lines[1:4]) and len(lines) == 5
+
+
+# ---- 10. 两遍流程完整性闸门
+def test_r2_completeness_gate_bad_fraction_and_unfetched_extra(tmp_path):
+    import os
+    s = STRAT["F1_put_spread"]
+    good = [mk("2024-03-01", "2024-03-10", 30, 5)] + [mk(f"2025-{7 + k // 20:02d}-{1 + k % 20:02d}", "2025-12-30", 60 + k % 3, 1000 + 10 * k) for k in range(12)]
+    ok = v2.evaluate(s, "SPY", good, [], {}, SPEC)
+    assert ok["shadow_pass"]
+    comp = v2.completeness_check([ok], tmp_path, {})
+    assert comp["complete"]
+    bad = list(good)
+    bad[3] = dict(bad[3], reason="no_more_quotes")                                      # 1/13 = 7.7% > 5%
+    r = v2.evaluate(s, "SPY", bad, [], {}, SPEC)
+    comp = v2.completeness_check([r], tmp_path, {})
+    assert not comp["complete"] and "SPY" in comp["reasons"][0]
+    g = v2.apply_gates([r, ok], comp)
+    assert not ok["shadow_pass"] and not r["shadow_pass"] and ok["blocked_by"] == ["incomplete"] and not ok["live_stat_ok"]
+    assert any("未完成：先补数据" in b for b in v2.banner_lines({"gates": g}))
+    # stop_on_missing 同样计入；刚好 5% 不算超过
+    many = good + [mk("2025-09-01", "2025-09-02", 5, 3000 + k) for k in range(7)]          # 20 笔
+    many[0] = dict(many[0], reason="stop_on_missing")
+    assert v2.completeness_check([v2.evaluate(s, "SPY", many, [], {}, SPEC)], tmp_path, {})["complete"]      # 1/20 = 5%
+    many[1] = dict(many[1], reason="stop_on_missing")
+    assert not v2.completeness_check([v2.evaluate(s, "SPY", many, [], {}, SPEC)], tmp_path, {})["complete"]
+    # 补数据没跑：清单文件比 cbbo1m_extra_v2 里的数据新（或根本没有补数据）
+    meta = tmp_path / "meta"
+    meta.mkdir()
+    nf = meta / "extra_needed_v2.json"
+    nf.write_text("{}")
+    os.utime(nf, (2_000_000_000, 2_000_000_000))
+    assert not v2.completeness_check([ok], tmp_path, {"SPY": 5})["complete"]               # 没有补数据
+    assert v2.completeness_check([ok], tmp_path, {"SPY": 0})["complete"]                   # 没有缺的报价就不需要补
+    ex = tmp_path / "cbbo1m_extra_v2" / "SPY"
+    ex.mkdir(parents=True)
+    f = ex / "2024-01.parquet"
+    f.write_bytes(b"x")
+    os.utime(f, (1_900_000_000, 1_900_000_000))
+    assert not v2.completeness_check([ok], tmp_path, {"SPY": 5})["complete"]               # 补数据比清单旧
+    os.utime(f, (2_100_000_000, 2_100_000_000))
+    assert v2.completeness_check([ok], tmp_path, {"SPY": 5})["complete"]                   # 补过了（补完仍缺的是真没有）
+
+
+def test_r2_needed_file_not_rewritten_when_unchanged_and_timestamped_copies(tmp_path):
+    import os
+    from datetime import datetime
+    root = tmp_path / "opra"
+    assert v2.write_needed_if_changed(root, {"SPY": {"2024-01-05": {"SPY240209P00095000"}}}) is True
+    p = root / "meta" / "extra_needed_v2.json"
+    os.utime(p, (1_000_000_000, 1_000_000_000))
+    assert v2.write_needed_if_changed(root, {"SPY": {"2024-01-05": {"SPY240209P00095000"}}}) is False
+    assert p.stat().st_mtime == 1_000_000_000                                              # 内容没变就不动文件
+    assert v2.write_needed_if_changed(root, {"SPY": {"2024-01-06": {"SPY240209P00095000"}}}) is True
+    out = {"gates": {}, "results": [], "sizing": [], "warnings": [], "spec_sha256_16": "x", "unresolved_extra": {}}
+    paths = v2.write_outputs(out, [], SPEC, tmp_path / "rep", now=datetime(2026, 10, 25, 13, 5))
+    names = sorted(x.name for x in (tmp_path / "rep").iterdir())
+    assert "options_v2.md" in names and "options_v2_20261025_1305.md" in names and "options_v2_20261025_1305.json" in names and "options_v2.json" in names
+    assert (tmp_path / "rep" / "options_v2_20261025_1305.md").read_text() == (tmp_path / "rep" / "options_v2.md").read_text()
+
+
+# ---- 11. 相关性上限：所有还开着的指数类持仓都算
+def test_r2_correlated_cap_counts_all_open_index_positions_not_just_same_day():
+    idx = set(SPEC["universe"]["index_like"])
+    tr = [ft(CAL[10], "SPY", exit_="2025-12-30"), ft(CAL[11], "QQQ", exit_="2025-12-30"), ft(CAL[12], "SOXX", exit_="2025-12-30"),
+          ft(CAL[13], "SMH", exit_="2025-12-30"), ft(CAL[14], "NVDA", strat="F3_cheap_straddle", exit_="2025-12-30")]
+    r = v2.size_account(tr, CAL, 0.02, SPEC, idx, None)
+    assert r["taken"] == 4 and r["skipped"] == {"correlated_cap": 1}                       # 第 4 个指数类（不同天开的）被挡；单票不受限
+    # 前面的平仓之后又有空位
+    tr2 = [ft(CAL[10], "SPY", exit_=CAL[12]), ft(CAL[11], "QQQ", exit_="2025-12-30"), ft(CAL[11], "SOXX", exit_="2025-12-30"),
+           ft(CAL[13], "SMH", exit_="2025-12-30")]
+    r = v2.size_account(tr2, CAL, 0.02, SPEC, idx, None)
+    assert r["taken"] == 4 and not r["skipped"]
+
+
+# ---- 12. 跳过按训练 / 考试 / 暴跌窗口拆开
+def test_r2_skips_split_by_segment_and_crash_window(tmp_path):
+    cal = weekdays(450, date(2024, 1, 2))
+    days = cal
+    idx = {d: i for i, d in enumerate(days)}
+    q = quotes_from(qrows(P95, [2], 1.0, 1.05), tmp_path)           # 几乎没有报价：每个信号日都会因 no_quotes 跳过
+    ctx = v2.Ctx("SPY", days, [100.0] * len(days), [100.0] * len(days), q, SPEC)
+    s = always("F1_put_spread")
+    cands = [{"i": idx[d], "legs": None, "why": "no_quotes"} for d in ("2024-08-05", "2025-04-07", "2025-04-08", "2025-08-01")]
+    split: dict = {}
+    tr, sig, sk = v2.simulate(s, ctx, SPEC, cands, split)
+    assert sk == {"no_quotes": 4} and split["train"]["no_quotes"] == 3 and split["test"]["no_quotes"] == 1
+    assert split["2024-08-01..2024-08-16"]["no_quotes"] == 1 and split["2025-04-01..2025-04-30"]["no_quotes"] == 2
+    ev = v2.evaluate(s, "SPY", tr, sig, sk, SPEC, skips_split=split)
+    assert ev["skips_split"]["2025-04-01..2025-04-30"] == {"no_quotes": 2}
+    out = {"results": [ev], "sizing": [], "warnings": [], "spec_sha256_16": "x", "unresolved_extra": {}, "gates": {}}
+    v2.write_report(out, SPEC, tmp_path / "r.md")
+    md = (tmp_path / "r.md").read_text()
+    assert "按训练段 / 考试段 / 暴跌窗口拆开" in md and "暴跌窗口 2025-04" in md

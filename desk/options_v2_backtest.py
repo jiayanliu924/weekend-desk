@@ -36,7 +36,6 @@ tstat / seg_of / extra-needed 两遍机制；数据与 v1 相同（opra_fetch �
 from __future__ import annotations
 
 import argparse
-import bisect
 import csv
 import hashlib
 import json
@@ -44,7 +43,7 @@ import math
 import sys
 import tomllib
 from collections import Counter
-from datetime import date
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -66,12 +65,19 @@ BONF = 0.05 / N_TRIALS
 TOO_GOOD_RET = 0.40
 TOO_GOOD_WIN = 0.95
 TOO_GOOD_MIN_N = 30
+TOO_GOOD_SPREAD_WIN = 0.90          # 价差类另加（裁定 2026-10-25）：胜率 > 90% 且 ≥20 笔且每笔平均 > 最大亏损的 25%
+TOO_GOOD_SPREAD_N = 20
+TOO_GOOD_SPREAD_RET = 0.25
+INCOMPLETE_FRAC = 0.05              # 某组 > 5% 的笔以 no_more_quotes / stop_on_missing 收尾 -> 整份报告“未完成”
+KELLY_BIG_LOSS = 0.90               # 有一笔亏掉 ≥90% 最大亏损 -> 凯利封顶降一档
+INT_ACCOUNT = 5000.0                # 整数张仿真的小账户
 MULT = 100
 E0 = 100_000.0
 EPS = 1e-9
 
 REASON_ZH = {"take_profit": "止盈", "stop_loss": "止损", "max_hold": "持满天数", "exit_dte": "临近到期", "next_session": "财报后第一个交易日收盘",
              "no_more_quotes": "之后一直没有完整报价，按最大亏损记", "open_at_end": "到数据末尾还没平，按最后一次完整报价算"}
+ZH_SLICE = {"train": "训练段", "test": "考试段", "2024-08-01..2024-08-16": "暴跌窗口 2024-08", "2025-04-01..2025-04-30": "暴跌窗口 2025-04"}
 SKIP_ZH = [("no_signal_data", "算不出 IV/RV"), ("no_expiry", "没有合适到期日"), ("no_strike", "没有行权价"),
            ("wing_unavailable", "保护腿选不出（同一行权价/顺序不对）"), ("no_ask", "买腿没有卖价"), ("no_bid", "卖腿没有买价"),
            ("stale_quote", "报价早于15:50"), ("spread", "价差超流动性线"), ("no_credit", "收不到权利金"),
@@ -341,12 +347,14 @@ def cost_at(legs: list[dict], quotes: list, L_ps: float) -> tuple[float, bool]:
 
 
 def settle(legs: list[dict], ex: dict, mode, fill: dict, L_ps: float) -> float:
-    """一张合约（×100）的净盈亏 $。ex = {never, flag, quotes}。"""
+    """一张合约（×100）的净盈亏 $。ex = {never, flag, quotes, synthetic_cost_ps}。"""
     slip, fee = fill["slippage_pct"], fill["fee_per_contract"]
     n = len(legs)
     cash = MULT * entry_net_ps(legs, mode, slip) - fee * n
     if ex.get("never"):
         return cash - MULT * L_ps
+    if ex.get("synthetic_cost_ps") is not None:        # 缺腿日止损：平仓总成本（已含平仓手续费）由 find_exit 给出
+        return cash - MULT * ex["synthetic_cost_ps"]
     if ex.get("flag"):
         return cash - MULT * L_ps - fee * n
     tot = 0.0
@@ -367,44 +375,71 @@ def leg_series(q: Quotes, legs: list[dict], entry_ord: int) -> list[dict]:
     return out
 
 
+def lb_cost_ps(legs: list[dict], spot: float) -> float:
+    """平仓成本下界（每股）：按当天标的收盘价算的结构到期内在价值的相反数 = Σ空头腿内在价值 − Σ多头腿内在价值。
+    价差的真实平仓成本只会比它多一点时间价值差（深度实值时差几分钱），所以拿它当“至少要付这么多”的下界。"""
+    tot = 0.0
+    for l in legs:
+        intr = max(spot - l["strike"], 0.0) if l["type"] == "C" else max(l["strike"] - spot, 0.0)
+        tot += intr if l["side"] == "sell" else -intr
+    return tot
+
+
 def find_exit(strat: dict, legs: list[dict], ser: list[dict], entry_idx: int, ords: list[int], q: Quotes,
-              net_ps: float, L_ps: float, fill: dict) -> dict:
-    """entry_idx 之后逐个交易日检查。返回 {idx, reason, quotes, flag, never, marks{idx: 成本}, last_full}。"""
+              net_ps: float, L_ps: float, fill: dict, spots: list[float] | None = None) -> dict:
+    """entry_idx 之后逐个交易日检查。返回 {idx, reason, quotes, flag, never, marks{idx: 成本}, last_full, missing[, synthetic_cost_ps]}。
+    所有出场路径（止盈 / 止损 / 持满 / 临近到期 / 财报次日）只认 ≥15:50 ET（半天市 12:50）的报价；过期报价算缺失。
+    缺腿日（任何一条腿没有可用报价）：不做止盈；信用结构用当天收盘价算平仓成本下界，若下界已经击穿止损线，
+    就按 max(下界 + 平仓手续费, 止损价估计) 平仓，封顶最大亏损（reason = stop_on_missing）；借方结构从内在价值推不出“已击穿”，
+    只在盯市里按内在价值（更差者）估。时间到期（持满 / 临近到期）顺延到下一个所有腿都有可用报价的日子。"""
     n_days = len(ords)
     exp = legs[0]["exp"]
     earn = strat.get("exit") == "next_session_close"
     credit_kind = net_ps > 0
     max_hold, exit_dte = strat.get("max_hold_days"), strat.get("exit_dte")
+    fee_ps = fill["fee_per_contract"] * len(legs) / MULT
     marks: dict[int, float] = {}
     last_full = None
     pending = None
+    last_cost = cost_at(legs, [(l["bid"], l["ask"], 0) for l in legs], L_ps)[0]
     for k in range(entry_idx + 1, n_days):
         o = ords[k]
         if o > exp:
             break
-        qs = [s.get(o) for s in ser]
+        cut = q.stale_cut(o)
+        qs = [x if (x is not None and x[2] >= cut) else None for x in (s.get(o) for s in ser)]
+        n_missing = sum(x is None for x in qs)
         if earn:        # 公布后第一个交易日 15:59 无条件平；缺的腿按保守口径处理（不顺延）
             cost, flag = cost_at(legs, qs, L_ps)
             return {"idx": k, "reason": "next_session", "quotes": [(x[0], x[1]) if x else None for x in qs], "flag": flag,
-                    "never": False, "marks": marks, "last_full": last_full, "missing": sum(x is None for x in qs)}
+                    "never": False, "marks": marks, "last_full": last_full, "missing": n_missing}
         tr = None
         if max_hold and k - entry_idx >= max_hold:
             tr = "max_hold"
         elif exit_dte is not None and exp - o <= exit_dte:
             tr = "exit_dte"
-        if any(x is None for x in qs):
+        if n_missing:
+            lb = lb_cost_ps(legs, spots[k]) if spots is not None else None
+            if lb is not None:
+                if credit_kind and lb - net_ps >= strat["stop_loss_mult_of_credit"] * net_ps - EPS:
+                    stop_px = (1 + strat["stop_loss_mult_of_credit"]) * net_ps
+                    cost = min(L_ps, max(lb + fee_ps, stop_px))
+                    return {"idx": k, "reason": "stop_on_missing", "quotes": None, "flag": False, "never": False,
+                            "synthetic_cost_ps": cost, "marks": marks, "last_full": last_full, "missing": n_missing}
+                last_cost = max(last_cost, lb)           # 盯市：上一个标记和内在价值下界里更差的那个
+                marks[k] = last_cost
             if tr and pending is None:
-                pending = tr             # 时间到了但有腿没报价 -> 顺延到所有腿都有报价的下一个交易日
+                pending = tr             # 时间到了但有腿没有可用报价 -> 顺延到所有腿都有可用报价的下一个交易日
             continue
         cost, flag = cost_at(legs, qs, L_ps)
-        marks[k] = cost
+        marks[k] = last_cost = cost
         quotes = [(x[0], x[1]) for x in qs]
         last_full = (k, quotes)
         done = lambda why: {"idx": k, "reason": why, "quotes": quotes, "flag": flag, "never": False, "marks": marks,  # noqa: E731
                             "last_full": last_full, "missing": 0}
         if pending:
             return done(pending)
-        good = all(leg_liquid(x[0], x[1], fill) and x[2] >= q.stale_cut(o) for x in qs)
+        good = all(leg_liquid(x[0], x[1], fill) for x in qs)       # 新鲜度上面已经筛过
         if credit_kind:
             if good and cost <= (1 - strat["take_profit_frac_of_credit"]) * net_ps + EPS:
                 return done("take_profit")
@@ -423,7 +458,9 @@ def find_exit(strat: dict, legs: list[dict], ser: list[dict], entry_idx: int, or
         cost, flag = cost_at(legs, [(a, b, 0) for a, b in quotes], L_ps)
         return {"idx": k, "reason": "open_at_end", "quotes": quotes, "flag": flag, "never": False, "marks": marks,
                 "last_full": last_full, "missing": 0}
-    return {"idx": min(max(bisect.bisect_left(ords, exp), entry_idx + 1), n_days - 1), "reason": "no_more_quotes", "quotes": None, "flag": False,
+    # 之后再也没有完整可用报价：从“第一天开始没有报价”那天起按最大亏损记（不拖到到期）
+    first_dark = (last_full[0] if last_full else entry_idx) + 1
+    return {"idx": min(first_dark, n_days - 1), "reason": "no_more_quotes", "quotes": None, "flag": False,
             "never": True, "marks": marks, "last_full": last_full, "missing": 0}
 
 
@@ -462,15 +499,15 @@ def load_earnings(path: Path | None = None) -> dict[str, list[dict]] | None:
     return out
 
 
-def earnings_entries(events: list[dict], days: list[str]) -> tuple[dict[int, dict], Counter]:
-    """{入场日序号: 事件}；amc -> 当天收盘进，bmo -> 前一交易日收盘进。财报日不在交易日历里 -> 记跳过。"""
+def earnings_entries(events: list[dict], days: list[str]) -> tuple[dict[int, dict], dict[str, list[str]]]:
+    """({入场日序号: 事件}, {跳过原因: [财报日]})；amc -> 当天收盘进，bmo -> 前一交易日收盘进。财报日不在交易日历里 -> 记跳过。"""
     pos = {d: i for i, d in enumerate(days)}
-    out, bad = {}, Counter()
+    out, bad = {}, {}
     for ev in sorted(events, key=lambda e: e["date"]):
         i = pos.get(ev["date"])
         if i is None:
             if SAMPLE_START <= ev["date"] <= days[-1]:
-                bad["earnings_date_not_trading_day"] += 1
+                bad.setdefault("earnings_date_not_trading_day", []).append(ev["date"])
             continue
         if ev["timing"] == "bmo":
             i -= 1
@@ -538,7 +575,7 @@ def build_trade(strat: dict, ctx: Ctx, c: dict, spec: dict) -> tuple[dict | None
     if max_loss_ps <= 0:
         return None, "bad_structure"
     ser = leg_series(ctx.q, legs, ctx.ords[i])
-    ex = find_exit(strat, legs, ser, i, ctx.ords, ctx.q, net, L, fill)
+    ex = find_exit(strat, legs, ser, i, ctx.ords, ctx.q, net, L, fill, ctx.raw)
     pnl = settle(legs, ex, "primary", fill, L)
     refs = {str(f): settle(legs, ex, f, fill, L) for f in fill["ref_fill_fracs"]}
     nl = len(legs)
@@ -568,25 +605,41 @@ def build_trade(strat: dict, ctx: Ctx, c: dict, spec: dict) -> tuple[dict | None
     return t, ""
 
 
-def simulate(strat: dict, ctx: Ctx, spec: dict, cands: list[dict]) -> tuple[list[dict], list[int], dict]:
+def day_labels(day: str) -> list[str]:
+    """一个日期属于哪些切片：训练段 / 考试段，外加落在哪个暴跌窗口里（窗口与训练/考试段有重叠，所以是多标签）。"""
+    labs = [seg_of(day)]
+    labs += [name for name, (a, b) in CRASH_WINDOWS.items() if a <= day <= b]
+    return labs
+
+
+def add_skip(skips: Counter, split: dict | None, reason: str, day: str) -> None:
+    skips[reason] += 1
+    if split is not None:
+        for lab in day_labels(day):
+            split.setdefault(lab, Counter())[reason] += 1
+
+
+def simulate(strat: dict, ctx: Ctx, spec: dict, cands: list[dict], split: dict | None = None) -> tuple[list[dict], list[int], dict]:
+    """split（可选的传出参数）：{切片: Counter(原因)}，切片 = train / test / 两个暴跌窗口。"""
     cd = strat.get("cooldown_days", 1)
     sig_days, trades, skips = [], [], Counter()
     blocked = -1                  # 可再开的最早交易日序号 = 平仓日 + cooldown_days
     for c in cands:
         i = c["i"]
+        day = ctx.days[i]
         if c.get("why") == "no_signal_data":      # 算不出 IV/RV：不算信号日
-            skips["no_signal_data"] += 1
+            add_skip(skips, split, "no_signal_data", day)
             continue
         sig_days.append(i)
         if i < blocked:
-            skips["cooldown_or_open"] += 1
+            add_skip(skips, split, "cooldown_or_open", day)
             continue
         if c["legs"] is None:
-            skips[c["why"]] += 1
+            add_skip(skips, split, c["why"], day)
             continue
         t, why = build_trade(strat, ctx, c, spec)
         if t is None:
-            skips[why] += 1
+            add_skip(skips, split, why, day)
             continue
         trades.append(t)
         blocked = t["exit_idx"] + cd
@@ -666,25 +719,60 @@ def window_pnl(trades: list[dict], a: str, b: str) -> dict:
             "overlap_pnl": round(sum(t["pnl"] for t in ov), 2), "overlap_trades": len(ov)}
 
 
-def evaluate(strat: dict, und: str, trades: list[dict], sig_idx: list[int], skips: dict, spec: dict, status: str = "ok") -> dict:
+def week_key(day: str) -> str:
+    iso = date.fromisoformat(day).isocalendar()
+    return f"{iso[0]}-W{iso[1]:02d}"
+
+
+def weeks_between(a: str, b: str) -> list[str]:
+    """a、b 之间（含）所有 ISO 日历周。"""
+    d, end, out = date.fromisoformat(a), date.fromisoformat(b), []
+    while d <= end:
+        k = week_key(d.isoformat())
+        if not out or out[-1] != k:
+            out.append(k)
+        d += timedelta(days=1)
+    return out
+
+
+def weekly_pnl(trades: list[dict], weeks: list[str] | None = None) -> dict[str, float]:
+    """按入场所在的 ISO 日历周汇总盈亏；没有交易的周记 0（时间块自助法要把空周也放进去）。"""
+    out = {w: 0.0 for w in (weeks or [])}
+    for t in trades:
+        k = week_key(t["entry_date"])
+        out[k] = out.get(k, 0.0) + t["pnl"]
+    return out
+
+
+def evaluate(strat: dict, und: str, trades: list[dict], sig_idx: list[int], skips: dict, spec: dict, status: str = "ok",
+             skips_split: dict | None = None, weeks: list[str] | None = None) -> dict:
+    """weeks = 考试段的全部 ISO 日历周（含没交易的周）；不给就取考试段第一笔到最后一笔之间的周。"""
     ps = spec["pass"]
     fr = spec["fill"]["ref_fill_fracs"]
     tr = [t for t in trades if seg_of(t["entry_date"]) == "train"]
     te = [t for t in trades if seg_of(t["entry_date"]) == "test"]
     mx, dd = streak_dd(trades)
     cl_te, cl_tr = clusters([t["entry_idx"] for t in te]), clusters([t["entry_idx"] for t in tr])
-    by_idx = {t["entry_idx"]: t["pnl"] for t in te}
-    cpnl = [sum(by_idx[i] for i in c) for c in cl_te]
-    p, ts = boot_p(cpnl), tstat(cpnl)
+    if weeks is None and te:
+        weeks = weeks_between(min(t["entry_date"] for t in te), max(t["entry_date"] for t in te))
+    wk = weekly_pnl(te, weeks)
+    wvals = [wk[k] for k in sorted(wk)]
+    # 时间块自助法：以日历周为块，整周重抽（周内盈亏先加总），不再把每笔当独立
+    p, ts = boot_p(wvals), tstat(wvals)
     b_all, b_tr, b_te = basic(trades), basic(tr), basic(te)
     c1 = b_te["total_pnl"] > 0
     c2 = len(cl_te) >= ps["min_clusters"]
-    c3 = b_tr["trades"] > 0 and b_te["avg_pnl"] is not None and b_tr["avg_pnl"] != 0 and b_te["avg_pnl"] != 0 \
-        and (b_tr["avg_pnl"] > 0) == (b_te["avg_pnl"] > 0)
+    c3a = b_all["total_pnl"] > 0                 # 裁定 2026-10-25：整个样本扣费后净盈亏 > 0
+    c3b = b_tr["total_pnl"] > 0                  # 且训练段总盈亏 > 0（取代“训练段平均每笔同号”）
     c4 = p is not None and p < ps["p_shadow"]
-    crit = bool(c1 and c2 and c3 and c4)
-    too_good = bool(b_te["trades"] and ((b_te["avg_ret"] or 0) > TOO_GOOD_RET or
-                                        ((b_te["win_rate"] or 0) > TOO_GOOD_WIN and b_te["trades"] >= TOO_GOOD_MIN_N)))
+    crit = bool(c1 and c2 and c3a and c3b and c4)
+    ml_ret = lambda b: (b["avg_ret"] or 0)       # noqa: E731
+    spread_kind = bool(strat["legs"] and any(l["side"] == "sell" for l in strat["legs"]))
+    too_good = bool(b_te["trades"] and (ml_ret(b_te) > TOO_GOOD_RET or ((b_te["win_rate"] or 0) > TOO_GOOD_WIN and b_te["trades"] >= TOO_GOOD_MIN_N)))
+    if spread_kind:      # 价差 / 铁鹰另加：胜率 > 90% 且 ≥20 笔且每笔平均 > 最大亏损的 25%（考试段或整样本任一）
+        for b in (b_te, b_all):
+            if b["trades"] >= TOO_GOOD_SPREAD_N and (b["win_rate"] or 0) > TOO_GOOD_SPREAD_WIN and ml_ret(b) > TOO_GOOD_SPREAD_RET:
+                too_good = True
     shadow = bool(crit and not too_good)
     reasons = Counter(t["reason"] for t in trades)
     worst = min(trades, key=lambda t: t["pnl"]) if trades else None
@@ -695,20 +783,71 @@ def evaluate(strat: dict, und: str, trades: list[dict], sig_idx: list[int], skip
     sample_note = ""
     if strat["entry"] == "earnings_eve" and not c2:
         sample_note = "样本不够（考试段财报簇数 < 10），只能当探索，不能下结论"
-    return {"strategy": strat["id"], "und": und, "status": status, "kind": "credit" if strat["legs"] and any(l["side"] == "sell" for l in strat["legs"]) else "debit",
+    return {"strategy": strat["id"], "und": und, "status": status, "kind": "credit" if spread_kind else "debit",
             "all": b_all, "train": b_tr, "test": b_te, "ref": ref,
             "worst_trade": ({k: worst[k] for k in ("entry_date", "exit_date", "legs", "pnl", "ret", "reason")} if worst else None),
             "max_consec_losses": mx, "max_drawdown": dd,
             "windows": {k: window_pnl(trades, a, b) for k, (a, b) in CRASH_WINDOWS.items()},
             "signal_days": len(sig_idx), "signal_clusters": len(clusters(sig_idx)),
-            "traded_clusters_train": len(cl_tr), "traded_clusters_test": len(cl_te),
-            "test_cluster_tstat": ts, "test_cluster_boot_p": p, "bonferroni": BONF,
-            "crit_test_pnl_positive": bool(c1), "crit_clusters_ge_min": bool(c2), "crit_train_same_sign": bool(c3), "crit_boot_p_lt_shadow": bool(c4),
-            "shadow_criteria_met": crit, "too_good": too_good, "shadow_pass": shadow,
+            "traded_clusters_train": len(cl_tr), "traded_clusters_test": len(cl_te), "test_weeks": len(wvals),
+            "test_week_tstat": ts, "test_week_boot_p": p, "bonferroni": BONF,
+            "crit_test_pnl_positive": bool(c1), "crit_clusters_ge_min": bool(c2), "crit_whole_net_positive": bool(c3a),
+            "crit_train_total_positive": bool(c3b), "crit_boot_p_lt_shadow": bool(c4),
+            "shadow_criteria_met": crit, "too_good": too_good, "shadow_pass": shadow, "blocked_by": [],
             "live_stat_ok": bool(shadow and p is not None and p < BONF), "live_paper_route": shadow,
-            "sample_note": sample_note, "skips": skips, "reasons": dict(reasons),
+            "sample_note": sample_note, "skips": skips,
+            "skips_split": {k: dict(v) for k, v in (skips_split or {}).items()}, "reasons": dict(reasons),
             "n_no_ask_close": sum(1 for t in trades if t["no_ask_close"]), "n_no_more_quotes": reasons.get("no_more_quotes", 0),
+            "n_stop_on_missing": reasons.get("stop_on_missing", 0),
             "n_missing_exit_leg": sum(t["missing_exit_legs"] for t in trades)}
+
+
+def _block(x: dict, why: str) -> None:
+    x["shadow_pass"] = False
+    x["live_stat_ok"] = False
+    x["live_paper_route"] = False
+    if why not in x["blocked_by"]:
+        x["blocked_by"].append(why)
+
+
+def apply_gates(results: list[dict], completeness: dict | None = None) -> dict:
+    """跨组合的闸门，改 results 里的过关标志，返回 {control, completeness}。
+    ① 对照组 F4c（财报日买跨式，文献预计亏）在主口径下考试段或整样本合计 > 0 -> 红色警报，F4 全部不许过。
+    ② 数据不完整（见 completeness_check）-> 整份报告“未完成”，所有过关标志置 False。"""
+    f4c = [x for x in results if x["strategy"].startswith("F4c") and x["status"] == "ok"]
+    ctrl = {"test_pnl": round(sum(x["test"]["total_pnl"] for x in f4c), 2), "all_pnl": round(sum(x["all"]["total_pnl"] for x in f4c), 2),
+            "n_trades": sum(x["all"]["trades"] for x in f4c)}
+    ctrl["alarm"] = bool(ctrl["test_pnl"] > 0 or ctrl["all_pnl"] > 0)
+    if ctrl["alarm"]:
+        for x in results:
+            if x["strategy"].startswith("F4_"):
+                _block(x, "control_group_profit")
+    comp = completeness or {"complete": True, "reasons": []}
+    if not comp["complete"]:
+        for x in results:
+            _block(x, "incomplete")
+    return {"control": ctrl, "completeness": comp}
+
+
+def completeness_check(results: list[dict], root: Path, unresolved: dict[str, int], max_bad_frac: float = INCOMPLETE_FRAC) -> dict:
+    """两遍流程的完整性闸门：
+    ① 某 (策略, 标的) 里 > 5% 的笔以 no_more_quotes 或 stop_on_missing 收尾 -> 不完整；
+    ② 补数据没跑过：该标的还有缺的 (合约, 日)，且 meta/extra_needed_v2.json 比 cbbo1m_extra_v2/<标的>/ 里最新的文件新（或根本没有补数据）-> 不完整。"""
+    reasons = []
+    for x in results:
+        n = x["all"]["trades"]
+        bad = x.get("n_no_more_quotes", 0) + x.get("n_stop_on_missing", 0)
+        if n and bad / n > max_bad_frac:
+            reasons.append(f"{x['strategy']}/{x['und']}：{n} 笔里 {bad} 笔（{bad / n * 100:.0f}%）以“之后没报价 / 缺腿日止损”收尾，超过 {max_bad_frac * 100:.0f}%")
+    nf = root / "meta" / NEEDED_FILE
+    for u, miss in unresolved.items():
+        if not miss or not nf.exists():
+            continue
+        files = list((root / EXTRA_SUB_V2 / u).glob("*.parquet")) if (root / EXTRA_SUB_V2 / u).exists() else []
+        newest = max((f.stat().st_mtime for f in files), default=None)
+        if newest is None or newest < nf.stat().st_mtime:
+            reasons.append(f"{u}：还有 {miss} 个(合约,日)没有报价，补数据还没跑（{NEEDED_FILE} 比 {EXTRA_SUB_V2}/{u}/ 里的数据新）")
+    return {"complete": not reasons, "reasons": reasons}
 
 
 # ---------------------------------------------------------------- 仓位换算
@@ -727,10 +866,27 @@ def kelly_f(rets: list[float]) -> float | None:
     return float(grid[j]) if g[j] > 0 else 0.0
 
 
+def kelly_capped(trades: list[dict], spec: dict) -> dict:
+    """四分之一凯利（训练段估计）：只用训练段的每笔收益率估凯利比例，× kelly_fraction，
+    硬封顶 = 最高一档（10%）；样本里只要有一笔亏掉 ≥90% 最大亏损，封顶降到 5%（中间一档）。拿去用在考试段。"""
+    sz = spec["sizing"]
+    tiers = sorted(sz["risk_per_trade"])
+    train_rets = [t["ret"] for t in trades if seg_of(t["entry_date"]) == "train"]
+    kf = kelly_f(train_rets)
+    big_loss = any(t["ret"] <= -KELLY_BIG_LOSS for t in trades)
+    cap = tiers[-2] if big_loss and len(tiers) > 1 else tiers[-1]
+    quarter = kf * sz["kelly_fraction"] if kf is not None else None
+    used = min(quarter, cap) if quarter is not None else None
+    return {"label": "四分之一凯利（训练段估计）", "n_train_trades": len(train_rets), "kelly_full": kf, "quarter": quarter, "cap": cap,
+            "cap_reason": "有一笔亏掉 ≥90% 最大亏损，封顶降到 5%" if big_loss else "封顶 = 最高一档 10%",
+            "fraction": used, "capped": bool(quarter is not None and quarter > cap)}
+
+
 def size_account(trades: list[dict], cal: list[str], tier: float, spec: dict, index_like: set[str],
-                 order: dict | None = None) -> dict:
-    """每笔在入场时冒 tier × 当时净值 的最大亏损（张数可以是小数）；同时持仓 ≤ max_open；同一天开的 index_like 标的合计 ≤ cap_mult 笔。
-    净值逐日盯市（交易当天的主口径平仓价），已平仓按实际盈亏。"""
+                 order: dict | None = None, e0: float = E0, integer: bool = False) -> dict:
+    """每笔在入场时冒 tier × 当时净值 的最大亏损；integer=True 时张数向下取整（取整成 0 张就不做，记 round_to_0）。
+    同时持仓 ≤ max_open；index_like 标的的持仓（所有当前还开着的，不只是同一天开的）合计 ≤ correlated_cap_mult 笔。
+    净值逐日盯市（缺报价日用更差的标记，见 find_exit），已平仓按实际盈亏。"""
     sz = spec["sizing"]
     order = order or {}
     by_entry: dict[str, list[dict]] = {}
@@ -750,31 +906,37 @@ def size_account(trades: list[dict], cal: list[str], tier: float, spec: dict, in
                 p["last"] = t["mtm"].get(day, p["last"])
                 keep.append(p)
         open_ = keep
-        e_pre = E0 + realized + sum(p["n"] * p["last"] for p in open_)
-        n_idx = 0
+        e_pre = e0 + realized + sum(p["n"] * p["last"] for p in open_)
         for t in by_entry.get(day, []):
             if len(open_) >= sz["max_open"]:
                 skipped["max_open"] += 1
                 continue
             is_idx = t["und"] in index_like
-            if is_idx and n_idx >= sz["correlated_cap_mult"]:
+            if is_idx and sum(1 for p in open_ if p["t"]["und"] in index_like) >= sz["correlated_cap_mult"]:
                 skipped["correlated_cap"] += 1
                 continue
             if e_pre <= 0 or t["max_loss"] <= 0:
                 skipped["no_equity"] += 1
                 continue
-            open_.append({"t": t, "n": tier * e_pre / t["max_loss"], "last": t["mtm"].get(day, 0.0)})
-            n_idx += is_idx
+            n = tier * e_pre / t["max_loss"]
+            if integer:
+                n = math.floor(n + 1e-9)
+                if n <= 0:
+                    skipped["round_to_0"] += 1
+                    continue
+            open_.append({"t": t, "n": n, "last": t["mtm"].get(day, 0.0)})
             taken += 1
-        eq.append(E0 + realized + sum(p["n"] * p["last"] for p in open_))
-    return {"tier": tier, "equity": eq, "taken": taken, "skipped": dict(skipped)}
+        eq.append(e0 + realized + sum(p["n"] * p["last"] for p in open_))
+    attempted = taken + skipped["round_to_0"]
+    return {"tier": tier, "equity": eq, "taken": taken, "skipped": dict(skipped),
+            "zero_share": (skipped["round_to_0"] / attempted if integer and attempted else None)}
 
 
-def _segment_stats(cal: list[str], eq: list[float], start: int) -> dict:
-    """cal[start:] 这一段的月收益（均值 / 中位）、最差一周、最大回撤；基准 = 段前一天净值（start=0 时用初始净值）。"""
+def _segment_stats(cal: list[str], eq: list[float], start: int, e0: float = E0) -> dict:
+    """cal[start:] 这一段的月收益（中位 / 均值）、最差一周、最大回撤；基准 = 段前一天净值（start=0 时用初始净值）。"""
     if start >= len(cal):
         return {"months": 0, "monthly_mean": None, "monthly_median": None, "worst_week": None, "worst_week_label": None, "max_drawdown": None, "total_return": None}
-    base = eq[start - 1] if start > 0 else E0
+    base = eq[start - 1] if start > 0 else e0
     months: dict[str, float] = {}
     weeks: dict[tuple, float] = {}
     peak, dd = base, 0.0
@@ -801,15 +963,23 @@ def _segment_stats(cal: list[str], eq: list[float], start: int) -> dict:
 def sizing_report(trades: list[dict], cal: list[str], spec: dict, label: str, index_like: set[str], order: dict | None = None) -> dict:
     sz = spec["sizing"]
     ti = next((i for i, d in enumerate(cal) if d >= TEST_START), len(cal))
-    te_rets = [t["ret"] for t in trades if seg_of(t["entry_date"]) == "test"]
-    kf = kelly_f(te_rets)
+    kc = kelly_capped(trades, spec)
     tiers = []
     for tier in sz["risk_per_trade"]:
         s = size_account(trades, cal, tier, spec, index_like, order)
+        si = size_account(trades, cal, tier, spec, index_like, order, e0=INT_ACCOUNT, integer=True)
         tiers.append({"tier": tier, "taken": s["taken"], "skipped": s["skipped"],
-                      "test": _segment_stats(cal, s["equity"], ti), "full": _segment_stats(cal, s["equity"], 0)})
-    return {"label": label, "n_trades": len(trades), "n_test_trades": len(te_rets), "kelly_full": kf,
-            "kelly_quarter": (kf * sz["kelly_fraction"] if kf is not None else None), "tiers": tiers}
+                      "test": _segment_stats(cal, s["equity"], ti), "full": _segment_stats(cal, s["equity"], 0),
+                      "integer": {"account": INT_ACCOUNT, "taken": si["taken"], "skipped": si["skipped"], "zero_share": si["zero_share"],
+                                  "mostly_zero": bool(si["zero_share"] is not None and si["zero_share"] > 0.5),
+                                  "test": _segment_stats(cal, si["equity"], ti, INT_ACCOUNT), "full": _segment_stats(cal, si["equity"], 0, INT_ACCOUNT)}})
+    ksim = None
+    if kc["fraction"]:
+        s = size_account(trades, cal, kc["fraction"], spec, index_like, order)
+        ksim = {"fraction": kc["fraction"], "taken": s["taken"], "skipped": s["skipped"],
+                "test": _segment_stats(cal, s["equity"], ti), "full": _segment_stats(cal, s["equity"], 0)}
+    return {"label": label, "n_trades": len(trades), "n_test_trades": sum(1 for t in trades if seg_of(t["entry_date"]) == "test"),
+            "kelly": kc, "kelly_sim": ksim, "tiers": tiers}
 
 
 # ---------------------------------------------------------------- 驱动
@@ -819,6 +989,22 @@ def load_quotes(root: Path, und: str) -> Quotes | None:
         return None
     ex = [x for x in (Quotes._load(root / sub / und) for sub in EXTRA_SUBS) if x is not None]
     return Quotes(main, pd.concat(ex, ignore_index=True) if ex else None)
+
+
+def write_needed_if_changed(root: Path, new: dict[str, dict[str, set]]) -> bool:
+    """写 meta/extra_needed_v2.json，但内容没变就不动文件（否则每跑一遍回测它的修改时间都比补数据新，完整性闸门会永远报“补数据没跑”）。"""
+    p = root / "meta" / NEEDED_FILE
+    cur = json.loads(p.read_text()) if p.exists() else {}
+    changed = False
+    for u, dd in new.items():
+        m = {k: set(v) for k, v in cur.get(u, {}).items()}
+        for day, syms in dd.items():
+            m.setdefault(day, set()).update(syms)
+        if cur.get(u) != {k: sorted(v) for k, v in sorted(m.items())}:
+            changed = True
+    if changed:
+        write_extra_needed(root, new, NEEDED_FILE)
+    return changed
 
 
 def run(root: Path, unds: list[str] | None, strat_ids: list[str] | None, spec: dict, earnings_path: Path | None = None,
@@ -855,6 +1041,7 @@ def run(root: Path, unds: list[str] | None, strat_ids: list[str] | None, spec: d
             continue
         ctx = Ctx(u, days, [adj_d[d] for d in days], [raw_d[d] for d in days], q, spec)
         cal.update(d for d in days if d >= SAMPLE_START)
+        test_weeks = weeks_between(max(TEST_START, days[0]), days[-1]) if days and days[-1] >= TEST_START else []
         need: dict[str, set] = {}
         for s in mine:
             if s["entry"] == "earnings_eve":
@@ -870,13 +1057,17 @@ def run(root: Path, unds: list[str] | None, strat_ids: list[str] | None, spec: d
                 cands = scan_entries(s, ctx)
             for day, syms in extra_needed_for(s, ctx, cands).items():
                 need.setdefault(day, set()).update(syms)
-            tr, sig, sk = simulate(s, ctx, spec, cands)
+            split: dict = {}
+            tr, sig, sk = simulate(s, ctx, spec, cands, split)
             if s["entry"] == "earnings_eve":
-                for k, v in bad.items():
-                    sk[k] = sk.get(k, 0) + v
-            results.append(evaluate(s, u, tr, sig, sk, spec))
+                for k, dates in bad.items():
+                    sk[k] = sk.get(k, 0) + len(dates)
+                    for dd in dates:
+                        for lab in day_labels(dd):
+                            split.setdefault(lab, Counter())[k] += 1
+            results.append(evaluate(s, u, tr, sig, sk, spec, skips_split=split, weeks=test_weeks))
             trades_all += tr
-        write_extra_needed(root, {u: need}, NEEDED_FILE)
+        write_needed_if_changed(root, {u: need})
         extra_rows[u] = q.n_extra
         unresolved[u] = still_missing(q, need)
         del q, ctx
@@ -885,12 +1076,17 @@ def run(root: Path, unds: list[str] | None, strat_ids: list[str] | None, spec: d
     n_zero = sum(x.get("n_no_more_quotes", 0) for x in results)
     if n_zero:
         warnings.append(f"{n_zero} 笔仓位平仓前一直没有完整报价，按最大亏损记；若还没跑过 `opra_fetch --extra --needed-file {NEEDED_FILE} --extra-sub {EXTRA_SUB_V2} --download --yes`，先补数据再看结论")
+    n_sm = sum(x.get("n_stop_on_missing", 0) for x in results)
+    if n_sm:
+        warnings.append(f"{n_sm} 笔在缺腿日按“内在价值下界”触发了止损（stop_on_missing，保守口径，单独计数）")
     n_na = sum(x.get("n_no_ask_close", 0) for x in results)
     if n_na:
         warnings.append(f"{n_na} 笔平仓时空头腿没有卖价，按该价差最大亏损平仓（保守口径，单独计数）")
+    comp = completeness_check(results, root, unresolved)
+    gates = apply_gates(results, comp)
     index_like = set(spec["universe"]["index_like"])
     sizing = sizing_sets(trades_all, sorted(cal), results, spec, index_like)
-    out = {"spec_version": "v2", "spec_sha256_16": spec.get("_sha16"), "sample": [SAMPLE_START, "latest"], "train_end": TRAIN_END, "test_start": TEST_START,
+    out = {"gates": gates, "spec_version": "v2", "spec_sha256_16": spec.get("_sha16"), "sample": [SAMPLE_START, "latest"], "train_end": TRAIN_END, "test_start": TEST_START,
            "n_trials": N_TRIALS, "bonferroni": BONF, "extra_rows": extra_rows, "unresolved_extra": unresolved,
            "results": results, "sizing": sizing, "warnings": warnings}
     return out, trades_all
@@ -913,15 +1109,51 @@ def sizing_sets(trades: list[dict], cal: list[str], results: list[dict], spec: d
         sets.append((f"{s['id']}（该策略全部标的，示意）", [t for t in trades if t["strategy"] == s["id"]], False))
     out = []
     for lab, tr, is_passed in sets:
-        r = sizing_report(tr, cal, spec, lab, index_like, order) if tr else {"label": lab, "n_trades": 0, "n_test_trades": 0, "kelly_full": None, "kelly_quarter": None, "tiers": []}
+        r = sizing_report(tr, cal, spec, lab, index_like, order) if tr else {"label": lab, "n_trades": 0, "n_test_trades": 0, "kelly": None, "kelly_sim": None, "tiers": []}
         r["passed_set"] = is_passed
         out.append(r)
     return out
 
 
 # ---------------------------------------------------------------- 报告（中文）
+RULING_ZH = ("**过关标准澄清 —— Opus 裁定 2026-10-25（看结果前）**：影子门槛在 toml 原有四条（考试段主口径总盈亏 > 0；考试段簇数 ≥ 10；考试段 p < 0.10；不是“好得离谱”）之外，"
+             "再加两条——**整个样本主口径扣费后净盈亏 > 0**，且**训练段总盈亏 > 0**（取代“训练段平均每笔同号”）。训练段总盈亏为负的策略，即使考试段为正也不能过。"
+             "两次暴跌窗口（2024-08-01 至 08-16、2025-04-01 至 04-30）必须按“持仓期间盈亏”（和窗口有重叠的每一笔的整笔盈亏）展示在报告顶部。"
+             "p 值用按日历周的时间块自助法（整周重抽），不再把每笔当独立。")
+
+
 def _ret(x) -> str:
     return "-" if x is None else f"{x * 100:+.1f}%"
+
+
+def _mm(te: dict) -> str:
+    """月收益：中位数在前，均值放括号。"""
+    return f"{_ret(te['monthly_median'])}（均值 {_ret(te['monthly_mean'])}）"
+
+
+def _dd(x) -> str:
+    return "-" if x is None else f"{x * 100:.1f}%"
+
+
+def banner_lines(out: dict) -> list[str]:
+    g = out.get("gates") or {}
+    L = []
+    comp = g.get("completeness") or {"complete": True, "reasons": []}
+    if not comp["complete"]:
+        L.append("**【未完成：先补数据】** 下面所有“过关”标志都已强制置为“否”，数字只能当草稿看。原因：" + "；".join(comp["reasons"]))
+    ctrl = g.get("control")
+    if ctrl and ctrl["alarm"]:
+        L.append(f"**【红色警报：对照组赚钱 → 先查 bug】** F4c（财报日买跨式，文献预计扣成本后亏）在主口径下考试段合计 {ctrl['test_pnl']:+,.0f}、整样本合计 {ctrl['all_pnl']:+,.0f} 美元，大于 0。"
+                 "这说明回测有 bug 或口径错，F4（财报铁蝶）全部不许过。")
+    return L
+
+
+def _sizing_pick(out: dict) -> tuple[dict | None, str]:
+    sets = out["sizing"]
+    s = next((x for x in sets if x.get("passed_set")), None)
+    if s:
+        return s, "过关组合"
+    return next((x for x in sets if x["label"].startswith("全部策略")), None), "全部策略合计；没过关，仅示意"
 
 
 def summary_lines(out: dict) -> list[str]:
@@ -930,45 +1162,78 @@ def summary_lines(out: dict) -> list[str]:
     live = [x for x in passed if x["live_stat_ok"]]
     n = len(res)
     ok = sum(1 for x in res if x["status"] == "ok" and x["all"]["trades"] > 0)
+    fp = "（28 个组合按 10% 的影子门槛，纯靠运气平均也会有 28×0.10≈2.8 个“通过”；影子通过不是证明，只是进入影子记账继续观察）"
     if passed:
         l1 = (f"1. 本次跑了 {n} 个（策略,标的）组合（全套共 28 个），其中跑出交易的有 {ok} 个，按预先登记标准过了“影子记账”门槛的有 {len(passed)} 个："
               + "、".join(f"{x['strategy']}/{x['und']}" for x in passed) + "；其中统计上够上真钱门槛（p<0.05/60）的有 "
-              + (f"{len(live)} 个。" if live else "0 个（要再走“影子 + 模拟账户满 8 周”那条路）。"))
+              + (f"{len(live)} 个。" if live else "0 个（要再走“影子 + 模拟账户满 8 周”那条路）。") + fp)
     elif ok == 0:
-        l1 = "1. 现在还没有可用的报价数据（或日线收盘），一个组合都没跑出交易——先按下面“下一步”补数据，这份报告里的数字都是空的。"
+        l1 = "1. 现在还没有可用的报价数据（或日线收盘），一个组合都没跑出交易——先按下面“下一步”补数据，这份报告里的数字都是空的。" + fp
     else:
-        l1 = f"1. 本次跑了 {n} 个（策略,标的）组合（全套共 28 个），其中跑出交易的有 {ok} 个，按预先登记标准一个都没过影子门槛（不进影子记账）。"
-    sets = out["sizing"]
-    s = next((x for x in sets if x.get("passed_set")), None) or next((x for x in sets if x["label"].startswith("全部策略")), None)
-    lab = "过关组合" if s and s.get("passed_set") else "全部策略合计；没过关，仅示意"
+        l1 = f"1. 本次跑了 {n} 个（策略,标的）组合（全套共 28 个），其中跑出交易的有 {ok} 个，按预先登记标准一个都没过影子门槛（不进影子记账）。" + fp
+    s, lab = _sizing_pick(out)
     lines = [l1]
     tiers = s["tiers"] if s else []
     if not tiers:
         lines += [f"{k}. 每笔最多亏账户 {int(t * 100)}% 的档位：没有交易，算不出月收益。" for k, t in zip((2, 3, 4), (0.02, 0.05, 0.10))]
         lines.append("5. 最大回撤：没有交易，算不出。")
-    else:
-        for k, t in zip((2, 3, 4), tiers):
-            te = t["test"]
-            lines.append(f"{k}. 每笔最多亏账户 {t['tier'] * 100:.0f}% 的档位（{lab}）：考试段平均每月 {_ret(te['monthly_mean'])}，中位数 {_ret(te['monthly_median'])}，最差一周 {_ret(te['worst_week'])}。")
-        dd = "、".join(f"{t['tier'] * 100:.0f}% 档 {t['test']['max_drawdown'] * 100:.0f}%" if t["test"]["max_drawdown"] is not None else f"{t['tier'] * 100:.0f}% 档 -" for t in tiers)
-        full = "、".join(f"{t['full']['max_drawdown'] * 100:.0f}%" if t["full"]["max_drawdown"] is not None else "-" for t in tiers)
-        lines.append(f"5. 最大回撤（考试段）：{dd}；整个样本（含 2024-08 日元平仓、2025-04 关税暴跌）三档分别是 {full}。")
+        return lines
+    for k, t in zip((2, 3, 4), tiers):
+        te, it = t["test"], t["integer"]
+        zero = ("；$5,000 账户取整张后大多数交易是 0 张，这一档在小账户上做不了" if it["mostly_zero"] else
+                (f"；$5,000 账户取整张：月中位 {_ret(it['test']['monthly_median'])}（均值 {_ret(it['test']['monthly_mean'])}），{(it['zero_share'] or 0) * 100:.0f}% 的单取整成 0 张"))
+        lines.append(f"{k}. 每笔最多亏账户 {t['tier'] * 100:.0f}%（{lab}）：考试段月收益中位数 {_ret(te['monthly_median'])}（均值 {_ret(te['monthly_mean'])}），最差一周 {_ret(te['worst_week'])}{zero}。")
+    dd = "、".join(f"{t['tier'] * 100:.0f}% 档 {_dd(t['test']['max_drawdown'])}" for t in tiers)
+    full = "、".join(_dd(t["full"]["max_drawdown"]) for t in tiers)
+    kc = s.get("kelly")
+    kt = (f"；四分之一凯利（训练段估计）= {('每笔冒账户 %.1f%%' % (kc['fraction'] * 100)) if kc and kc['fraction'] is not None else '样本不足'}" if kc else "")
+    lines.append(f"5. 最大回撤（考试段）：{dd}；整个样本（含 2024-08 日元平仓、2025-04 关税暴跌）三档分别是 {full}{kt}。三档都列出，不挑最好的一档当标题。")
     return lines
+
+
+def crash_lines(out: dict) -> list[str]:
+    names = list(CRASH_WINDOWS)
+    L = ["## 两次暴跌窗口（持仓期间盈亏：和窗口有重叠的每一笔的整笔盈亏，主口径，每笔 1 张）", "",
+         "| 策略 | 标的 | " + " | ".join(f"{n}（盈亏$ / 笔数）" for n in names) + " |", "|---|---|" + "---|" * len(names)]
+    tot = {n: [0.0, 0] for n in names}
+    for x in out["results"]:
+        if x["status"] != "ok" or not x["all"]["trades"]:
+            continue
+        cells = []
+        for n in names:
+            w = x["windows"][n]
+            tot[n][0] += w["overlap_pnl"]
+            tot[n][1] += w["overlap_trades"]
+            cells.append(f"{usd(w['overlap_pnl'])} / {w['overlap_trades']}")
+        L.append(f"| {x['strategy']} | {x['und']} | " + " | ".join(cells) + " |")
+    L.append("| **合计** | | " + " | ".join(f"**{usd(tot[n][0])} / {tot[n][1]}**" for n in names) + " |")
+    L.append("")
+    return L
 
 
 def write_report(out: dict, spec: dict, path: Path) -> None:
     res = out["results"]
     L = ["# 期权策略 v2 回测报告（真实历史买卖报价，预先登记）", ""]
+    b = banner_lines(out)
+    if b:
+        L += b + [""]
     L += summary_lines(out) + [""]
+    L += [RULING_ZH, ""]
+    L += crash_lines(out)
     L += [f"样本 {SAMPLE_START} → 最近一个交易日；训练段到 {TRAIN_END}，**考试段 {TEST_START} → 现在**；所有结论只看考试段、主口径（卖在买价、买在卖价，扣全部成本）。",
           f"一共试了 {N_TRIALS} 次（v1 32 + v2 28），统计显著性按 Bonferroni 校正：单次 p 要小于 {BONF:.5f}。规格文件 sha256 前 16 位 = {out['spec_sha256_16']}（登记值 {EXPECTED_SPEC_SHA16}）。", "",
           "## 先读这几条（口径和局限）", "",
           "- 现价用当天 IEX 日线不复权收盘近似 15:59；IV30 用 Black–Scholes 从 ≥15:50 的报价中间价反解（利率 4.5%，不考虑分红）；RV20 只用 d−21…d−1 的收盘（20 个日对数收益），当天收盘不进。",
           "- 价差/铁鹰/铁蝶的最大亏损 = 宽度 − 收到的权利金（铁鹰取两边宽度的大者），借方策略 = 付出的权利金；“每笔收益率”= 盈亏 ÷ 最大亏损，跨策略可比。",
-          "- 入场、止盈都要求每条腿价差 ≤ max(15% 中间价, 0.05 美元) 且报价不早于 15:50；止损、临近到期、持满天数、财报次日出场不挑流动性，照主口径成交。",
-          "- 平仓时空头腿没有卖价 -> 按该价差最大亏损平仓；多头腿没有买价 -> 按 0；补数据后仍然一直没有完整报价 -> 按最大亏损。这三类都单独计数（见各策略表）。",
+          "- 入场、止盈要求每条腿价差 ≤ max(15% 中间价, 0.05 美元)；**所有**出场（止盈、止损、持满、临近到期、财报次日）只认 ≥15:50 ET（半天市 12:50）的报价，过期报价算缺失。",
+          "- 缺腿日（任何一条腿没有可用报价）：不许止盈；信用结构用当天标的收盘价算平仓成本的内在价值下界，若下界已击穿止损线，按 max(下界 + 手续费, 止损价估计) 平仓并封顶最大亏损（记 stop_on_missing，单独计数）；"
+          "借方结构从内在价值推不出“已击穿”，所以缺腿日不触发止损，只在盯市里用更差的标记。持满/临近到期的时间出场顺延到下一个所有腿都有可用报价的日子。",
+          "- 平仓时空头腿没有卖价 -> 按该价差最大亏损平仓；多头腿没有买价 -> 按 0；一直没有完整可用报价 -> 从第一天没报价那天起按最大亏损记（不是拖到到期）。这几类都单独计数。",
+          "- 盯市（算仓位回撤）：缺腿日用“上一个标记”和“内在价值下界”里更差的那个。",
           "- “参考口径”（成交在中间价 ± 75% / 50% 半价差）**仅参考，不作为结论**：只在参考口径下才赚钱的策略，下一步是在 Alpaca 模拟账户实测成交价，不是上真钱。",
-          "- “好得离谱”（考试段每笔平均 > 最大亏损的 40%，或胜率 > 95% 且 ≥30 笔）先当 bug 查，不算过关。", ""]
+          "- “好得离谱”：考试段每笔平均 > 最大亏损的 40%，或胜率 > 95% 且 ≥30 笔；价差/铁鹰另加：胜率 > 90% 且 ≥20 笔且每笔平均 > 最大亏损的 25%。先当 bug 查，不算过关。",
+          "- 完整性闸门：某组 > 5% 的笔以“之后没报价 / 缺腿日止损”收尾，或补数据还没跑 -> 整份报告标“未完成”，所有过关标志置否。",
+          "- 同一份报告每次另存一份带时间戳的副本（options_v2_YYYYMMDD_HHMM.md / .json）。", ""]
     for w in out["warnings"]:
         L.append(f"- 警告：{w}")
     if out["warnings"]:
@@ -986,12 +1251,14 @@ def write_report(out: dict, spec: dict, path: Path) -> None:
             L += ["**没有财报日历**（knowledge/earnings_history.json 不存在），这条策略跳过。", ""]
         if "no_data" in notes:
             L += ["有标的没有报价/收盘数据，见警告。", ""]
-        L += ["| 标的 | 笔数 | 胜率 | 每笔平均收益(占最大亏损) | 总盈亏$(每笔1张) | 训练段$ | 考试段$ | 考试段簇数 | p值(簇自助法,单边) | 最差一笔$ | 最长连亏 | 2024-08窗口$(已平仓) | 2025-04窗口$(已平仓) | 平仓无卖价/无后续报价 | 影子门槛 | 上真钱统计门槛 |",
+        L += ["| 标的 | 笔数 | 胜率 | 每笔平均收益(占最大亏损) | 总盈亏$(每笔1张) | 训练段$ | 考试段$ | 考试段簇数 | p值(按周块自助法,单边) | 最差一笔$ | 最长连亏 | 2024-08窗口$(持仓期间) | 2025-04窗口$(持仓期间) | 平仓无卖价/无后续报价/缺腿止损 | 影子门槛 | 上真钱统计门槛 |",
               "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
         for x in rr:
             a = x["all"]
             w = x["windows"]
             verdict = "好得离谱:先查bug" if x["too_good"] else ("**过**" if x["shadow_pass"] else "没过")
+            if x["shadow_criteria_met"] and x["blocked_by"]:
+                verdict = "标准达到但被闸门挡住：" + "、".join({"incomplete": "数据未完成", "control_group_profit": "对照组赚钱"}.get(k, k) for k in x["blocked_by"])
             if x["sample_note"]:
                 verdict += "（样本不够）"
             if x["status"] != "ok":
@@ -999,8 +1266,9 @@ def write_report(out: dict, spec: dict, path: Path) -> None:
             live = "是" if x["live_stat_ok"] else "否"
             wt = x["worst_trade"]["pnl"] if x["worst_trade"] else None
             L.append(f"| {x['und']} | {a['trades']} | {pct(a['win_rate'])} | {_ret(a['avg_ret'])} | {usd(a['total_pnl'])} | {usd(x['train']['total_pnl'])} | {usd(x['test']['total_pnl'])} | "
-                     f"{x['traded_clusters_test']} | {fnum(x['test_cluster_boot_p'], '.3f')} | {usd(wt)} | {x['max_consec_losses']} | "
-                     f"{usd(w['2024-08-01..2024-08-16']['realized_pnl'])} | {usd(w['2025-04-01..2025-04-30']['realized_pnl'])} | {x['n_no_ask_close']}/{x['n_no_more_quotes']} | {verdict} | {live} |")
+                     f"{x['traded_clusters_test']} | {fnum(x['test_week_boot_p'], '.3f')} | {usd(wt)} | {x['max_consec_losses']} | "
+                     f"{usd(w['2024-08-01..2024-08-16']['overlap_pnl'])} | {usd(w['2025-04-01..2025-04-30']['overlap_pnl'])} | "
+                     f"{x['n_no_ask_close']}/{x['n_no_more_quotes']}/{x['n_stop_on_missing']} | {verdict} | {live} |")
         L.append("")
         L += ["参考口径（**仅参考，不作为结论**）：每笔平均收益 / 考试段总盈亏$（成交在中间价 ± 半价差 × 比例）", "",
               "| 标的 | " + " | ".join(f"{float(k) * 100:.0f}%半价差" for k in rr[0]["ref"]) + " |", "|---|" + "---|" * len(rr[0]["ref"])]
@@ -1011,32 +1279,53 @@ def write_report(out: dict, spec: dict, path: Path) -> None:
           "| 策略 | 标的 | 信号日 | 实际开仓 | " + " | ".join(n for _, n in SKIP_ZH) + " | 状态 |", "|---|---|---|---|" + "---|" * (len(SKIP_ZH) + 1)]
     for x in res:
         L.append(f"| {x['strategy']} | {x['und']} | {x['signal_days']} | {x['all']['trades']} | " + " | ".join(str(x["skips"].get(k, 0)) for k, _ in SKIP_ZH) + f" | {x['status']} |")
+    L += ["", "### 被跳过的信号，按训练段 / 考试段 / 暴跌窗口拆开", "",
+          "暴跌窗口和训练段/考试段有重叠（两个窗口都落在训练段里），所以一个跳过可能同时计入两行。只列有跳过的行。", "",
+          "| 策略 | 标的 | 切片 | " + " | ".join(n for _, n in SKIP_ZH) + " |", "|---|---|---|" + "---|" * len(SKIP_ZH)]
+    for x in res:
+        for lab in ("train", "test", *CRASH_WINDOWS):
+            sp = x.get("skips_split", {}).get(lab)
+            if sp:
+                L.append(f"| {x['strategy']} | {x['und']} | {ZH_SLICE.get(lab, lab)} | " + " | ".join(str(sp.get(k, 0)) for k, _ in SKIP_ZH) + " |")
     L.append("")
     L += ["## 小结", ""]
     passed = [x for x in res if x["shadow_pass"]]
-    L.append(f"{len(res)} 个（策略, 标的）组合里过影子门槛的有 {len(passed)} 个：" + ("、".join(f"{x['strategy']}/{x['und']}" for x in passed) if passed else "无") + "。")
-    L.append("影子门槛 = ① 考试段主口径总盈亏 > 0；② 考试段簇数 ≥ 10；③ 训练段每笔平均和考试段同号（都赚）；④ 考试段簇自助法 p < 0.10；且不是“好得离谱”。"
+    L.append(f"{len(res)} 个（策略, 标的）组合里过影子门槛的有 {len(passed)} 个：" + ("、".join(f"{x['strategy']}/{x['und']}" for x in passed) if passed else "无") + "。"
+             "28 个组合按 10% 的影子门槛，纯靠运气平均会有 28×0.10≈2.8 个“通过”；影子通过不是证明。")
+    L.append("影子门槛 = ① 考试段主口径总盈亏 > 0；② 考试段簇数 ≥ 10；③ 整个样本净盈亏 > 0 且训练段总盈亏 > 0；④ 考试段按周块自助法 p < 0.10；且不是“好得离谱”、数据完整、对照组没赚钱。"
              "上真钱的统计门槛另加 p < 0.05/60，或者影子 + Alpaca 模拟账户满 8 周且实际成交价和回测主口径差距 < 30%（后一条这里算不了，要线上实测）。没过的不进影子记账。")
     L += ["", "## 仓位换算：把“每笔收益率”翻译成账户的月收益 / 回撤", "",
-          "做法：每笔在入场时冒“档位 × 当时账户净值”的最大亏损（所以张数是小数，实盘要取整，小账户取整后风险会偏离）；同时最多持 "
-          f"{spec['sizing']['max_open']} 笔；同一天开的 SPY/QQQ/SOXX/SMH 持仓视为完全相关，合计最多 {spec['sizing']['correlated_cap_mult']} 笔（= 单档 × {spec['sizing']['correlated_cap_mult']} 的风险）；"
-          "净值逐日按平仓价盯市。月收益、最差一周、最大回撤都是**考试段**（2025-07 起）的；“整样本最大回撤/最差一周”包含 2024-08 和 2025-04 两次暴跌。"
-          "“四分之一凯利”= 用考试段每笔收益率估出的凯利比例 × 1/4（单位是“每笔最大亏损占账户的比例”，把各笔当独立重复的赌局，不考虑同时持仓，偏乐观）。", ""]
+          "做法：每笔在入场时冒“档位 × 当时账户净值”的最大亏损；同时最多持 "
+          f"{spec['sizing']['max_open']} 笔；SPY/QQQ/SOXX/SMH 视为完全相关，**所有当前还开着的**这类持仓合计最多 {spec['sizing']['correlated_cap_mult']} 笔（= 单档 × {spec['sizing']['correlated_cap_mult']} 的风险，不只算同一天开的）；"
+          "净值逐日按盯市估（缺腿日用更差的标记）。月收益标题用**中位数**，均值放括号。月收益、最差一周、最大回撤都是**考试段**（2025-07 起）的；“整样本”包含 2024-08 和 2025-04 两次暴跌。"
+          f"第一张表是 10 万美元账户、张数可以是小数；第二张表是 ${INT_ACCOUNT:,.0f} 小账户、张数向下取整（取整成 0 张就不做，会写出比例，大多数是 0 张的档位在小账户上做不了）。"
+          "**四分之一凯利（训练段估计）**：只用训练段每笔收益率估凯利比例 × 1/4，拿去用在考试段；硬封顶 = 最高一档 10%，样本里只要有一笔亏掉 ≥90% 最大亏损就封顶 5%（把各笔当独立重复的赌局，不考虑同时持仓，仍偏乐观）。", ""]
     for s in out["sizing"]:
         L += [f"### {s['label']}", ""]
         if not s["tiers"]:
             L += ["没有交易。", ""]
             continue
-        kq = s["kelly_quarter"]
-        L.append(f"交易 {s['n_trades']} 笔（考试段 {s['n_test_trades']} 笔）。凯利比例 {fnum(s['kelly_full'], '.3f') if s['kelly_full'] is not None else '样本不足'}，"
-                 f"四分之一凯利 = {('每笔冒账户 %.1f%%' % (kq * 100)) if kq is not None else '样本不足'}。" + ("" if s.get("passed_set") else "（这一组没过关，只是示意“如果硬做会怎样”。）"))
-        L += ["", "| 每笔风险档位 | 开仓笔数 | 因同时持仓上限/相关上限跳过 | 考试段月均 | 月中位 | 考试段最差一周 | 考试段最大回撤 | 整样本最差一周 | 整样本最大回撤 |", "|---|---|---|---|---|---|---|---|---|"]
+        kc = s["kelly"]
+        kl = ("样本不足（训练段 < 5 笔）" if kc["kelly_full"] is None else
+              f"训练段凯利 {kc['kelly_full']:.3f}，× 1/4 = {kc['quarter']:.3f}，{kc['cap_reason']}，实际用 {kc['fraction'] * 100:.1f}%" + ("（被封顶）" if kc["capped"] else ""))
+        L.append(f"交易 {s['n_trades']} 笔（考试段 {s['n_test_trades']} 笔）。{kc['label']}：{kl}。" + ("" if s.get("passed_set") else "（这一组没过关，只是示意“如果硬做会怎样”。）"))
+        L += ["", "10 万美元账户，张数可小数：", "",
+              "| 每笔风险档位 | 开仓笔数 | 因持仓上限/相关上限跳过 | 考试段月收益 中位（均值） | 考试段最差一周 | 考试段最大回撤 | 整样本最差一周 | 整样本最大回撤 |", "|---|---|---|---|---|---|---|---|"]
         for t in s["tiers"]:
             te, fu = t["test"], t["full"]
             sk = "、".join(f"{ {'max_open': '持仓上限', 'correlated_cap': '相关上限', 'no_equity': '净值耗尽'}.get(k, k)} {v}" for k, v in t["skipped"].items()) or "0"
-            L.append(f"| {t['tier'] * 100:.0f}% | {t['taken']} | {sk} | {_ret(te['monthly_mean'])} | {_ret(te['monthly_median'])} | {_ret(te['worst_week'])} | "
-                     f"{fnum(te['max_drawdown'] * 100, '.1f') + '%' if te['max_drawdown'] is not None else '-'} | {_ret(fu['worst_week'])} | "
-                     f"{fnum(fu['max_drawdown'] * 100, '.1f') + '%' if fu['max_drawdown'] is not None else '-'} |")
+            L.append(f"| {t['tier'] * 100:.0f}% | {t['taken']} | {sk} | {_mm(te)} | {_ret(te['worst_week'])} | {_dd(te['max_drawdown'])} | {_ret(fu['worst_week'])} | {_dd(fu['max_drawdown'])} |")
+        ks = s.get("kelly_sim")
+        if ks:
+            te, fu = ks["test"], ks["full"]
+            L.append(f"| 四分之一凯利（训练段估计）{ks['fraction'] * 100:.1f}% | {ks['taken']} | - | {_mm(te)} | {_ret(te['worst_week'])} | {_dd(te['max_drawdown'])} | {_ret(fu['worst_week'])} | {_dd(fu['max_drawdown'])} |")
+        L += ["", f"${INT_ACCOUNT:,.0f} 账户，张数向下取整：", "",
+              "| 每笔风险档位 | 开仓笔数 | 取整成 0 张的比例 | 其他跳过 | 考试段月收益 中位（均值） | 考试段最大回撤 | 说明 |", "|---|---|---|---|---|---|---|"]
+        for t in s["tiers"]:
+            it = t["integer"]
+            sk = "、".join(f"{ {'max_open': '持仓上限', 'correlated_cap': '相关上限', 'no_equity': '净值耗尽'}.get(k, k)} {v}" for k, v in it["skipped"].items() if k != "round_to_0") or "0"
+            note = "大多数交易取整后是 0 张，这一档在小账户上做不了" if it["mostly_zero"] else ""
+            L.append(f"| {t['tier'] * 100:.0f}% | {it['taken']} | {pct(it['zero_share'])} | {sk} | {_mm(it['test'])} | {_dd(it['test']['max_drawdown'])} | {note} |")
         L.append("")
     path.write_text("\n".join(L) + "\n")
 
@@ -1052,16 +1341,23 @@ def next_steps(out: dict, root: Path) -> list[str]:
             "  python -m desk.options_v2_backtest"]
 
 
-def write_outputs(out: dict, trades: list[dict], spec: dict, rdir: Path) -> None:
+def write_outputs(out: dict, trades: list[dict], spec: dict, rdir: Path, now: datetime | None = None) -> list[Path]:
+    """写 latest（options_v2.md / .json / _trades.csv）和一份带时间戳的副本 options_v2_YYYYMMDD_HHMM.md / .json。"""
     rdir.mkdir(parents=True, exist_ok=True)
-    (rdir / "options_v2.json").write_text(json.dumps(out, ensure_ascii=False, indent=1, default=str))
+    stamp = (now or datetime.now()).strftime("%Y%m%d_%H%M")
+    js = json.dumps(out, ensure_ascii=False, indent=1, default=str)
+    (rdir / "options_v2.json").write_text(js)
+    (rdir / f"options_v2_{stamp}.json").write_text(js)
     write_report(out, spec, rdir / "options_v2.md")
+    ts_md = rdir / f"options_v2_{stamp}.md"
+    ts_md.write_text((rdir / "options_v2.md").read_text())
     cols = ["strategy", "und", "kind", "legs", "entry_date", "exit_date", "expiry", "dte_entry", "net_ps", "max_loss", "pnl", "ret", "pnl_lastmark",
             "reason", "no_ask_close", "missing_exit_legs", "iv30", "rv20"] + sorted({k for t in trades for k in t if k.startswith(("pnl_ref", "ret_ref"))})
     with open(rdir / "options_v2_trades.csv", "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
         w.writeheader()
         w.writerows(trades)
+    return [rdir / "options_v2.md", ts_md]
 
 
 def main(argv=None) -> int:
@@ -1082,9 +1378,9 @@ def main(argv=None) -> int:
         fetch_closes(root, a.underlyings or spec["universe"]["all"])
         return 0
     out, trades = run(root, a.underlyings, a.strategies, spec, Path(a.earnings) if a.earnings else None)
-    write_outputs(out, trades, spec, rdir)
-    print(f"完成：{len(out['results'])} 个组合，{len(trades)} 笔 -> {rdir}/options_v2.md、options_v2.json")
-    for line in summary_lines(out):
+    paths = write_outputs(out, trades, spec, rdir)
+    print(f"完成：{len(out['results'])} 个组合，{len(trades)} 笔 -> {paths[0]}（副本 {paths[1].name}）、options_v2.json")
+    for line in banner_lines(out) + summary_lines(out):
         print(line)
     for w in out["warnings"]:
         print(f"警告：{w}")
