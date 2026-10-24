@@ -569,6 +569,123 @@ def estimate_extra(settings, src, db, unds: list[str] | None = None, root: Path 
     return {"has_file": True, "n_requests": len(reqs), "total_usd": round(float(total), 4), "underlyings": list(unds)}
 
 
+# ---------------------------------------------------------------- 卡 L2 round 2：按 (合约, 日) 增量补数据
+def fetched_path(root: Path, sub: str) -> Path:
+    return root / "meta" / f"fetched_{sub}.jsonl"
+
+
+def fetched_pairs(root: Path, sub: str) -> set[tuple[str, str, str]]:
+    """已经补过（试过）的 (标的, 日期, OCC 合约)。账本一行 = 一个成功落盘的请求：{"und","day","occ":[...],"file","rows"}。
+    不再用"月文件在不在"判断：同一个月后来才出现的新需求照样会补。"""
+    p = fetched_path(root, sub)
+    out: set[tuple[str, str, str]] = set()
+    if not p.exists():
+        return out
+    for line in p.read_text().splitlines():
+        try:
+            r = json.loads(line)
+        except ValueError:
+            continue
+        for occ in r.get("occ", []):
+            out.add((r["und"], r["day"], occ))
+    return out
+
+
+def _incremental_requests(src, unds: list[str], root: Path, needed_file: str, sub: str) -> tuple[list[dict], int, int] | None:
+    """(待补请求, 清单里的 (合约,日) 总数, 其中已补过的数)；清单不存在 -> None。每个请求 = 一天里最多 MAX_SYMBOLS 个还没补过的合约。"""
+    p = root / "meta" / needed_file
+    if not p.exists():
+        return None
+    need = json.loads(p.read_text())
+    done = fetched_pairs(root, sub)
+    reqs, total, have = [], 0, 0
+    for u in unds:
+        days = need.get(u) or {}
+        todo: dict[str, list[str]] = {}
+        for ds, occs in days.items():
+            valid = [o for o in occs if OCC.match(o)]
+            total += len(valid)
+            miss = sorted(o for o in set(valid) if (u, ds, o) not in done)
+            have += len(set(valid)) - len(miss)
+            if miss:
+                todo[ds] = miss
+        if not todo:
+            continue
+        ct = src.close_times(date.fromisoformat(min(todo)), date.fromisoformat(max(todo)))
+        for ds in sorted(todo):
+            t0, t1 = day_window(date.fromisoformat(ds), ct.get(ds, "16:00"))
+            for k, ch in enumerate(chunks(todo[ds])):
+                reqs.append({"und": u, "month": month_of(ds), "day": ds, "chunk": k, "occ": ch, "symbols": [occ_to_osi(x) for x in ch],
+                             "start": t0.isoformat(), "end": t1.isoformat()})
+    return reqs, total, have
+
+
+def plan_extra_incremental(settings, src, db, unds: list[str] | None = None, budget_usd: float | None = None, root: Path | None = None,
+                           needed_file: str = "extra_needed.json", sub: str = EXTRA_SUB, workers: int = MAX_WORKERS, sleep=time.sleep) -> dict:
+    """增量补数据的计划（程序可读）：只算还没补过的 (合约,日)，逐请求精确询价（免费），最便宜的优先，累计 ≤ min(budget_usd, [opra] max_cost_usd)，
+    放不下的就留到以后（部分完成没关系，绝不"全有或全无"）。返回
+    {"has_file","n_pairs_total","n_pairs_fetched","n_requests","total_usd"（全部待补）,"budget_usd","plan_usd","n_selected","n_selected_pairs","selected":[请求…]}。"""
+    root = root or (settings.data / "opra")
+    p = root / "meta" / needed_file
+    base = {"has_file": False, "n_pairs_total": 0, "n_pairs_fetched": 0, "n_requests": 0, "total_usd": 0.0, "budget_usd": budget_usd,
+            "plan_usd": 0.0, "n_selected": 0, "n_selected_pairs": 0, "selected": []}
+    if not p.exists():
+        return base
+    if unds is None:
+        unds = sorted(u for u, d in json.loads(p.read_text()).items() if d)
+    reqs, total, have = _incremental_requests(src, unds, root, needed_file, sub)
+    base.update(has_file=True, n_pairs_total=total, n_pairs_fetched=have, n_requests=len(reqs))
+    if not reqs:
+        return base
+    price_plan(db, reqs, workers, sleep)
+    cap = max_cost(settings)
+    limit = cap if budget_usd is None else min(float(budget_usd), cap)
+    reqs.sort(key=lambda r: (r["cost"], r["und"], r["day"], r["chunk"]))
+    chosen, acc = [], 0.0
+    for r in reqs:
+        if acc + r["cost"] > limit + 1e-9:
+            break                                   # 升序：这一个放不下，后面的更放不下
+        chosen.append(r)
+        acc += r["cost"]
+    base.update(total_usd=round(sum(r["cost"] for r in reqs), 4), plan_usd=round(acc, 4), n_selected=len(chosen),
+                n_selected_pairs=sum(len(r["occ"]) for r in chosen), selected=chosen)
+    return base
+
+
+def run_extra_incremental(settings, src, db, unds: list[str] | None = None, budget_usd: float | None = None, root: Path | None = None,
+                          needed_file: str = "extra_needed.json", sub: str = EXTRA_SUB, out=print, workers: int = MAX_WORKERS,
+                          sleep=time.sleep) -> dict:
+    """按计划下载。每个 (标的, 月) 写一个新文件 <月>.i<序号>.parquet（加载器 glob *.parquet，文件名前 7 位是月份，所以和旧文件并存），
+    写完立刻把这批 (合约,日) 记进 meta/fetched_<sub>.jsonl —— 中途被杀也不会重复花钱，下次接着补。返回 {"downloaded_pairs","files","est_usd","plan"}。"""
+    root = root or (settings.data / "opra")
+    plan = plan_extra_incremental(settings, src, db, unds, budget_usd, root, needed_file, sub, workers, sleep)
+    by = defaultdict(list)
+    for r in plan["selected"]:
+        by[(r["und"], r["month"])].append(r)
+    files, pairs, spent = [], 0, 0.0
+    (root / "meta").mkdir(parents=True, exist_ok=True)
+    for (und, month), rs in sorted(by.items()):
+        df = fetch_month(db, rs, workers)
+        d = root / sub / und
+        d.mkdir(parents=True, exist_ok=True)
+        seq = len(list(d.glob(f"{month}.i*.parquet"))) + 1
+        path = d / f"{month}.i{seq:03d}.parquet"
+        tmp = path.with_suffix(".tmp")
+        df.to_parquet(tmp, index=False)
+        tmp.replace(path)
+        with open(fetched_path(root, sub), "a") as f:
+            for r in rs:
+                f.write(json.dumps({"und": und, "day": r["day"], "occ": r["occ"], "file": path.name, "rows": len(df),
+                                    "est_cost_usd": round(r["cost"], 4), "at": datetime.now().isoformat(timespec="seconds")}) + "\n")
+        pairs += sum(len(r["occ"]) for r in rs)
+        spent += sum(r["cost"] for r in rs)
+        files.append(str(path.relative_to(root)))
+        out(f"  {und} {month}：{len(rs)} 个请求，{len(df)} 行，预计 ${sum(r['cost'] for r in rs):,.2f} -> {path.name}")
+        del df
+    out(f"增量补数据：补了 {pairs} 个 (合约,日)；还剩 {plan['n_requests'] - plan['n_selected']} 个请求没放进预算，留到下次。")
+    return {"downloaded_pairs": pairs, "files": files, "est_usd": round(spent, 4), "plan": {k: v for k, v in plan.items() if k != "selected"}}
+
+
 def run_extra(settings, src, db, unds: list[str], mode: str, yes: bool = False, root: Path | None = None,
               out=print, workers: int = MAX_WORKERS, sleep=time.sleep,
               needed_file: str = "extra_needed.json", sub: str = EXTRA_SUB) -> int:
@@ -613,6 +730,8 @@ def main(argv=None) -> int:
     ap.add_argument("--extra", action="store_true", help="补数据：读 meta/extra_needed.json（期权回测第一遍产出），下到 cbbo1m_extra/；配合 --plan / --download")
     ap.add_argument("--needed-file", default="extra_needed.json", help="配合 --extra：meta/ 下的清单文件名（v2 回测用 extra_needed_v2.json）")
     ap.add_argument("--extra-sub", default=EXTRA_SUB, help="配合 --extra：补数据存放的子目录（v2 回测用 cbbo1m_extra_v2，避免和 v1 的月文件互相跳过）")
+    ap.add_argument("--incremental", action="store_true", help="配合 --extra：按 (合约,日) 增量补（已补过的不再补，最便宜的优先，受 --budget-usd 限制，可以只补一部分）；--estimate-json 打印计划，--download --yes 执行")
+    ap.add_argument("--budget-usd", type=float, default=None, help="配合 --incremental：这次最多花多少美元（预估）")
     ap.add_argument("--exact", action="store_true", help="逐个请求精确询价（慢，调用很多）；默认抽样估算 x1.2")
     ap.add_argument("--underlyings", nargs="+", default=UNDERLYINGS)
     ap.add_argument("--start", default=DEFAULT_START)
@@ -648,6 +767,17 @@ def main(argv=None) -> int:
         if a.diagnose:
             print("--extra 要配 --plan 或 --download", file=sys.stderr)
             return 1
+        if a.incremental:
+            if a.estimate_json:
+                pl = plan_extra_incremental(s, src, db, a.underlyings, a.budget_usd, needed_file=a.needed_file, sub=a.extra_sub)
+                print(json.dumps({k: v for k, v in pl.items() if k != "selected"}))
+                return 0
+            if a.plan or not a.yes:
+                print("--incremental 的下载要 --download --yes（只看计划用 --estimate-json）", file=sys.stderr)
+                return 1
+            res = run_extra_incremental(s, src, db, a.underlyings, a.budget_usd, needed_file=a.needed_file, sub=a.extra_sub)
+            print(json.dumps({k: v for k, v in res.items() if k != "plan"}))
+            return 0
         if a.estimate_json:
             print(json.dumps(estimate_extra(s, src, db, a.underlyings, needed_file=a.needed_file, sub=a.extra_sub)))
             return 0

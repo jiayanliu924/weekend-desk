@@ -248,3 +248,13 @@ def test_stale_running_state_from_dead_process(env):  # noqa: F811
     import json as _j
     (agents._dir(s) / "state.json").write_text(_j.dumps({"running": True, "ts": __import__("time").time(), "pid": 999999}))
     assert agents.get_state(s)["running"] is False
+
+
+def test_arena_html_has_honest_limits_when_lab_results_are_shown(env):  # noqa: F811
+    s, web = env
+    from desk import arena
+    assert "期权研究室的诚实限制" not in web._arena_html()                      # 还没有研究室成绩：不显示
+    arena.add_score(s, "LAB_SELL", "lab_dev", 2.5, "DSR +1.20 vs best +0.00 -> +1.20")
+    html = web._arena_html()
+    assert "期权研究室的诚实限制" in html and "开发段只有 18 个月" in html and "金库每看一次就" in html and "不保证找到能赚钱的方案" in html
+    assert "期权真报价" in html and "卖波动派" in html                         # 赛道也在排行榜里

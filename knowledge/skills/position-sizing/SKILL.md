@@ -12,7 +12,7 @@ description: 期权仓位与破产风险说明（风控与提案 agent 用）。
 - 赢率 60%：f* = 20%。押 30%：+1.5%；押 50%：-3.4%。
 - 超过约 2 倍凯利，增长率转负（理论结论）。
 - 真实期权的 edge 远小于上述假设：未核实。
-- 库内报告口径：1/4 凯利（kelly_fraction = 0.25），用考试段估算，并报告每一档的最大回撤、最差一周、月化收益。
+- 库内报告口径：1/4 凯利（kelly_fraction = 0.25），用开发段估算，并报告每一档的最大回撤、最差一周、月化收益。
 
 ## 2. 破产概率（R2 自算：104 笔，每笔押权益比例 f，1:1 赔率）
 - 赢率 55%：f=10% 曾跌破起点 10% 的概率 0.6%；f=30% 为 62%；f=50% 为 96%（中位终值约 0.00008 倍）。
@@ -42,8 +42,8 @@ description: 期权仓位与破产风险说明（风控与提案 agent 用）。
 ## 5. 使用规则
 - 同时持仓 ≤ 6 笔（所有策略合计）。
 - 同日 index_like 价差合计风险 ≤ 单档 × 3。
-- 不设加倍，不因连亏加仓。手动交易里加仓是本能，须开仓前写死（教训簿 2026-10-11）。
+- 不设加倍，不因连亏加仓。手动交易里加仓是本能，须开仓前写死。
 - 每档都报告：最大回撤、最差一周、月化收益、1/4 凯利比例。
 - 样本少的探索性策略（如 F4，每只约 11 次财报）只用最小档（判断）。
 
-来源：knowledge/options_research_v2.md（R2 §1 基金实例、§2 容量、§4 数学）；knowledge/options_strategies_v2.toml（[sizing]、[pass]）；knowledge/options_lab_loop.md §2；knowledge/lessons.md（2026-10-11）。
+来源：knowledge/options_research_v2.md（R2 §1 基金实例、§2 容量、§4 数学）；knowledge/options_strategies_v2.toml（[sizing]、[pass]）；knowledge/options_lab_loop.md §2。

@@ -306,6 +306,66 @@ def test_estimate_extra_is_programmatic_and_matches_run_extra(tmp_path):
     assert of.estimate_extra(st, FakeSrc(), db3, needed_file="extra_needed_lab.json", sub="cbbo1m_extra_lab")["n_requests"] == 0 and db3.cost_calls == 0
 
 
+class PerSymbolDB(FakeDB):
+    """每个请求的价钱 = 0.5 × 符号个数，方便造"便宜的先补"。"""
+
+    def get_cost(self, **kw):
+        self.cost_calls += 1
+        return 0.5 * len(kw["symbols"])
+
+
+def test_incremental_fetch_tracks_pairs_cheapest_first_partial_and_later_needs(tmp_path):
+    """卡 L2 round 2：按 (合约, 日) 记账，不看月文件在不在；预算内最便宜的先补，可以只补一部分；同月后来才出现的需求照样补。"""
+    import json
+    root = tmp_path / "opra"
+    (root / "meta").mkdir(parents=True)
+    st = Settings(tmp_path)
+    A, B, C = "SOXX251024P00270000", "SOXX251024C00295000", "SOXX251024C00300000"
+    need = {"SOXX": {"2025-09-10": [A], "2025-09-11": [A, B, C], "2025-10-01": [A, B]}}
+    nf = root / "meta" / "extra_needed_lab.json"
+    nf.write_text(json.dumps(need))
+    kw = dict(needed_file="extra_needed_lab.json", sub="cbbo1m_extra_lab")
+    assert of.plan_extra_incremental(st, FakeSrc(), PerSymbolDB(), root=tmp_path / "nope", **kw)["has_file"] is False
+    # 计划：三个请求 0.5 / 1.0 / 1.5；预算 1.6 -> 选 0.5 + 1.0（最便宜的先），1.5 那个放不下留到以后
+    plan = of.plan_extra_incremental(st, FakeSrc(), PerSymbolDB(), None, 1.6, **kw)
+    assert plan["n_requests"] == 3 and plan["total_usd"] == 3.0 and plan["plan_usd"] == 1.5 and plan["n_selected"] == 2 and plan["n_selected_pairs"] == 3
+    assert [(r["day"], r["cost"]) for r in plan["selected"]] == [("2025-09-10", 0.5), ("2025-10-01", 1.0)]
+    assert plan["n_pairs_total"] == 6 and plan["n_pairs_fetched"] == 0
+    # 预算连最便宜的都放不下：一个都不选（不是报错）
+    assert of.plan_extra_incremental(st, FakeSrc(), PerSymbolDB(), None, 0.4, **kw)["n_selected"] == 0
+    # [opra] max_cost_usd 仍是硬顶
+    st_cap = Settings(tmp_path, cap=0.7)
+    assert of.plan_extra_incremental(st_cap, FakeSrc(), PerSymbolDB(), None, 99, **kw)["n_selected"] == 1
+    # 执行第一批：只补两个请求；账本里是 (合约, 日)
+    db = PerSymbolDB()
+    res = of.run_extra_incremental(st, FakeSrc(), db, None, 1.6, out=lambda *a: None, **kw)
+    assert res["downloaded_pairs"] == 3 and db.get_calls == 2
+    assert of.fetched_pairs(root, "cbbo1m_extra_lab") == {("SOXX", "2025-09-10", A), ("SOXX", "2025-10-01", A), ("SOXX", "2025-10-01", B)}
+    d = root / "cbbo1m_extra_lab" / "SOXX"
+    assert sorted(p.name for p in d.glob("*.parquet")) == ["2025-09.i001.parquet", "2025-10.i001.parquet"]
+    # 第二批（预算够）：只剩 09-11 那个请求；2025-09 这个月已经有文件了，照样补，写成新文件
+    db2 = PerSymbolDB()
+    res2 = of.run_extra_incremental(st, FakeSrc(), db2, None, 10, out=lambda *a: None, **kw)
+    assert res2["downloaded_pairs"] == 3 and db2.get_calls == 1 and res2["plan"]["n_requests"] == 1
+    assert sorted(p.name for p in d.glob("*.parquet")) == ["2025-09.i001.parquet", "2025-09.i002.parquet", "2025-10.i001.parquet"]
+    assert all(p.stem[:7] in ("2025-09", "2025-10") for p in d.glob("*.parquet"))             # 加载器按文件名前 7 位认月份
+    # 全补完：什么都不做，不询价下载
+    db3 = PerSymbolDB()
+    assert of.run_extra_incremental(st, FakeSrc(), db3, None, 10, out=lambda *a: None, **kw)["downloaded_pairs"] == 0 and db3.get_calls == 0
+    # 回测后来又在已补过的月 / 日里写了新需求：只补新的 (合约, 日)
+    D = "SOXX251024C00310000"
+    need["SOXX"]["2025-09-10"] = [A, D]
+    nf.write_text(json.dumps(need))
+    db4 = PerSymbolDB()
+    plan4 = of.plan_extra_incremental(st, FakeSrc(), db4, None, 10, **kw)
+    assert plan4["n_requests"] == 1 and plan4["selected"][0]["occ"] == [D] and plan4["selected"][0]["cost"] == 0.5 and db4.cost_calls == 1
+    res4 = of.run_extra_incremental(st, FakeSrc(), PerSymbolDB(), None, 10, out=lambda *a: None, **kw)
+    assert res4["downloaded_pairs"] == 1 and (d / "2025-09.i003.parquet").exists()
+    assert ("SOXX", "2025-09-10", D) in of.fetched_pairs(root, "cbbo1m_extra_lab")
+    # 旧的按月文件模式不受影响（不同的账本和命名）
+    assert not (root / "cbbo1m_extra_lab" / "SOXX" / "2025-09.parquet").exists()
+
+
 def test_index_cache_roundtrip_gives_same_requests(tmp_path):
     root = tmp_path / "opra"
     (root / "meta").mkdir(parents=True)

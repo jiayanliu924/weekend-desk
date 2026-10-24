@@ -17,7 +17,7 @@ description: 期权尾部风险检查表（风控 agent 用）。覆盖 2024-08-
 ## 2. 跳空与检查时点
 - 库内出场与估值只用当天 ≥15:50 ET 的最后报价。15:50 之前盘中跌破的止损线，回测里看不见。
 - 因此回测的止损只能估"收盘时还在亏"，估不到"盘中被扫或跳空穿过"的损失。
-- 历史教训：服务器只存 15 分钟均值时，事后无法判断止损是否被扫（2026-10-11 复盘）；"破支撑 10 分钟就走"的紧规则在尾部双向时会被反复扫。
+- 只存粗粒度（如 15 分钟均值）数据时，事后无法判断止损是否被扫；紧止损在尾部双向时容易被反复扫（一般性推理，不是某次回测结果）。
 - 财报跳空：NVDA 财报日涨跌超过 10% 并不罕见（数字未核实）。F4 的 ±8% 翅膀是唯一封顶。
 - 价差的最坏亏损由行权价封顶；止损（浮亏 2 倍权利金）在跳空时可能被跳过，但不超过价差的最大亏损。
 
@@ -44,4 +44,4 @@ description: 期权尾部风险检查表（风控 agent 用）。覆盖 2024-08-
 - 跨式买方（F3）：最大亏损 = 付出的权利金。卖出跨式无封顶，不许使用（库内规则）。
 - 收益率的分母就是保证金，即这个最大亏损（toml 收益口径）。
 
-来源：knowledge/options_lab_loop.md §2、§4；knowledge/options_strategies_v2.toml（[pass]、[sizing]、F1–F4）；knowledge/options_research_v2.md（S4、S5、R2 §2）；knowledge/lessons.md（2026-10-11）；QuantLib / py_vollib 说明见 knowledge/open_source_tools_R3.md §3。
+来源：knowledge/options_lab_loop.md §2、§4；knowledge/options_strategies_v2.toml（[pass]、[sizing]、F1–F4）；knowledge/options_research_v2.md（S4、S5、R2 §2）；QuantLib / py_vollib 说明见 knowledge/open_source_tools_R3.md §3。

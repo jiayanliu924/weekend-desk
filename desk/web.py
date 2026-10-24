@@ -992,9 +992,15 @@ def _arena_html() -> str:
     rev = "".join(f'<li>{datetime.fromtimestamp(r["ts"], PT):%m-%d}：{E("；".join(r["events"]) or "无人淘汰")}</li>' for r in reviews)
     empty = "<tr><td colspan=4>还没有</td></tr>"
     rev_html = f"<div class=k>周评</div><ul>{rev}</ul>" if rev else ""
+    lab_note = ""
+    if any(t["room"] in ("OPT_LAB", "lab_critic") and t["last"] for t in st["table"].values()):      # 显示了期权研究室成绩 -> 带上诚实限制（设计 §7）
+        from . import lab_room
+        lab_note = ('<div class="note" style="margin:8px 0"><b>期权研究室的诚实限制：</b><ul>'
+                    + "".join(f"<li>{E(x)}</li>" for x in lab_room.honest_limits(S)) + "</ul></div>")
     return f"""<h2>赛马排行榜（30 天积分）</h2>
 <div class="tw"><table><tr><th>岗位</th><th>agent</th><th>积分</th><th>已结算</th><th>状态</th><th>影子模拟账（万分点）</th><th>最近一次奖惩</th></tr>{rows}</table></div>
 <p class="sub">正式模拟账（每次决策时听冠军的）：{book["governed"]:+.1f} 万分点，{book["n"]} 笔。纪律分每场会后立即结算；期权预测约 2 天后结算；交易在周末开盘后结算；每 7 天评一次淘汰。</p>
+{lab_note}
 <details><summary>最近 25 条奖惩记录</summary><div class="tw"><table><tr><th>时间</th><th>agent</th><th>分</th><th>原因</th></tr>{log_rows or empty}</table></div>
 {rev_html}</details>"""
 
