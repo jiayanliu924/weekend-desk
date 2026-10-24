@@ -587,6 +587,26 @@ def best_dev(env: LabEnv | None = None, log: list[dict] | None = None) -> dict |
     return best
 
 
+def brief_spec(norm: dict | None) -> str:
+    """规范化方案的一行摘要（给提示词用，字段全由代码从校验后的方案生成，不含 agent 写的自由文字）。"""
+    return _brief(norm)
+
+
+def top_dev(k: int = 5, env: LabEnv | None = None, log: list[dict] | None = None) -> list[dict]:
+    """日志里开发段 DSR 最高的 k 个方案（跑过回测、DSR 算得出），只含开发段数字：
+    {"hash","who","brief","n_trades","dsr","boot_p","total_pnl","worst","points"}。金库数字不在这里（也不会进来）。"""
+    log = read_log(env) if log is None else log
+    rows = []
+    for e in log:
+        if _ran(e) and e["dev"].get("dsr") is not None:
+            d = e["dev"]
+            rows.append({"hash": e["hash"], "who": e.get("who"), "brief": _brief(e.get("spec")), "n_trades": d["n_trades"],
+                         "dsr": d["dsr"], "boot_p": d.get("boot_p"), "total_pnl": d["total_pnl"],
+                         "worst": (d.get("worst_trade") or {}).get("pnl"), "points": e.get("points")})
+    rows.sort(key=lambda r: -r["dsr"])
+    return rows[:max(0, k)]
+
+
 def score_dev(result: dict | None, best_so_far: dict | float | None) -> tuple[float, str]:
     """§2.5 开发段打分（返回 (分, 原因)）：
     分 = clip(DSR − 当前最好的 DSR, ±5) − 0.5 × max(0, 复杂度 − 3) − 暴跌罚分；格式错 / 越界 / 重复 = −1。

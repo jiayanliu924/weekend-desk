@@ -9,9 +9,9 @@
 周末方案格式：
 {"kind": "weekend", "name": "...", "instruments": ["NVDA", ...] 或 "all", "direction": "fade"|"follow",
  "min_abs_dev_bps": 数字, "max_abs_dev_bps": 数字, "size": "flat"|"proportional"}
-期权方案格式：
-{"kind": "options", "name": "...", "side": "short"|"long", "when": "control"|"event"|"all",
- "min_implied": 0到3的年化波动（如 0.4 = 40%）, "max_implied": 数字}
+期权方案（kind "options"）：2026-10-25 起不再在这里打分。DVOL 近似公式不是真实报价，期权方案改由「期权研究室」
+（desk/lab_room.py + desk/options_lab.py，真实 OPRA 报价、开发段 / 金库）回测；run_spec 对它只回一句说明、0 分、不计试验。
+backtest_options 和旧的格式留着只作历史，不再被 run_spec 调用。
 """
 from __future__ import annotations
 
@@ -20,6 +20,7 @@ import math
 import time
 from pathlib import Path
 
+OPTIONS_MOVED = "期权方案改由期权研究室用真实报价回测"
 TRAIN_FRAC = 2 / 3
 OPT_COST_PCT = 0.10       # 期权一买一卖（跨式两腿）的手续费+价差，按标的价格的 0.10% 粗算
 STRADDLE_K = 0.8          # 跨式价值 ≈ 0.8 · S · σ · √T
@@ -158,7 +159,9 @@ def run_spec(settings, raw: dict, who: str, run_id: str) -> dict:
     spec, err = validate(raw)
     if not spec:
         return {"spec": raw, "error": err}
-    res = backtest_weekend(settings, spec) if spec["kind"] == "weekend" else backtest_options(settings, spec)
+    if spec["kind"] == "options":                    # 不回测、不记试验、0 分
+        return {"spec": spec, "rejected": OPTIONS_MOVED, "points": 0}
+    res = backtest_weekend(settings, spec)
     with _trials_path(settings).open("a") as f:
         f.write(json.dumps({"ts": time.time(), "run": run_id, "who": who, "spec": spec,
                             "test_mean": res["test"]["mean"], "test_n": res["test"]["n"]}, ensure_ascii=False) + "\n")
@@ -184,6 +187,8 @@ def describe(r: dict) -> str:
     """一行文字，喂回给 Agent，也显示在网页上。"""
     if r.get("error"):
         return f"方案无效：{r['error']}"
+    if r.get("rejected"):
+        return f"「{r['spec'].get('name', '')}」{r['rejected']}（这里 0 分、不计试验）"
     s, x = r["spec"], r["result"]
     tr, te, bt = x["train"], x["test"], x["baseline_test"]
     hit = "—" if te["hit"] is None else f"{te['hit'] * 100:.0f}%"
@@ -195,11 +200,9 @@ def describe(r: dict) -> str:
 
 def data_summary(settings) -> str:
     rows = _load(settings, "history_weekends.json") or []
-    h = _load(settings, "history_options.json") or {}
     cost, thr = weekend_cost_bps(settings)
     split_w = _split([r["weekend"] for r in rows])
-    split_o = _split([r["date"] for r in h.get("events", []) + h.get("control", [])])
     return (f"可回测数据：周末 {len(rows)} 行（7 个合约 × 约 28 个周末，字段：合约、周五收盘到决策时的链上偏离 dev、开盘相对周五的变化 y），"
             f"考试段从 {split_w} 开始；单笔成本 {cost:.2f} 万分点，出手门槛 {thr:.2f}。"
-            f"期权 {len(h.get('events', []))} 个事件日 + {len(h.get('control', []))} 个普通日（字段：隐含波动、实际/隐含比值），考试段从 {split_o} 开始。"
+            f"期权方案不在算法室打分：{OPTIONS_MOVED}（这里提交期权方案 0 分、不计试验），算法室只提周末方案。"
             f"训练段的逐笔数据你看不到，只能看汇总；考试段结果由代码给出。")

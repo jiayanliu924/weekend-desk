@@ -976,7 +976,7 @@ def _arena_html() -> str:
         return f'<p class="note">赛马数据读取失败：{E(str(e))}</p>'
     names = {k: v["name"] for k, v in st["table"].items()}
     rows = ""
-    for race, label in arena.RACES.items():
+    for race, label in {**arena.RACES, **arena.EXTRA_BOARDS}.items():      # EXTRA_BOARDS = 期权研究室评委：只列分数，没有冠军
         mem = sorted([(k, t) for k, t in st["table"].items() if t["room"] == race], key=lambda x: -x[1]["score30"])
         for i, (k, t) in enumerate(mem):
             badge = ("🏆 冠军" if t["champion"] else "") + (" ⏸ 暂停" if t["paused"] else "")

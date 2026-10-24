@@ -9,16 +9,22 @@ from desk import agents, pdfreport
 from tests.test_web import env  # noqa: F401  (fixture)
 
 
+LAB_ROOMS = ("OPT_LAB", "lab_critic")     # 卡 L2 期权研究室：独立进程里跑，不进每日例会
+
+
 def test_roster_shape():
     rooms = {}
-    for a in agents.AGENTS:
+    base = [a for a in agents.AGENTS if a["room"] not in LAB_ROOMS]
+    for a in base:
         rooms.setdefault(a["room"], []).append(a)
     for r in ("trading", "algo", "options"):
         assert len(rooms[r]) == 3, r            # 赛马岗 3 个
     for r in ("risk", "niche", "js"):
         assert len(rooms[r]) == 2, r
-    assert len(agents.AGENTS) == 18
-    assert len({a["id"] for a in agents.AGENTS}) == len(agents.AGENTS)
+    assert len(base) == 18
+    assert [a["id"] for a in agents.AGENTS if a["room"] == "OPT_LAB"] == ["LAB_SELL", "LAB_BUY", "LAB_EVENT"]
+    assert [a["id"] for a in agents.AGENTS if a["room"] == "lab_critic"] == ["LAB_SKEPTIC", "LAB_RISK"]
+    assert len({a["id"] for a in agents.AGENTS}) == len(agents.AGENTS) == 23
 
 
 def fake_llm_factory(calls):
@@ -78,13 +84,15 @@ def test_full_meeting_and_audit(env):  # noqa: F811
     calls = []
     rec = agents.run_meeting(s, "test", llm=fake_llm_factory(calls), push=False)
     assert rec["mode"] == "full", rec.get("degraded_reason")
-    members = [a for a in agents.AGENTS if a["room"] not in ("chair", "editor")]
+    members = [a for a in agents.AGENTS if a["room"] not in ("chair", "editor") + LAB_ROOMS]
     # members × 2 rounds + 7 room syntheses + chair + editor
     assert rec["calls"] == len(members) * 2 + 7 + 2 == len(calls) - 1   # +1 大白话总结
     algo = rec["rooms"]["algo"]
     bts = [b for o in algo["rounds"][0] for b in o["out"].get("backtest", [])]
     assert len(bts) == 9 and sum(1 for b in bts if b.get("error")) == 3       # bogus spec rejected
-    assert all("考试段" in b["text"] for b in bts if not b.get("error"))
+    assert sum(1 for b in bts if b.get("rejected")) == 3                       # 期权方案改由期权研究室回测：算法室里 0 分
+    assert all("考试段" in b["text"] for b in bts if not b.get("error") and not b.get("rejected"))
+    assert all("期权研究室" in b["text"] for b in bts if b.get("rejected"))
     assert any(f["topic"].startswith("算法回测") for f in rec["facts"])
     assert set(rec["rooms"]) == {r["key"] for r in agents.ROOMS}
     ck = rec["checks"]["cite"]
@@ -175,7 +183,8 @@ def test_algolab_backtest(env):  # noqa: F811
     assert res["train"]["n"] + res["test"]["n"] == 2          # 2 of 3 history rows exceed the threshold
     assert res["trials_total"] == 1 and res["bar"] == 0.05
     r2 = algolab.run_spec(s, {"kind": "options", "name": "y", "side": "short", "when": "all"}, "T", "run")
-    assert r2["result"]["trials_total"] == 2 and r2["result"]["bar"] == 0.025
+    assert r2["rejected"] == "期权方案改由期权研究室用真实报价回测" and r2["points"] == 0 and "result" not in r2     # 卡 L2：不再用 DVOL 近似打分
+    assert algolab.n_trials(s) == 1                                                                              # 也不计试验
     assert algolab.validate({"kind": "weekend", "direction": "sideways"})[0] is None
 
 
@@ -189,8 +198,8 @@ def test_intel_and_friday_spec(env):  # noqa: F811
     f = agents.build_bundle(s)
     assert sum(1 for x in f.items if x["topic"] == "Jane Street 公开情报") >= 8
     r = algolab.run_spec(s, {"kind": "options", "name": "到期日", "side": "short", "when": "friday"}, "T", "run")
-    assert "result" in r          # 2026-09-01 is a Tuesday, 2026-09-16 Wednesday → zero trades, still valid
-    assert r["result"]["train"]["n"] + r["result"]["test"]["n"] == 0
+    assert "result" not in r and r["rejected"]          # 卡 L2：期权方案（含 friday 到期日方案）改由期权研究室回测
+    assert algolab.validate({"kind": "options", "name": "到期日", "side": "short", "when": "friday"})[0] is not None     # 格式仍认，只是不在这里打分
 
 
 def test_arena_rewards_and_penalties(env):  # noqa: F811
@@ -206,7 +215,7 @@ def test_arena_rewards_and_penalties(env):  # noqa: F811
     assert {p["agent"] for p in preds if p["kind"] == "trade"} == {"FADER", "FOLLOWER", "SIZER"}
     assert {p["agent"] for p in preds if p["kind"] == "vol"} == {"VOLBULL", "VOLBEAR", "STATS"}
     st = rec["standings"]
-    assert set(st["champions"]) == {"trading", "options", "algo"}
+    assert set(st["champions"]) == {"trading", "options", "algo", "OPT_LAB"}
     # 交易预测在开盘后结算：给已完成的 2026-10-02 XYZ100 周末补一条预测
     arena._append(arena._d(s) / "predictions.jsonl", {"ts": 0, "run": "t", "agent": "FADER", "kind": "trade",
                                                       "target": "2026-10-02", "lean": "fade", "size": 1.0, "champion": True})

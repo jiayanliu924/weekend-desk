@@ -468,6 +468,23 @@ budget_month_usd = 60.0
 # 网页"现在开会"按钮的冷却时间
 manual_cooldown_min = 30
 
+[lab]
+# 卡 L2：期权研究室（desk/lab_room.py，设计 knowledge/options_lab_loop.md）。每天一轮：3 个赛马 agent 提真报价期权方案 → 代码校验/查重 →
+# 怀疑派 + 风控回测前预测 → 开发段回测打分 → 反思写 playbook。周一加跑金库晋级（一周最多 1 个）。
+# 一轮（LLM 调用 + 回测）永远在独立进程里跑（scheduler 用 subprocess.Popen 拉起 python -m desk.lab_room --round），绝不在下单进程里；
+# 那个进程自带内存上限和最低优先级。enabled = false：调度器永远不拉起。LLM 费用仍受 [agents] budget_day_usd / budget_month_usd 硬上限约束。
+enabled = true
+# 每天几点拉起（加州时间 HH:MM；之后 4 小时内都算"到点"，防止重启错过）
+daily_pt = "07:30"
+# 研究室进程的地址空间上限（MB，resource.RLIMIT_AS）；超了只杀它自己
+mem_limit_mb = 900
+# 单轮 LLM 费用上限（美元）：超过就不再调 LLM（本轮标记 partial，代码部分照常做完）
+round_budget_usd = 0.8
+# 补报价（Databento，opra_fetch --extra）每个 ISO 周最多花多少美元（按 --estimate 预估累计）；超了跳过并记日志
+max_extra_fetch_usd_week = 2.0
+# 整轮超时（分钟），到点中止并标记 timeout
+timeout_min = 90
+
 [pairs]
 # 跨 dex 同底层配对真下单（desk/pairs_exec.py）。开关在 data/state/pairs_live.json（默认 off，和 autotrade 的 live.json 分开）。
 # 信号 = pairs_lab 的走前选出的变体；两腿 IOC 限价、等名义；只平我们自己记账的数量（reduce-only）。以下全部是保守默认值。

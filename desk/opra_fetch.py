@@ -531,19 +531,12 @@ def run(settings, src, db, unds: list[str], start: date, end: date, mode: str, y
 EXTRA_SUB = "cbbo1m_extra"
 
 
-def run_extra(settings, src, db, unds: list[str], mode: str, yes: bool = False, root: Path | None = None,
-              out=print, workers: int = MAX_WORKERS, sleep=time.sleep,
-              needed_file: str = "extra_needed.json", sub: str = EXTRA_SUB) -> int:
-    """卡 A4 补数据：读 meta/extra_needed.json（回测第一遍写的 {标的: {日期: [OCC]}}），同一 15:30–16:00 窗口、raw_symbol、
-    每块 ≤2000、按日分组，逐请求精确询价（便宜），同一个费用上限 / --yes，存到 cbbo1m_extra/<UND>/<YYYY-MM>.parquet。
-    续跑：已有的月文件跳过（删掉才会重拉）；解析不了的批次和主下载一样跳过。
-    卡 B2：needed_file / sub 让 v2 回测（meta/extra_needed_v2.json -> cbbo1m_extra_v2/）与 v1 的补数据互不覆盖；
-    注意同一个 sub 目录下已有的月文件会被跳过，所以 v2 必须用自己的 sub。"""
-    root = root or (settings.data / "opra")
+def _extra_requests(src, unds: list[str], root: Path, needed_file: str, sub: str, out=print) -> list[dict] | None:
+    """读 meta/<needed_file>，返回待下载的请求（已有月文件的跳过）；清单文件不存在 -> None（并提示）。run_extra 和 estimate_extra 共用。"""
     p = root / "meta" / needed_file
     if not p.exists():
         out(f"没找到 meta/{needed_file}：先跑对应回测（python -m desk.options_rules_backtest 或 desk.options_v2_backtest）的第一遍。")
-        return 1
+        return None
     need = json.loads(p.read_text())
     reqs_all = []
     for u in unds:
@@ -555,6 +548,39 @@ def run_extra(settings, src, db, unds: list[str], mode: str, yes: bool = False, 
         reqs = [r for r in build_requests(u, days, ct) if not month_path(root, u, r["month"], sub).exists()]
         out(f"[{u}] 需补 {sum(len(v) for v in days.values())} 个(合约,日)，待下载请求 {len(reqs)}")
         reqs_all += reqs
+    return reqs_all
+
+
+def estimate_extra(settings, src, db, unds: list[str] | None = None, root: Path | None = None, needed_file: str = "extra_needed.json",
+                   sub: str = EXTRA_SUB, workers: int = MAX_WORKERS, sleep=time.sleep) -> dict:
+    """补数据的预计花费，程序可读（不用解析 --plan 的文字）：{"has_file", "n_requests", "total_usd", "underlyings"}。
+    和 run_extra 同一套请求、同一种逐请求精确询价（get_cost 免费）；清单不存在 -> has_file False、0 美元。unds 缺省 = 清单里所有标的。"""
+    root = root or (settings.data / "opra")
+    p = root / "meta" / needed_file
+    if not p.exists():
+        return {"has_file": False, "n_requests": 0, "total_usd": 0.0, "underlyings": []}
+    if unds is None:
+        unds = sorted(u for u, d in json.loads(p.read_text()).items() if d)
+    reqs = _extra_requests(src, unds, root, needed_file, sub, lambda *a, **k: None) or []
+    total = 0.0
+    if reqs:
+        est = estimate(db, reqs, True, workers, sleep)
+        total = plan_table(est, 1.0)[1]
+    return {"has_file": True, "n_requests": len(reqs), "total_usd": round(float(total), 4), "underlyings": list(unds)}
+
+
+def run_extra(settings, src, db, unds: list[str], mode: str, yes: bool = False, root: Path | None = None,
+              out=print, workers: int = MAX_WORKERS, sleep=time.sleep,
+              needed_file: str = "extra_needed.json", sub: str = EXTRA_SUB) -> int:
+    """卡 A4 补数据：读 meta/extra_needed.json（回测第一遍写的 {标的: {日期: [OCC]}}），同一 15:30–16:00 窗口、raw_symbol、
+    每块 ≤2000、按日分组，逐请求精确询价（便宜），同一个费用上限 / --yes，存到 cbbo1m_extra/<UND>/<YYYY-MM>.parquet。
+    续跑：已有的月文件跳过（删掉才会重拉）；解析不了的批次和主下载一样跳过。
+    卡 B2：needed_file / sub 让 v2 回测（meta/extra_needed_v2.json -> cbbo1m_extra_v2/）与 v1 的补数据互不覆盖；
+    注意同一个 sub 目录下已有的月文件会被跳过，所以 v2 必须用自己的 sub。"""
+    root = root or (settings.data / "opra")
+    reqs_all = _extra_requests(src, unds, root, needed_file, sub, out)
+    if reqs_all is None:
+        return 1
     out(f"向 Databento 询价（metadata.get_cost，不扣费；逐个请求精确，{len(reqs_all)} 次）…")
     est = estimate(db, reqs_all, True, workers, sleep)
     table, total = plan_table(est, 1.0)
@@ -582,6 +608,7 @@ def main(argv=None) -> int:
     g.add_argument("--plan", action="store_true", help="只算价格，不下载")
     g.add_argument("--download", action="store_true", help="下载（需 --yes 且总价不超上限）")
     g.add_argument("--diagnose", action="store_true", help="看 Databento 的 OPRA 符号格式并试询价一个合约")
+    g.add_argument("--estimate-json", action="store_true", help="配合 --extra：只算补数据预计花费，最后一行打印 JSON（给研究室程序读，不用解析文字）")
     ap.add_argument("--yes", action="store_true")
     ap.add_argument("--extra", action="store_true", help="补数据：读 meta/extra_needed.json（期权回测第一遍产出），下到 cbbo1m_extra/；配合 --plan / --download")
     ap.add_argument("--needed-file", default="extra_needed.json", help="配合 --extra：meta/ 下的清单文件名（v2 回测用 extra_needed_v2.json）")
@@ -614,10 +641,16 @@ def main(argv=None) -> int:
                 print(f"{u} 诊断出错：{str(e)[:300]}")
         return 0
     src = AlpacaSource(ax.Client(kid, sec, paper=paper))
+    if a.estimate_json and not a.extra:
+        print("--estimate-json 要配 --extra", file=sys.stderr)
+        return 1
     if a.extra:
         if a.diagnose:
             print("--extra 要配 --plan 或 --download", file=sys.stderr)
             return 1
+        if a.estimate_json:
+            print(json.dumps(estimate_extra(s, src, db, a.underlyings, needed_file=a.needed_file, sub=a.extra_sub)))
+            return 0
         return run_extra(s, src, db, a.underlyings, "plan" if a.plan else "download", a.yes,
                          needed_file=a.needed_file, sub=a.extra_sub)
     return run(s, src, db, a.underlyings, date.fromisoformat(a.start), date.fromisoformat(a.end),

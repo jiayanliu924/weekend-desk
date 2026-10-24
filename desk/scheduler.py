@@ -121,6 +121,12 @@ def due_jobs(now: datetime, settings, done: set) -> list[tuple[str, object]]:
         out.extend(supervisor.due(now, settings, done))
     except Exception as e:  # noqa: BLE001  巡检员配置写错也不能拖垮下单循环
         log.warning("supervisor.due failed: %s", e)
+    # 卡 L2 期权研究室：每天一次（[lab] daily_pt），只在这里"拉起独立进程"，LLM 和回测都不在本进程里跑；[lab] enabled = false 永远不拉起
+    try:
+        from . import lab_room
+        out.extend((k, None) for k in lab_room.due(now, settings, done))
+    except Exception as e:  # noqa: BLE001  研究室配置写错也不能拖垮下单循环
+        log.warning("lab_room.due failed: %s", e)
     # 跨 dex 配对自动下单：只有模式不是 off 才每分钟评估一次（off 时这里什么都不加）
     from . import pairs_exec
     if pairs_exec.get(settings)["mode"] != "off" or pairs_exec.has_open(settings):   # off 也要继续管理没平的仓位
@@ -140,6 +146,9 @@ def run_job(key: str, wk, settings):
         return continuous_extract(settings)
     if key.startswith("labs:"):
         return start_labs_auto(settings)
+    if key.startswith("lab:"):
+        from . import lab_room
+        return lab_room.launch(settings, key)       # 拉起 python -m desk.lab_room --round（周一加 --promote）；已有一轮在跑就跳过
     if key.startswith("headline:"):
         from . import headline_shadow
         return headline_shadow.run(settings)

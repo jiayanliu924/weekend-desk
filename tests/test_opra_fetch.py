@@ -280,6 +280,32 @@ def test_extra_mode_needed_file_and_sub_keep_v1_and_v2_apart(tmp_path):
     assert of.run_extra(st, FakeSrc(), db2, ["SOXX"], "download", yes=True) == 0 and db2.get_calls == 0
 
 
+def test_estimate_extra_is_programmatic_and_matches_run_extra(tmp_path):
+    """卡 L2：研究室不解析 --plan 的文字，而是读 estimate_extra 的数字；它和 run_extra 用同一套请求、同样的逐请求询价，且不下载。"""
+    import json
+    root = tmp_path / "opra"
+    (root / "meta").mkdir(parents=True)
+    st = Settings(tmp_path)
+    assert of.estimate_extra(st, FakeSrc(), FakeDB(), needed_file="extra_needed_lab.json", sub="cbbo1m_extra_lab") == \
+        {"has_file": False, "n_requests": 0, "total_usd": 0.0, "underlyings": []}
+    need = {"SOXX": {"2025-09-10": ["SOXX251024P00270000"], "2025-09-11": ["SOXX251024P00270000", "SOXX251024C00295000"],
+                     "2025-10-01": ["SOXX251024P00270000"]}, "SPY": {}}
+    (root / "meta" / "extra_needed_lab.json").write_text(json.dumps(need))
+    db = FakeDB(per=1.5)
+    est = of.estimate_extra(st, FakeSrc(), db, needed_file="extra_needed_lab.json", sub="cbbo1m_extra_lab")
+    assert est == {"has_file": True, "n_requests": 3, "total_usd": 4.5, "underlyings": ["SOXX"]}     # SPY 清单为空：不算
+    assert db.cost_calls == 3 and db.get_calls == 0 and not (root / "cbbo1m_extra_lab").exists()      # 只询价，没下载
+    # 已有的月文件不再算（和 run_extra 的续跑一致）
+    (root / "cbbo1m_extra_lab" / "SOXX").mkdir(parents=True)
+    (root / "cbbo1m_extra_lab" / "SOXX" / "2025-09.parquet").write_bytes(b"x")
+    est2 = of.estimate_extra(st, FakeSrc(), FakeDB(per=1.5), ["SOXX"], needed_file="extra_needed_lab.json", sub="cbbo1m_extra_lab")
+    assert est2["n_requests"] == 1 and est2["total_usd"] == 1.5
+    # 全都下过了 -> 0 个请求、0 美元、一次询价都不发
+    (root / "cbbo1m_extra_lab" / "SOXX" / "2025-10.parquet").write_bytes(b"x")
+    db3 = FakeDB()
+    assert of.estimate_extra(st, FakeSrc(), db3, needed_file="extra_needed_lab.json", sub="cbbo1m_extra_lab")["n_requests"] == 0 and db3.cost_calls == 0
+
+
 def test_index_cache_roundtrip_gives_same_requests(tmp_path):
     root = tmp_path / "opra"
     (root / "meta").mkdir(parents=True)

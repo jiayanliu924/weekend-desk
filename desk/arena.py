@@ -6,6 +6,8 @@
 - 期权岗：每天预测下一个对照样本的"实际/隐含"比值，答案出来后按比"历史平均"猜得准多少给分（±10 封顶）。
 - 交易岗：对下个周末每个合约给出 fade/follow/skip + 仓位，开盘后按模拟盈亏给分（每 5 个万分点 1 分，±10 封顶）。
 - 算法岗：方案交给代码做样本外回测，赢现行规则多少给多少分（±5 封顶）；过了多次尝试门槛 +5；交白卷/格式错 −1。
+- 期权真报价岗（OPT_LAB，卡 L2，desk/lab_room.py 独立进程每天一轮）：方案由 desk/options_lab.py 在真实报价开发段回测，run_dev 的分直接是赛马分（kind lab_dev）；
+  评委 LAB_SKEPTIC / LAB_RISK（room lab_critic，EXTRA_BOARDS，不赛马）预测 DSR 正负，对 +1 错 −1（kind lab_critic）。
 
 奖励：积分 → 排行榜；赛马岗第一名 = 冠军：冠军的决定进"正式模拟账"、模型升一级、发言在结论里优先、打法给别人学。
 惩罚：扣分；连续两次周评垫底且落后冠军 10 分以上 → 淘汰，用冠军打法改写出新一代顶替（分数清零重来）；
@@ -22,7 +24,9 @@ from pathlib import Path
 
 from .clock import current_or_next_weekend
 
-RACES = {"trading": "交易", "options": "期权", "algo": "算法"}
+RACES = {"trading": "交易", "options": "期权", "algo": "算法", "OPT_LAB": "期权真报价"}
+# 卡 L2：期权研究室里"打分但不赛马"的评委（怀疑派 / 风控）；只在排行榜里列出，不选冠军、不淘汰
+EXTRA_BOARDS = {"lab_critic": "期权真报价·评委"}
 WINDOW_DAYS = 30
 MAX_PER_RACE = 4
 
@@ -109,7 +113,7 @@ def standings(settings, base: list[dict], now: float | None = None) -> dict:
         t["total"] += s["points"]
         if s["ts"] >= cut:
             t["score30"] += s["points"]
-            if s["kind"] in ("outcome", "algo"):
+            if s["kind"] in ("outcome", "algo", "lab_dev"):      # lab_dev = 期权研究室的开发段回测结果（卡 L2）
                 t["n_outcome"] += 1
             if s["kind"] == "outcome" and t["room"] == "trading":
                 trade_pnl[s["agent"]] = trade_pnl.get(s["agent"], 0) + s["points"]
@@ -184,8 +188,12 @@ def score_algo(settings, rec: dict):
             if not bts:
                 add_score(settings, aid, "algo", -1, "交白卷：没有提交方案", rid)
                 continue
+            if all(b.get("rejected") for b in bts):          # 只提了期权方案：改由期权研究室回测，这里 0 分、不扣不加
+                continue
             best, note = None, ""
             for b in bts:
+                if b.get("rejected"):
+                    continue
                 if b.get("error"):
                     add_score(settings, aid, "algo", -1, f"方案无效：{b['error']}", rid)
                     continue
@@ -383,12 +391,24 @@ def _playbook(settings, aid: str) -> str:
         return ""
 
 
-def save_playbooks(settings, rec: dict):
+def set_playbook(settings, aid: str, text: str) -> None:
+    """直接写某个 agent 的 playbook（≤300 字）。期权研究室在独立进程里每轮反思后调用；和 save_playbooks 写同一个文件、同一个读取口（_playbook），
+    所以淘汰变异、冠军打法共享都照常用它。读-改-写加文件锁（研究室进程和主进程的会议可能同时写）。"""
+    import fcntl
     p = _d(settings) / "playbooks.json"
-    try:
-        books = json.loads(p.read_text())
-    except (OSError, ValueError):
-        books = {}
+    with open(_d(settings) / "playbooks.lock", "a") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        try:
+            books = json.loads(p.read_text())
+        except (OSError, ValueError):
+            books = {}
+        books[aid] = str(text).strip()[:300]
+        tmp = p.with_suffix(".tmp")
+        tmp.write_text(json.dumps(books, ensure_ascii=False, indent=1))
+        tmp.replace(p)
+
+
+def save_playbooks(settings, rec: dict):
     for race in RACES:
         room = rec.get("rooms", {}).get(race)
         if not room:
@@ -396,8 +416,7 @@ def save_playbooks(settings, rec: dict):
         for o in room["rounds"][-1]:
             pb = o.get("out", {}).get("playbook")
             if isinstance(pb, str) and pb.strip():
-                books[o["agent"]] = pb.strip()[:300]
-    p.write_text(json.dumps(books, ensure_ascii=False, indent=1))
+                set_playbook(settings, o["agent"], pb)
 
 
 def _mutate(llm, model, race, champ, loser) -> dict:
