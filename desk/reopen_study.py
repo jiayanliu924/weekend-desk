@@ -21,7 +21,7 @@ from . import config, features, rawstore
 
 STOCKS = ["NVDA", "TSLA", "INTC", "HOOD", "PLTR", "MSFT", "MU", "AMZN", "CRWV", "SNDK", "CRCL", "META",
           "GOOGL", "AAPL", "MSTR", "AMD", "CBRS"]
-INDEXES = ["SP500", "XYZ100", "BRENTOIL"]
+INDEXES = ["SP500", "XYZ100", "BRENTOIL", "GOLD", "SILVER", "NATGAS", "WTIOIL", "PLATINUM", "COPPER"]
 NOMINAL = {**{c: time(20, 5) for c in STOCKS}, **{c: time(18, 0) for c in INDEXES}}  # 周日 ET；SMSN 排除
 CASH_OPEN = time(9, 30)
 CASH_OPEN_NAMES = ["SP500", "XYZ100"]

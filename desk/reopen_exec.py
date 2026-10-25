@@ -255,6 +255,34 @@ class Event:
         return f"reopen:{self.kind}:{self.day.isoformat()}:{hhmm}"
 
 
+FEE_TTL_S = 6 * 3600
+FEE_MARGIN_BPS = 3.0
+_FEE_CACHE: dict = {"t": 0.0, "rt": None, "src": "full"}
+
+
+def round_trip_fee_bps(c, now_s: float | None = None) -> tuple[float, str]:
+    """实际 maker 进 + maker 出 的 bps（userFees，缓存 6h）；查不到 → 满额 2×3 bps。"""
+    now_s = time.time() if now_s is None else now_s
+    if _FEE_CACHE["rt"] is not None and now_s - _FEE_CACHE["t"] < FEE_TTL_S:
+        return _FEE_CACHE["rt"], _FEE_CACHE["src"]
+    full = 2 * DEFAULTS["fee_maker_bps"]
+    rt, src = full, "full(fallback)"
+    try:
+        r = c.info.post("/info", {"type": "userFees", "user": c.address})
+        mk = float(r["userAddRate"]) * 1e4
+        if 0 <= mk <= 20:
+            rt, src = 2 * mk, "userFees"
+    except Exception:  # noqa: BLE001
+        pass
+    _FEE_CACHE.update(t=now_s, rt=rt, src=src)
+    return rt, src
+
+
+def eff_k_bps(cf: dict, c=None) -> float:
+    rt, _ = round_trip_fee_bps(c) if c is not None else (2 * DEFAULTS["fee_maker_bps"], "full")
+    return max(cf["k_bps"], rt + FEE_MARGIN_BPS)
+
+
 def coin_of(settings, name: str) -> str:
     inst = settings.inst(name)
     return inst["coin"] if inst else f"xyz:{name}"
@@ -823,13 +851,14 @@ class Runner:
                 continue
             ovr = S * (mid / oracle - 1) * 1e4
             self.max_ovr[n] = max(self.max_ovr[n], ovr)
-            if ovr <= self.cf["k_bps"]:
+            ek = eff_k_bps(self.cf, m.c if m.real else None)
+            if ovr <= ek:
                 continue
             res = try_enter(m, self.ev, self.coins[n], S, oracle, mid, t0, self.last_ok_ms)
             if res["entered"] or not res.get("retry"):
                 self.final[n] = "entered" if res["entered"] else ("dry_signal" if res.get("dry") else "blocked")
                 self._log(n, "entry" if res["entered"] else ("would_enter" if res.get("dry") else "blocked"),
-                          S=S, G=G, overshoot_bps=round(ovr, 1), oracle=oracle, mid=mid, why=res["why"], pos_id=res.get("pos_id"))
+                          S=S, G=G, overshoot_bps=round(ovr, 1), eff_k_bps=round(ek, 2), oracle=oracle, mid=mid, why=res["why"], pos_id=res.get("pos_id"))
             else:
                 self._once(n, "blocked_retry", why=res["why"])
         with _TICK_LOCK:
@@ -952,7 +981,7 @@ def status_lines(settings) -> list[str]:
     m = MCtx(settings, None, cf, int(time.time() * 1000), True)
     realized_day, realized_cum = realized(st, _day_start_ms(m.now_ms)), realized(st)
     lines = [f"模式 {g['mode']}（off = 干跑，只写决策日志）；halt_entries={g['halt_entries']} {g.get('halt_reason') or ''}",
-             f"币 {cf['coins']}，k={cf['k_bps']:g} bps，每笔 ${cf['notional_usd']:.0f}，同时 ≤ {cf['max_concurrent']}，"
+             f"币 {cf['coins']}，k={cf['k_bps']:g} bps（有效 k={eff_k_bps(cf, None):g}，下单时按实际 maker 费率往返+3 重算），每笔 ${cf['notional_usd']:.0f}，同时 ≤ {cf['max_concurrent']}，"
              f"当日止损 ${cf['daily_loss_stop_usd']:.0f}，累计止损 ${cf['cum_loss_stop_usd']:.0f}",
              f"已实现：今日 ${realized_day:+.2f}，累计 ${realized_cum:+.2f}（未平仓位的浮盈亏要连交易所才算）"]
     for pid, p in open_positions(st).items():

@@ -204,9 +204,9 @@ def test_below_threshold_no_order_and_k_configurable(s):
     assert r.final["SP500"] == "window_closed" and 4 < r.max_ovr["SP500"] < 6
     sim2 = Sim()
     jump(sim2, 101.0, 101.05)
-    r2 = make(s, sim2, k_bps=3.0)
+    r2 = make(s, sim2, k_bps=3.0)      # 费用地板：有效 k = max(3, 2*3+3) = 9 > 5 bps → 仍不下单
     r2.run()
-    assert len(sim2.alos("entry")) == 1
+    assert not sim2.alos("entry")
 
 
 def test_notional_hard_cap_and_depth_cap(s):
