@@ -130,14 +130,16 @@ def _sign(x):
     return (x > 0) - (x < 0)
 
 
-def detect_t0(ctx, nom_ns):
-    """返回 (T0_ns, inferred_ok)。ctx: [(ns, oracle, mid, oi)]。"""
+def detect_t0(ctx, nom_ns, min_ns=None):
+    """返回 (T0_ns, inferred_ok)。ctx: [(ns, oracle, mid, oi)]。min_ns：只接受 ≥ min_ns 的跳变（实盘用；默认 None = 原行为）。"""
     ts = [c[0] for c in ctx]
     steps = []  # (ns, step_bps)
     for i in range(1, len(ctx)):
         steps.append((ts[i], abs(ctx[i][1] / ctx[i - 1][1] - 1) * 1e4 if ctx[i - 1][1] else 0.0))
     for ns, st in steps:
         if not (nom_ns - 600 * NS <= ns <= nom_ns + 600 * NS) or st <= 3:
+            continue
+        if min_ns is not None and ns < min_ns:
             continue
         prior = [s for n, s in steps if ns - 600 * NS <= n < ns]
         if len(prior) < 5:  # 没有足够的前 10 分钟样本就无法判断是否 EWMA 式爬升

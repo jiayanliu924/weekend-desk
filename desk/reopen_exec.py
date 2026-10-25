@@ -27,6 +27,7 @@ import argparse
 import hashlib
 import json
 import logging
+import math
 import re
 import threading
 import time
@@ -147,6 +148,45 @@ def cloid_hex(label: str) -> str:
 
 
 # ------------------------------------------------------------------ 交易所客户端（真实；测试注入假的）
+CTX_TTL_S = 2.5
+SIGNED_GAP_S = 0.002
+_CTX_LOCK = threading.Lock()
+_CTX_CACHE: dict = {"t": 0.0, "mc": None}
+_CTX_BACKOFF = {"until": 0.0}
+_ORDER_LOCK = threading.Lock()
+_LAST_SIGNED = {"t": 0.0}
+
+
+def _signed(fn):
+    """进程级下单锁：同一时刻只有一个签名动作，且两次之间至少隔 SIGNED_GAP_S（防 nonce 撞车）。"""
+    with _ORDER_LOCK:
+        gap = SIGNED_GAP_S - (time.monotonic() - _LAST_SIGNED["t"])
+        if gap > 0:
+            time.sleep(gap)
+        try:
+            return fn()
+        finally:
+            _LAST_SIGNED["t"] = time.monotonic()
+
+
+def _shared_ctx(fetch):
+    """所有 runner / 线程共享的 metaAndAssetCtxs：2.5 秒缓存 + 全局 429 退避。"""
+    with _CTX_LOCK:
+        now = time.monotonic()
+        if _CTX_CACHE["mc"] is not None and now - _CTX_CACHE["t"] < CTX_TTL_S:
+            return _CTX_CACHE["mc"]
+        if now < _CTX_BACKOFF["until"]:
+            raise RuntimeError("429 shared backoff active")
+        try:
+            mc = fetch()
+        except Exception as e:  # noqa: BLE001
+            if is_rate_limited(e):
+                _CTX_BACKOFF["until"] = time.monotonic() + min(BACKOFF_MAX_S, max(POLL_FLOOR_S, 5.0))
+            raise
+        _CTX_CACHE.update(t=time.monotonic(), mc=mc)
+        return mc
+
+
 class ReopenClient(autotrade.Client):
     """autotrade.Client 上加：整个 dex 的 ctx、盘口、ALO/IOC 限价（带 cloid）、按 oid 查单、撤单。key=None → 只读（干跑不需要钱包）。"""
 
@@ -163,7 +203,7 @@ class ReopenClient(autotrade.Client):
             self.ex = Exchange(Account.from_key(key), constants.MAINNET_API_URL, account_address=address, perp_dexs=names)
 
     def ctxs(self, coins: list[str]) -> dict:
-        mc = self.info.post("/info", {"type": "metaAndAssetCtxs", "dex": autotrade.DEX})
+        mc = _shared_ctx(lambda: self.info.post("/info", {"type": "metaAndAssetCtxs", "dex": autotrade.DEX}))
         names = [u["name"] for u in mc[0]["universe"]]
         out = {}
         idx = {n: i for i, n in enumerate(names)}
@@ -184,15 +224,15 @@ class ReopenClient(autotrade.Client):
         return {"bid": bid, "ask": ask, "bid_depth_usd": bid * float(b["sz"]), "ask_depth_usd": ask * float(a["sz"])}
 
     def set_leverage(self, coin: str, lev: int):
-        r = self.ex.update_leverage(int(lev), coin, is_cross=False)      # 逐仓
+        r = _signed(lambda: self.ex.update_leverage(int(lev), coin, is_cross=False))      # 逐仓
         if not isinstance(r, dict) or r.get("status") != "ok":
             raise RuntimeError(f"改杠杆失败 {coin}: {str(r)[:150]}")
         return r
 
     def _order(self, coin, is_buy, sz, px, reduce_only, cloid, tif) -> dict:
         from hyperliquid.utils.types import Cloid
-        resp = self.ex.order(coin, is_buy, sz, px, {"limit": {"tif": tif}}, reduce_only=reduce_only,        # 真下单路径
-                             cloid=Cloid.from_str(cloid_hex(cloid)))
+        resp = _signed(lambda: self.ex.order(coin, is_buy, sz, px, {"limit": {"tif": tif}}, reduce_only=reduce_only,  # 真下单路径
+                                             cloid=Cloid.from_str(cloid_hex(cloid))))
         out = {"filled_sz": 0.0, "avg_px": None, "oid": None, "error": None, "raw": resp}
         try:
             if resp.get("status") != "ok":
@@ -219,9 +259,9 @@ class ReopenClient(autotrade.Client):
 
     def cancel(self, coin: str, oid, cloid: str | None = None):
         if oid is not None:
-            return self.ex.cancel(coin, int(oid))
+            return _signed(lambda: self.ex.cancel(coin, int(oid)))
         from hyperliquid.utils.types import Cloid
-        return self.ex.cancel_by_cloid(coin, Cloid.from_str(cloid_hex(cloid)))
+        return _signed(lambda: self.ex.cancel_by_cloid(coin, Cloid.from_str(cloid_hex(cloid))))
 
     def order_info(self, oid) -> dict | None:
         r = self.info.query_order_by_oid(self.address, int(oid))
@@ -594,6 +634,10 @@ def _manage_one(m: MCtx, pid: str, force: str | None) -> bool:
     o, coin = st["open"], st["open"]["coin"]
     ent = o["entry_cloid"]
     # ---- 入场单：同步成交；有成交 / 到期 / 被强制 → 撤掉剩余挂单
+    for cl in list(st["orders"]):                          # 先把所有未终结的单（含超时状态未知的 exit_ioc）同步一遍
+        if cl not in st["ended"] and cl != ent:
+            _sync(m, pid, cl)
+    st = load_state(m.settings)["pos"][pid]
     if ent not in st["ended"]:
         _sync(m, pid, ent)
         st = load_state(m.settings)["pos"][pid]
@@ -631,6 +675,9 @@ def _manage_one(m: MCtx, pid: str, force: str | None) -> bool:
     sell = net > 0
     b = m.book(coin)
     dec = _dec(m, coin)
+    if dec is None:
+        log.warning("szDecimals unknown for %s; skip manage cycle", coin)
+        return False
     if reason:
         if alo_active:
             _cancel(m, pid, alo["cloid"])
@@ -648,8 +695,12 @@ def _manage_one(m: MCtx, pid: str, force: str | None) -> bool:
             return False
         slip = cf["exit_slippage_bps"] * (2 ** min(n_ioc, 3)) / 1e4
         mid = (b["bid"] + b["ask"]) / 2
-        px = autotrade.round_px(mid * (1 - slip) if sell else mid * (1 + slip), dec)
-        _place(m, pid, coin, not sell, abs(net), px, True, "exit_ioc", "Ioc")
+        px = round_px_dir(mid * (1 - slip) if sell else mid * (1 + slip), dec, down=sell)
+        q = autotrade.round_sz(abs(net), dec)
+        if q <= 0:
+            log.warning("exit size rounds to 0 for %s (net %g)", coin, net)
+            return False
+        _place(m, pid, coin, not sell, q, px, True, "exit_ioc", "Ioc")
         st = load_state(m.settings)["pos"][pid]
         if abs(st["net"]) < EPS:
             _close_pos(m, pid, st["exit_reason"] or reason)
@@ -664,7 +715,11 @@ def _manage_one(m: MCtx, pid: str, force: str | None) -> bool:
         if crosses:                                        # ALO 会吃单被拒 → 价格比 oracle 更好，直接 IOC
             m.led.append("exit_reason", pid, {"pos_id": pid, "reason": "oracle_crossed_book", "t_ms": now})
             return _manage_one(m, pid, "oracle_crossed_book")
-        _place(m, pid, coin, not sell, abs(net), px, True, "exit_alo", "Alo")
+        q = autotrade.round_sz(abs(net), dec)
+        if q <= 0:
+            log.warning("exit size rounds to 0 for %s (net %g)", coin, net)
+            return False
+        _place(m, pid, coin, not sell, q, px, True, "exit_alo", "Alo")
     return False
 
 
@@ -674,11 +729,40 @@ def _alert_rl(m: MCtx, pid: str, title: str, body: str, every_ms: int = 300_000)
         _alert(m, title, body, pid)
 
 
-def _dec(m: MCtx, coin: str) -> int:
+_DEC_CACHE: dict = {}
+
+
+def _dec(m: MCtx, coin: str) -> int | None:
+    """szDecimals；成功后按币缓存。失败 → None（调用方本轮跳过），不再瞎猜 2。"""
+    if coin in _DEC_CACHE:
+        return _DEC_CACHE[coin]
     try:
-        return int(m.c.sz_decimals(coin))
-    except Exception:  # noqa: BLE001
-        return 2
+        d = int(m.c.sz_decimals(coin))
+    except Exception as e:  # noqa: BLE001
+        log.warning("sz_decimals %s failed: %s", coin, e)
+        return None
+    _DEC_CACHE[coin] = d
+    return d
+
+
+def _px_decimals(px: float, sz_dec: int) -> int:
+    dec = max(0, 6 - sz_dec)
+    sig = 5 - int(math.floor(math.log10(px))) - 1
+    return max(0, min(dec, sig))
+
+
+def round_px_dir(px: float, sz_dec: int, down: bool) -> float:
+    """保守取整：down=True（卖）只往下，False（买）只往上；仍满足 HL 5 位有效数字 / 小数位规则。"""
+    r = autotrade.round_px(px, sz_dec)
+    if px <= 0 or r == px:
+        return r
+    if down and r > px:
+        r = round(r - 10 ** -_px_decimals(r, sz_dec), _px_decimals(r, sz_dec))
+        r = autotrade.round_px(r, sz_dec)
+    elif not down and r < px:
+        d = _px_decimals(r, sz_dec)
+        r = autotrade.round_px(round(r + 10 ** -d, d), sz_dec)
+    return r
 
 
 # ------------------------------------------------------------------ 开仓
@@ -727,48 +811,52 @@ def try_enter(m: MCtx, ev: Event, coin: str, S: int, oracle: float, mid: float, 
     st = load_state(m.settings)
     if m.dry:
         return {"entered": False, "why": "干跑（off）：本来会下单，没有下", "retry": False, "dry": True}
-    why = entry_block(m, st, coin, last_ok_ms)
-    if why:
-        return {"entered": False, "why": why, "retry": "没更新" in why}
-    b = m.book(coin)
-    if not b or b["bid"] >= b["ask"]:
-        return {"entered": False, "why": "读不到有效盘口", "retry": True}
-    spread = (b["ask"] - b["bid"]) / ((b["ask"] + b["bid"]) / 2) * 1e4
-    if spread > cf["max_book_spread_bps"]:
-        return {"entered": False, "why": f"盘口价差 {spread:.0f} bps 太宽", "retry": True}
-    is_buy = S < 0                                          # 方向 −S：S>0（冲高）→ 卖；S<0（砸低）→ 买
-    px_ref = b["bid"] if is_buy else b["ask"]               # 挂在本方最优价（ALO，不吃单）
-    depth = b["bid_depth_usd"] if is_buy else b["ask_depth_usd"]
-    notional = min(cf["notional_usd"], NOTIONAL_HARD_CAP, cf["depth_fraction"] * depth)
-    dec = _dec(m, coin)
-    px = autotrade.round_px(px_ref, dec)
-    sz = autotrade.round_sz(notional / px, dec)
-    if sz * px < MIN_ORDER_USD * 1.05:
-        return {"entered": False, "why": f"名义 ${sz * px:.2f} 低于最小下单（盘口深度 ${depth:.0f}）", "retry": False}
-    try:
-        pf = autotrade._live_preflight(m.settings, cf, m.c, check_wallet=m.real)
-        if pf:
-            _push(m.settings, f"重开下单未通过安全检查：{coin}", pf, priority="high")
-            return {"entered": False, "why": pf, "retry": False}
-        avail = m.c.balance().get("available")
-        if avail is None or float(avail) < sz * px * 1.1 / LEVERAGE:
-            return {"entered": False, "why": f"保证金不够（可用 {avail}）", "retry": False}
-        pos = float(m.c.position(coin))
-        if abs(pos) > EPS:
-            return {"entered": False, "why": f"交易所上 {coin} 已有仓位 {pos}（手动或其他来源），不开仓", "retry": False}
-        m.c.set_leverage(coin, LEVERAGE)
-    except Exception as e:  # noqa: BLE001
-        return {"entered": False, "why": f"下单前检查失败（{type(e).__name__}: {str(e)[:100]}）", "retry": False}
-    n_open = sum(1 for r in m.led.all() if r["kind"] == "open")
-    pid = f"{re.sub(r'[^A-Za-z0-9]+', '_', coin).strip('_')}-{m.now_ms}-{n_open + 1}"
-    entry_cloid = f"{PREFIX}{pid}-entry-1"
-    m.led.append("open", pid, {"pos_id": pid, "coin": coin, "event": ev.key, "S": S, "dir": -S, "t0_ms": int(t0_ns // 1_000_000),
-                               "entry_deadline_ms": int(t0_ns // 1_000_000 + cf["entry_window_s"] * 1000), "entry_cloid": entry_cloid,
-                               "notional_target": sz * px, "oracle_ref": oracle, "mid_at_signal": mid, "t_ms": m.now_ms})
-    r = _place(m, pid, coin, is_buy, sz, px, False, "entry", "Alo")
-    if r.get("error") and not r.get("unknown"):
-        m.led.append("closed", pid, {"pos_id": pid, "coin": coin, "reason": "no_fill", "pnl_usd": 0.0, "t_ms": m.now_ms})
-        return {"entered": False, "why": f"ALO 被拒：{r['error']}", "retry": False}
+    with _TICK_LOCK:                                         # 守卫检查 → 记 open → 下单 整段加锁，并行 runner 不会超 max_concurrent
+        st = load_state(m.settings)
+        why = entry_block(m, st, coin, last_ok_ms)
+        if why:
+            return {"entered": False, "why": why, "retry": "没更新" in why}
+        b = m.book(coin)
+        if not b or b["bid"] >= b["ask"]:
+            return {"entered": False, "why": "读不到有效盘口", "retry": True}
+        spread = (b["ask"] - b["bid"]) / ((b["ask"] + b["bid"]) / 2) * 1e4
+        if spread > cf["max_book_spread_bps"]:
+            return {"entered": False, "why": f"盘口价差 {spread:.0f} bps 太宽", "retry": True}
+        is_buy = S < 0                                          # 方向 −S：S>0（冲高）→ 卖；S<0（砸低）→ 买
+        px_ref = b["bid"] if is_buy else b["ask"]               # 挂在本方最优价（ALO，不吃单）
+        depth = b["bid_depth_usd"] if is_buy else b["ask_depth_usd"]
+        notional = min(cf["notional_usd"], NOTIONAL_HARD_CAP, cf["depth_fraction"] * depth)
+        dec = _dec(m, coin)
+        if dec is None:
+            return {"entered": False, "why": "读不到 szDecimals", "retry": True}
+        px = autotrade.round_px(px_ref, dec)
+        sz = autotrade.round_sz(notional / px, dec)
+        if sz * px < MIN_ORDER_USD * 1.05:
+            return {"entered": False, "why": f"名义 ${sz * px:.2f} 低于最小下单（盘口深度 ${depth:.0f}）", "retry": False}
+        try:
+            pf = autotrade._live_preflight(m.settings, cf, m.c, check_wallet=m.real)
+            if pf:
+                _push(m.settings, f"重开下单未通过安全检查：{coin}", pf, priority="high")
+                return {"entered": False, "why": pf, "retry": False}
+            avail = m.c.balance().get("available")
+            if avail is None or float(avail) < sz * px * 1.1 / LEVERAGE:
+                return {"entered": False, "why": f"保证金不够（可用 {avail}）", "retry": False}
+            pos = float(m.c.position(coin))
+            if abs(pos) > EPS:
+                return {"entered": False, "why": f"交易所上 {coin} 已有仓位 {pos}（手动或其他来源），不开仓", "retry": False}
+            m.c.set_leverage(coin, LEVERAGE)
+        except Exception as e:  # noqa: BLE001
+            return {"entered": False, "why": f"下单前检查失败（{type(e).__name__}: {str(e)[:100]}）", "retry": False}
+        n_open = sum(1 for r in m.led.all() if r["kind"] == "open")
+        pid = f"{re.sub(r'[^A-Za-z0-9]+', '_', coin).strip('_')}-{m.now_ms}-{n_open + 1}"
+        entry_cloid = f"{PREFIX}{pid}-entry-1"
+        m.led.append("open", pid, {"pos_id": pid, "coin": coin, "event": ev.key, "S": S, "dir": -S, "t0_ms": int(t0_ns // 1_000_000),
+                                   "entry_deadline_ms": int(t0_ns // 1_000_000 + cf["entry_window_s"] * 1000), "entry_cloid": entry_cloid,
+                                   "notional_target": sz * px, "oracle_ref": oracle, "mid_at_signal": mid, "t_ms": m.now_ms})
+        r = _place(m, pid, coin, is_buy, sz, px, False, "entry", "Alo")
+        if r.get("error") and not r.get("unknown"):
+            m.led.append("closed", pid, {"pos_id": pid, "coin": coin, "reason": "no_fill", "pnl_usd": 0.0, "t_ms": m.now_ms})
+            return {"entered": False, "why": f"ALO 被拒：{r['error']}", "retry": False}
     _push(m.settings, f"重开挂单：{coin} {'买' if is_buy else '卖'} {sz:g} @ {px:g}",
                 f"过冲 {S * (mid / oracle - 1) * 1e4:.1f} bps > {cf['k_bps']:g}，名义约 ${sz * px:.0f}，T0+{cf['entry_window_s']:.0f}s 没成交就撤", priority="high")
     return {"entered": True, "why": "已挂 ALO", "retry": False, "pos_id": pid}
@@ -822,7 +910,7 @@ class Runner:
                     continue
                 row = (int(self.clock() * NS), float(x["oracle"]), float(x["mid"]), float(x.get("oi", 0.0)))
                 s = self.samples[n]
-                if not s or s[-1][1:] != row[1:]:
+                if not s or row[0] > s[-1][0]:            # 每次成功轮询都记一行（值不变也记），冻结 oracle 的币也能凑够 5 个前置步
                     s.append(row)
                 cur[n] = (row[1], row[2])
             self.last_ok_ms = self.clock() * 1000
@@ -844,7 +932,7 @@ class Runner:
         for n in self.coins:
             if n in self.final or n not in cur:
                 continue
-            t0, ok = rs.detect_t0(self.samples[n], self.ev.nominal_ns)
+            t0, ok = rs.detect_t0(self.samples[n], self.ev.nominal_ns, min_ns=self.ev.nominal_ns - 60 * NS)
             if ok and t0 is not None:
                 if n not in self.t0:
                     self._log(n, "t0_detected", t0_ns=t0, lag_s=round((t0 - self.ev.nominal_ns) / NS, 1))

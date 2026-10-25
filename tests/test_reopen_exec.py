@@ -587,3 +587,134 @@ def test_asia_empty_lists_ok(s):
 def test_group_xyz():
     g = rx.group_xyz(["xyz:SMSN", "xyz:SOFTBANK", "xyz:NVDA"])
     assert g["已配置/已知 韩国"] == ["SMSN"] and g["已配置/已知 日本"] == ["SOFTBANK"] and g["其他"] == ["NVDA"]
+
+
+# ------------------------------------------------------------------ 2026-10-26 pre-open audit fixes
+@pytest.fixture(autouse=True)
+def _clear_audit_caches():
+    rx._DEC_CACHE.clear()
+    rx._CTX_CACHE.update(t=0.0, mc=None)
+    rx._CTX_BACKOFF["until"] = 0.0
+    yield
+    rx._DEC_CACHE.clear()
+    rx._CTX_CACHE.update(t=0.0, mc=None)
+    rx._CTX_BACKOFF["until"] = 0.0
+
+
+def test_fix1_shared_ctx_cache_and_global_429_backoff():
+    calls = []
+    def fetch():
+        calls.append(1)
+        return "mc"
+    assert rx._shared_ctx(fetch) == "mc" and rx._shared_ctx(fetch) == "mc"
+    assert len(calls) == 1                                  # 2.5s 内共用一次
+    rx._CTX_CACHE.update(t=0.0, mc=None)
+    def boom():
+        raise RuntimeError("429 Too Many Requests")
+    with pytest.raises(RuntimeError):
+        rx._shared_ctx(boom)
+    assert rx._CTX_BACKOFF["until"] > 0
+    with pytest.raises(RuntimeError, match="backoff"):     # 其他 runner 也被挡住，不打交易所
+        rx._shared_ctx(fetch)
+    assert len(calls) == 1
+
+
+def test_fix2_signed_actions_spaced_and_serialized():
+    import threading, time as _t
+    ts = []
+    def act():
+        ts.append(_t.monotonic())
+    th = [threading.Thread(target=lambda: rx._signed(act)) for _ in range(5)]
+    [t.start() for t in th]; [t.join() for t in th]
+    ts.sort()
+    assert all(b - a >= rx.SIGNED_GAP_S * 0.9 for a, b in zip(ts, ts[1:]))
+
+
+def test_fix2_try_enter_holds_tick_lock(s, monkeypatch):
+    rx.put(s, mode="live")
+    seen = []
+    orig = rx.entry_block
+    def eb(*a, **k):
+        seen.append(rx._TICK_LOCK._is_owned())
+        return orig(*a, **k)
+    monkeypatch.setattr(rx, "entry_block", eb)
+    sim = Sim()
+    r = make(s, sim)
+    jump(sim, 101.0, 101.2)
+    r.run()
+    assert seen and all(seen)
+
+
+def test_fix3_directional_px_rounding():
+    assert rx.round_px_dir(101.237, 2, down=True) <= 101.237
+    assert rx.round_px_dir(101.233, 2, down=False) >= 101.233
+    assert rx.round_px_dir(101.237, 2, down=True) == 101.23
+    assert rx.round_px_dir(101.233, 2, down=False) == 101.24
+    assert rx.round_px_dir(12345.6, 0, down=False) == 12346
+
+
+def test_fix3_exit_size_rounded(s):
+    rx.put(s, mode="live")
+    sim = Sim()
+    r = _enter_and_fill(s, sim, NOM_S + 20)
+    r.run()
+    for o in sim.orders.values():
+        if o["ro"]:
+            assert o["sz"] == autotrade.round_sz(o["sz"], 2)
+
+
+def test_fix4_dec_none_on_error_and_cached():
+    class C:
+        n = 0
+        def sz_decimals(self, coin):
+            C.n += 1
+            if coin == "BAD":
+                raise RuntimeError("x")
+            return 3
+    m = type("M", (), {"c": C()})()
+    assert rx._dec(m, "BAD") is None
+    assert rx._dec(m, "OK") == 3 and rx._dec(m, "OK") == 3
+    assert C.n == 2
+
+
+def test_fix5_manage_syncs_unknown_exit_ioc_first(s, monkeypatch):
+    rx.put(s, mode="live")
+    sim = Sim()
+    r = _enter_and_fill(s, sim, NOM_S + 20)
+    r.run()
+    p = only_pos(s)
+    synced = []
+    orig = rx._sync
+    monkeypatch.setattr(rx, "_sync", lambda m, pid, cl: synced.append(cl) or orig(m, pid, cl))
+    # 伪造一张未终结的 exit_ioc，确认 _manage_one 一开始就同步它
+    pid = p["open"]["pos_id"]
+    led = rx._led(s)
+    led.append("order", pid, {"pos_id": pid, "cloid": "fake-ioc", "cloid_hex": rx.cloid_hex("fake-ioc"), "coin": "x",
+                              "is_buy": True, "sz": 1.0, "px": 1.0, "purpose": "exit_ioc", "t_ms": 0})
+    stp = rx.load_state(s)["pos"][pid]
+    assert "fake-ioc" in stp["orders"]
+    if True:
+        m = rx.MCtx(s, sim, rx.cfg(s), int(sim.t * 1000), False)
+        try:
+            rx._manage_one(m, pid, None)
+        except Exception:  # noqa: BLE001
+            pass
+        assert synced and synced[0] == "fake-ioc"
+
+
+def test_fix7_detect_t0_min_ns_and_unchanged_rows_appended(s):
+    from desk import reopen_study as rs
+    rows = [(NOM - (600 - 3 * i) * NS, 100.0, 100.0, 0.0) for i in range(190)]
+    rows.append((NOM - 30 * NS, 101.0, 101.0, 0.0))      # 早跳变（前置步中位数 0）
+    rows.append((NOM + 3 * NS, 102.0, 102.0, 0.0))
+    assert rs.detect_t0(rows, NOM)[0] == NOM - 30 * NS   # 研究行为不变
+    t0, ok = rs.detect_t0(rows, NOM, min_ns=NOM - 60 * NS)
+    assert ok and t0 == NOM - 30 * NS
+    t0, ok = rs.detect_t0(rows, NOM, min_ns=NOM)
+    assert ok and t0 == NOM + 3 * NS
+    sim = Sim()
+    r = make(s, sim)
+    r.samples = {"SP500": []}
+    m = rx.MCtx(s, sim, rx.cfg(s), int(sim.t * 1000), True)
+    r.poll(m); sim.t += 3; r.poll(m)
+    assert len(r.samples["SP500"]) == 2                   # 值不变也记

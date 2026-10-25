@@ -107,8 +107,13 @@ def query(data_dir: Path, stream: str, sql_where: str = "TRUE", select: str = "*
     else:
         src = f"'{glob(data_dir, stream)}'"
     con = duckdb.connect()
-    q = f"SELECT {select} FROM read_parquet({src}, hive_partitioning=true) WHERE {sql_where} ORDER BY {order}"
-    return con.execute(q).fetchall()
+    try:
+        con.execute("SET memory_limit='150MB'")
+        con.execute("SET threads=1")
+        q = f"SELECT {select} FROM read_parquet({src}, hive_partitioning=true) WHERE {sql_where} ORDER BY {order}"
+        return con.execute(q).fetchall()
+    finally:
+        con.close()
 
 
 def verify(data_dir: Path, stream: str) -> dict:
