@@ -40,6 +40,7 @@ from . import reopen_study as rs
 from .ledger import Ledger
 
 log = logging.getLogger("reopen_exec")
+_MISSING_WARNED: set = set()
 ET = ZoneInfo("America/New_York")
 PREFIX = "reopen-"
 MODES = ("off", "live")
@@ -165,8 +166,14 @@ class ReopenClient(autotrade.Client):
         mc = self.info.post("/info", {"type": "metaAndAssetCtxs", "dex": autotrade.DEX})
         names = [u["name"] for u in mc[0]["universe"]]
         out = {}
+        idx = {n: i for i, n in enumerate(names)}
         for c in coins:
-            x = mc[1][names.index(c)]
+            if c not in idx:                                   # 名字不在交易所名单里：只跳过这一个，别的照常
+                if c not in _MISSING_WARNED:
+                    _MISSING_WARNED.add(c)
+                    log.warning("coin %s not on dex; skipped", c)
+                continue
+            x = mc[1][idx[c]]
             out[c] = {"oracle": float(x["oraclePx"]), "mid": float(x.get("midPx") or x["markPx"]), "oi": float(x["openInterest"])}
         return out
 
@@ -810,7 +817,9 @@ class Runner:
         try:
             cx = self.c.ctxs(list(self.coins.values()))
             for n, coin in self.coins.items():
-                x = cx[coin]
+                x = cx.get(coin)
+                if x is None:
+                    continue
                 row = (int(self.clock() * NS), float(x["oracle"]), float(x["mid"]), float(x.get("oi", 0.0)))
                 s = self.samples[n]
                 if not s or s[-1][1:] != row[1:]:
@@ -851,6 +860,8 @@ class Runner:
                 self._log(n, "window_closed", max_overshoot_bps=round(self.max_ovr[n], 1))
                 continue
             if now_ns < t0:
+                continue
+            if n not in cur:
                 continue
             oracle, mid = cur[n]
             pre = rs.Series(self.samples[n], t0).at(-5, 1)
