@@ -135,10 +135,19 @@ def due_jobs(now: datetime, settings, done: set) -> list[tuple[str, object]]:
             out.append((f"pairs:{slot}", None))
         for k in [k for k in done if k.startswith("pairs:") and int(k[6:]) < slot - 3]:
             done.discard(k)
+    # 重开 forced-flow 真钱执行器：事件前 5 分钟起唤醒（off = 干跑只写决策日志），有未平仓位时每分钟唤醒一个看守；轮询在它自己的守护线程里
+    try:
+        from . import reopen_exec
+        out.extend((k, None) for k in reopen_exec.due(now, settings, done))
+    except Exception as e:  # noqa: BLE001  配置写错也不能拖垮下单循环
+        log.warning("reopen_exec.due failed: %s", e)
     return out
 
 
 def run_job(key: str, wk, settings):
+    if key.startswith("reopen"):
+        from . import reopen_exec
+        return reopen_exec.launch(settings, key)
     if key.startswith("supervisor"):
         from . import supervisor
         return supervisor.run_async(settings, "daily" if key.startswith("supervisor_daily:") else "hourly")
