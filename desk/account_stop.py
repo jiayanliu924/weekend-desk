@@ -64,7 +64,7 @@ def tripped(settings) -> bool:
 
 
 def components(settings) -> dict:
-    out = {"weekend_usd": 0.0, "pairs_usd": 0.0, "errors": []}
+    out = {"weekend_usd": 0.0, "pairs_usd": 0.0, "reopen_usd": 0.0, "errors": []}
     try:
         from . import autotrade
         out["weekend_usd"] = float(autotrade.realized_total(settings))
@@ -77,7 +77,20 @@ def components(settings) -> dict:
                                      for p in st.get("pairs", {}).values() if p.get("closed")))
     except Exception as e:  # noqa: BLE001
         out["errors"].append(f"pairs: {e}")
-    raw = out["weekend_usd"] + out["pairs_usd"]
+    try:
+        from . import reopen_exec
+        rst = reopen_exec.load_state(settings)
+        v = float(reopen_exec.realized(rst))
+        if reopen_exec.open_positions(rst):          # 未平：用执行器每次管理时写的浮动盈亏快照（只算亏损，盈利不抵）
+            try:
+                snap = json.loads(reopen_exec.pnl_snapshot_path(settings).read_text())
+                v += min(0.0, float(snap.get("unrealized_usd", 0.0) or 0.0))
+            except FileNotFoundError:
+                pass
+        out["reopen_usd"] = v
+    except Exception as e:  # noqa: BLE001
+        out["errors"].append(f"reopen: {e}")
+    raw = out["weekend_usd"] + out["pairs_usd"] + out["reopen_usd"]
     base = float(state(settings).get("baseline_usd", 0.0) or 0.0)   # --reset 时记下的累计盈亏，之后只算新增亏损
     out["raw_total_usd"] = raw
     out["baseline_usd"] = base
@@ -108,16 +121,16 @@ def check(settings) -> dict:
 
 
 def _trip(settings, c: dict) -> None:
-    from . import autotrade, pairs_exec
+    from . import autotrade, pairs_exec, reopen_exec
     keep = {k: v for k, v in state(settings).items() if k in ("killed_weekends",)}
     _write(settings, {**keep, **c, "tripped": True, "ts": time.time()})
-    for name, mod in (("周末策略", autotrade), ("跨平台套利", pairs_exec)):
+    for name, mod in (("周末策略", autotrade), ("跨平台套利", pairs_exec), ("重开执行器", reopen_exec)):
         try:
             mod.put(settings, mode="off", updated_by="account_stop")
         except Exception as e:  # noqa: BLE001
             log.exception("account_stop: 关闭%s失败：%s", name, e)
     notify.push(settings, "总账户止损触发：所有自动下单已停",
-                f"累计真实盈亏 ${c['total_usd']:.2f}（周末 ${c['weekend_usd']:.2f}，套利 ${c['pairs_usd']:.2f}），"
+                f"累计真实盈亏 ${c['total_usd']:.2f}（周末 ${c['weekend_usd']:.2f}，套利 ${c['pairs_usd']:.2f}，重开 ${c.get('reopen_usd', 0.0):.2f}），"
                 f"上限 −${c['limit_usd']:.0f}。已开的套利仓位会继续按规则平掉，不再开新仓。", priority="max")
 
 

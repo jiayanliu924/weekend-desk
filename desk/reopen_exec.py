@@ -58,12 +58,26 @@ HARD_STOP_CAP_S = 900.0
 EXIT_WAIT_CAP_S = 600.0
 DEPTH_FRAC_CAP = 0.10
 LEVERAGE = 1
+# 限速：metaAndAssetCtxs 权重 20，Hyperliquid 每 IP 1200 权重/分钟。1 秒轮询 = 1200/分钟（单这一项就打满，
+# 还和 pairs_exec / collector 共用 IP）。下限 2 秒（≤600/分钟），默认 3 秒（≈400/分钟 + 管理单 ~50/分钟），留一半余量。
+POLL_FLOOR_S = 2.0
+BACKOFF_MAX_S = 30.0
+
+
+def is_rate_limited(e: Exception) -> bool:
+    return getattr(e, "status_code", None) == 429 or "429" in str(e)[:200]
+
+
+def pnl_snapshot_path(settings) -> Path:
+    p = Path(settings.data) / "state" / "reopen_pnl.json"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    return p
 
 DEFAULTS = {
     "coins": ["SP500", "XYZ100", "BRENTOIL"],   # 研究事件表里的名字；其他币等判定后再加
     "k_bps": 10.0, "notional_usd": 500.0, "max_concurrent": 3,
     "daily_loss_stop_usd": 15.0, "cum_loss_stop_usd": 50.0, "min_balance_usd": 5.0,
-    "poll_s": 1.0, "pre_s": 120.0, "t0_wait_s": 600.0, "entry_window_s": 120.0,
+    "poll_s": 3.0, "pre_s": 120.0, "t0_wait_s": 600.0, "entry_window_s": 120.0,
     "exit_wait_s": 600.0, "hard_stop_s": 900.0, "stale_s": 10.0,
     "exit_slippage_bps": 50.0, "max_book_spread_bps": 100.0, "depth_fraction": 0.10,
     "fee_maker_bps": 3.0, "fee_taker_bps": 9.0, "ioc_attempts": 12,
@@ -114,6 +128,7 @@ def cfg(settings) -> dict:
     d["entry_window_s"] = max(1.0, min(f("entry_window_s"), ENTRY_WINDOW_CAP_S))
     d["hard_stop_s"] = max(60.0, min(f("hard_stop_s"), HARD_STOP_CAP_S))
     d["exit_wait_s"] = max(1.0, min(f("exit_wait_s"), EXIT_WAIT_CAP_S))
+    d["poll_s"] = max(POLL_FLOOR_S, f("poll_s"))
     d["depth_fraction"] = max(0.0, min(f("depth_fraction"), DEPTH_FRAC_CAP))
     return d
 
@@ -371,6 +386,12 @@ def pnl_state(m: MCtx, st: dict) -> dict:
     unreal = sum(pos_pnl(m, p) for p in open_positions(st).values())
     day = realized(st, _day_start_ms(m.now_ms)) + unreal
     cum = realized(st) + unreal
+    try:   # 给 account_stop 用：未平仓位的浮动盈亏快照（它没有交易所连接）
+        tmp = pnl_snapshot_path(m.settings).with_suffix(".tmp")
+        tmp.write_text(json.dumps({"unrealized_usd": unreal, "n_open": len(open_positions(st)), "t_ms": m.now_ms}))
+        tmp.replace(pnl_snapshot_path(m.settings))
+    except OSError:
+        pass
     return {"day": day, "cum": cum, "daily_hit": day <= -m.cf["daily_loss_stop_usd"], "cum_hit": cum <= -m.cf["cum_loss_stop_usd"]}
 
 
@@ -466,7 +487,7 @@ def _close_pos(m: MCtx, pid: str, reason: str):
     pnl = p["cash"] - p["fees"]
     m.led.append("closed", pid, {"pos_id": pid, "coin": p["open"]["coin"], "reason": reason, "pnl_usd": round(pnl, 4), "t_ms": m.now_ms})
     if reason != "no_fill":
-        stop = reason in ("time_stop", "daily_loss_stop", "cum_loss_stop")
+        stop = reason in ("time_stop", "daily_loss_stop", "cum_loss_stop", "account_stop")
         notify.push(m.settings, f"重开已平仓：{p['open']['coin']}" + ("（止损）" if stop else ""),
                     f"原因 {reason}，这一笔 ${pnl:+.2f}（含满额手续费估算），仓位 {pid}", priority="max" if stop else "high")
 
@@ -490,6 +511,13 @@ def manage_all(m: MCtx) -> dict:
         if not any(r["kind"] == "alert" and r.get("title", "").startswith("重开：当日亏损止损") and r.get("t_ms", 0) >= _day_start_ms(m.now_ms)
                    for r in m.led.all()):
             _alert(m, "重开：当日亏损止损触发", f"今日 ${ps['day']:.2f}，上限 −${m.cf['daily_loss_stop_usd']:.0f}，平掉全部重开仓位。")
+    if not force:
+        try:
+            from . import account_stop
+            if account_stop.check(m.settings).get("tripped"):
+                force = "account_stop"
+        except Exception:  # noqa: BLE001
+            log.exception("account_stop check")
     if force:
         out["stops"].append(force)
     for pid in list(ops):
@@ -601,12 +629,6 @@ def entry_block(m: MCtx, st: dict, coin: str, last_ok_ms: float | None) -> str |
     h = get(m.settings)
     if h.get("halt_entries"):
         return f"halt_entries 标志（{h.get('halt_reason') or '?'}）"
-    try:
-        from . import account_stop
-        if account_stop.tripped(m.settings):
-            return "总账户止损已触发"
-    except Exception:  # noqa: BLE001
-        pass
     if coin in _halted(m.settings):
         return f"{coin} 已下架 / 暂停"
     if last_ok_ms is None or m.now_ms - last_ok_ms > m.cf["stale_s"] * 1000:
@@ -618,6 +640,12 @@ def entry_block(m: MCtx, st: dict, coin: str, last_ok_ms: float | None) -> str |
         return "累计亏损止损"
     if ps["daily_hit"]:
         return f"当日亏损止损（${ps['day']:.2f}）"
+    try:
+        from . import account_stop
+        if account_stop.check(m.settings).get("tripped"):
+            return "总账户止损已触发"
+    except Exception as e:  # noqa: BLE001  读不到 = 失明，不开仓
+        return f"总账户止损检查失败（{type(e).__name__}）"
     ops = open_positions(st)
     if sum(1 for p in ops.values() if p["open"]["coin"] == coin) >= PER_COIN_MAX:
         return f"{coin} 已有仓位（每币最多 {PER_COIN_MAX}）"
@@ -700,6 +728,7 @@ class Runner:
         self.final: dict = {}            # name -> 结论（已决策 / 窗口过了 / 没找到 T0）
         self.max_ovr = {n: 0.0 for n in ev.names}
         self.last_ok_ms: float | None = None
+        self.backoff_s = 0.0
         self.logged: set = set()
         self.led = _led(settings)
 
@@ -737,8 +766,13 @@ class Runner:
                     s.append(row)
                 cur[n] = (row[1], row[2])
             self.last_ok_ms = self.clock() * 1000
+            self.backoff_s = 0.0
         except Exception as e:  # noqa: BLE001
-            log.warning("ctx poll failed: %s", e)
+            if is_rate_limited(e):
+                self.backoff_s = min(BACKOFF_MAX_S, max(self.cf["poll_s"], self.backoff_s * 2))
+                log.warning("ctx poll 429, backoff %.0fs", self.backoff_s)
+            else:
+                log.warning("ctx poll failed: %s", e)
         return cur
 
     def tick(self) -> bool:
@@ -802,9 +836,11 @@ class Runner:
             try:
                 if self.tick():
                     return
-            except Exception:  # noqa: BLE001
+            except Exception as e:  # noqa: BLE001
                 log.exception("reopen tick failed")
-            self.sleep(max(0.05, self.cf["poll_s"] - (self.clock() - t)))
+                if is_rate_limited(e):
+                    self.backoff_s = min(BACKOFF_MAX_S, max(self.cf["poll_s"], self.backoff_s * 2))
+            self.sleep(max(0.05, self.cf["poll_s"] + self.backoff_s - (self.clock() - t)))
         left = open_positions(load_state(self.settings))
         if left:
             notify.push(self.settings, "重开事件结束时仍有未平仓位", f"{list(left)}。管理线程会继续看守。", priority="max")
@@ -828,10 +864,17 @@ def manage_loop(settings, client=None, clock=time.time, sleep=time.sleep, max_s:
     cf = cfg(settings)
     c = client or _make_client(settings, need_trading=True)
     t_end = clock() + max_s
+    backoff = 0.0
     while clock() < t_end and has_open(settings):
-        with _TICK_LOCK:
-            manage_all(MCtx(settings, c, cf, int(clock() * 1000), False))
-        sleep(cf["poll_s"])
+        try:
+            with _TICK_LOCK:
+                manage_all(MCtx(settings, c, cf, int(clock() * 1000), False))
+            backoff = 0.0
+        except Exception as e:  # noqa: BLE001
+            log.exception("reopen manage tick")
+            if is_rate_limited(e):
+                backoff = min(BACKOFF_MAX_S, max(cf["poll_s"], backoff * 2))
+        sleep(cf["poll_s"] + backoff)
 
 
 # ------------------------------------------------------------------ 调度器接入（和 pairs_exec 一样跑在主进程里）

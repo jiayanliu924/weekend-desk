@@ -1,4 +1,4 @@
-"""重开真钱执行器（desk/reopen_exec.py）：全部用假交易所 + 假时钟，不联网、不真下单。
+"""重开真钱执行器（desk/rx.py）：全部用假交易所 + 假时钟，不联网、不真下单。
 覆盖：方向 / 阈值、名义与硬上限、off 不发单、T0+120 撤单、出场 ALO / 超时 IOC / 硬时间止损、当日 / 累计亏损止损、持仓数上限、halt 标志、数据过期、事件表、配置夹紧。"""
 import shutil
 from datetime import date, datetime, timezone
@@ -429,7 +429,7 @@ def test_halt_flag_and_account_stop_block(s, monkeypatch):
     assert not sim.orders
     rx.put(s, halt_entries=False)
     from desk import account_stop
-    monkeypatch.setattr(account_stop, "tripped", lambda settings: True)
+    monkeypatch.setattr(account_stop, "check", lambda settings: {"tripped": True})
     sim = Sim()
     jump(sim, 101.0, 101.2)
     make(s, sim).run()
@@ -535,3 +535,18 @@ def test_scheduler_registers_reopen(s):
     now = datetime.fromtimestamp(ev.nominal_ns / NS - 120, timezone.utc)
     keys = [k for k, _ in scheduler.due_jobs(now, s, set())]
     assert ev.key in keys
+
+
+def test_review_poll_floor_and_default(s):
+    assert rx.cfg(s)["poll_s"] >= 3.0
+    s.raw.setdefault("reopen", {})["poll_s"] = 0.5
+    assert rx.cfg(s)["poll_s"] == rx.POLL_FLOOR_S
+
+
+def test_review_account_stop_includes_reopen(s):
+    from desk import account_stop
+    led = rx._led(s)
+    led.append("open", "p1", {"pos_id": "p1", "coin": "xyz:SP500", "event": "e", "entry_cloid": "c"})
+    led.append("closed", "p1", {"pos_id": "p1", "coin": "xyz:SP500", "reason": "time_stop", "pnl_usd": -12.0, "t_ms": 1})
+    c = account_stop.components(s)
+    assert c["reopen_usd"] == -12.0 and c["total_usd"] <= -12.0
