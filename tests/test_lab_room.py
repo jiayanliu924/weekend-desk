@@ -539,44 +539,44 @@ def test_proposal_from_spec_roundtrips_to_the_same_hash():
 
 
 def test_round_fetches_then_rescores_pending_hashes_without_a_new_trial(S, env, pushes, monkeypatch):
-    pending = []
-
-    def fake_pending(env=None):
-        return list(pending)
-    monkeypatch.setattr(lab, "pending_rescore", fake_pending, raising=False)            # 另一个 agent 在加这个函数；这里只认名字和"返回哈希列表"
+    """补完报价后，重算交给 options_lab.rescore_pending（不走 run_dev：同一哈希再进 run_dev 会被当重复扣分）。"""
     write_needed(env)
-    calls = []
+    runs, rescores = [], []
     real = lab.run_dev
 
     def spy(p, who, env=None, now=None):
-        norm = lab.validate_proposal(p)[0]
-        calls.append((who, lab.spec_hash(norm) if norm else None))
+        runs.append(who)
         return real(p, who, env, now)
     monkeypatch.setattr(lab, "run_dev", spy)
-
-    def during(cmd):                                                                       # 下载期间"补进了报价"：先让第一个有效方案变成待重算
-        pending[:] = [first_hash]
     first_hash = lab.spec_hash(lab.validate_proposal({k: v for k, v in put_spread().items() if k != "cite"})[0])
-    r = Runner(0.5, during_download=during)
-    rec = lab_room.run(S, llm=FakeLab(), now=TUE, fetch_runner=r)
+
+    def fake_rescore(env=None, now=None):
+        rescores.append(now)
+        return [{"hash": first_hash, "status": "ok", "points": 1.0, "points_reason": "x"}]
+    monkeypatch.setattr(lab, "rescore_pending", fake_rescore)
+    n0 = lab.n_trials(env)
+    rec = lab_room.run(S, llm=FakeLab(), now=TUE, fetch_runner=Runner(0.5))
     assert rec["fetch"]["status"] == "downloaded" and rec["rescore"]["status"] == "ok" and rec["rescore"]["pending"] == 1
-    assert calls[-1] == ("LAB_SELL", first_hash) and len(calls) == 6                       # 5 个提案 + 1 次重算（用日志里的规范化方案还原，哈希不变、提案人不变）
     assert rec["rescore"]["results"][0]["hash"] == first_hash
+    assert len(runs) == 5 and len(rescores) == 1                                           # 5 个提案各回测一次；重算不经过 run_dev
+    assert lab.n_trials(env) - n0 <= 5                                                     # 重算不加试验次数
     # 没下载（预算用光）就不重算
     S.raw["lab"]["max_extra_fetch_usd_week"] = 0.0
-    calls.clear()
-    pending[:] = [first_hash]
+    runs.clear(); rescores.clear()
     rec2 = lab_room.run(S, llm=FakeLab(props={"LAB_SELL": [put_spread(stop_loss=3.0)], "LAB_BUY": [straddle(dte=40)], "LAB_EVENT": [strangle(dte=50)]}),
                         now=TUE + timedelta(days=1), fetch_runner=Runner())
-    assert rec2["fetch"]["status"] == "skipped_over_budget" and "rescore" not in rec2 and len(calls) == 3
+    assert rec2["fetch"]["status"] == "skipped_over_budget" and "rescore" not in rec2 and len(runs) == 3 and not rescores
 
 
-def test_rescore_is_skipped_when_options_lab_has_no_pending_rescore(S, env, monkeypatch):
-    monkeypatch.delattr(lab, "pending_rescore", raising=False)
+def test_rescore_is_skipped_or_contained_when_options_lab_fails(S, env, monkeypatch):
+    monkeypatch.delattr(lab, "rescore_pending", raising=False)
     assert lab_room.rescore_pending(S, env, TUE) == {"status": "unavailable"}
-    monkeypatch.setattr(lab, "pending_rescore", lambda: [{"hash": "deadbeefdeadbeef"}], raising=False)                      # 无参数也认；日志里没有的哈希只记一笔
+
+    def boom(env=None, now=None):
+        raise RuntimeError("disk")
+    monkeypatch.setattr(lab, "rescore_pending", boom, raising=False)
     out = lab_room.rescore_pending(S, env, TUE)
-    assert out["pending"] == 1 and out["results"] == [{"hash": "deadbeefdeadbeef", "status": "no_log_entry"}]
+    assert out["status"] == "error" and "disk" in out["error"]
 
 
 def test_round_runs_fetch_after_backtests(S, env, pushes):

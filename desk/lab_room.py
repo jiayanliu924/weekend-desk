@@ -584,37 +584,17 @@ def proposal_from_spec(norm: dict, why: str | None = None) -> dict:
 
 
 def rescore_pending(settings, env: lab.LabEnv, now: datetime) -> dict:
-    """补报价之后调用 options_lab.pending_rescore()（开发段回测因为缺报价不完整的哈希），逐个重跑 run_dev——
-    不新增试验、哈希不变，怎么重算由 options_lab 负责；这里不给 arena 加分（分数在提案当轮已经结算过）。pending_rescore 不存在 -> 跳过。"""
-    fn = getattr(lab, "pending_rescore", None)
+    """补报价之后：交给 options_lab.rescore_pending()（不新增试验、哈希不变、取代旧的 incomplete 行）。
+    不走 run_dev——同一哈希再进 run_dev 会被当成重复方案扣分。这里不给 arena 加分。"""
+    fn = getattr(lab, "rescore_pending", None)
     if fn is None:
         return {"status": "unavailable"}
     try:
-        try:
-            pend = fn(env)
-        except TypeError:
-            pend = fn()
+        res = fn(env, now)
     except Exception as e:  # noqa: BLE001
-        log.warning("pending_rescore failed: %s", e)
+        log.exception("rescore_pending failed: %s", e)
         return {"status": "error", "error": f"{type(e).__name__}: {e}"[:200]}
-    hashes = [h.get("hash") if isinstance(h, dict) else h for h in (pend or [])]
-    hashes = [h for h in hashes if isinstance(h, str)][:MAX_RESCORE]
-    log_rows = lab.read_log(env)
-    done = []
-    for h in hashes:
-        ent = (next((e for e in log_rows if e.get("hash") == h and e.get("backtested")), None)          # 原始那次回测（提案人是第一个提的人）
-               or next((e for e in log_rows if e.get("hash") == h and e.get("spec")), None))
-        if ent is None:
-            done.append({"hash": h, "status": "no_log_entry"})
-            continue
-        try:
-            res = lab.run_dev(proposal_from_spec(ent["spec"], ent.get("why")), ent.get("who") or "rescore", env, now)
-            dev = res.get("dev") or {}
-            done.append({"hash": h, "status": "rescored", "dsr": dev.get("dsr"), "n_trades": dev.get("n_trades"), "points_reason": res.get("points_reason")})
-        except Exception as e:  # noqa: BLE001
-            log.exception("rescore %s failed: %s", h, e)
-            done.append({"hash": h, "status": "error", "error": f"{type(e).__name__}: {e}"[:200]})
-    return {"status": "ok", "pending": len(hashes), "results": done}
+    return {"status": "ok", "pending": len(res), "results": res[:MAX_RESCORE]}
 
 
 # ------------------------------------------------------------------ 锁 / 资源限制 / 超时
@@ -710,7 +690,7 @@ def honest_limits(settings) -> list[str]:
 
 
 # ------------------------------------------------------------------ 推送
-PROMO_PLAIN = (("already promoted", "这周已经考过一个了"), ("no unvaulted candidate", "没有新的候选（去运气夏普都没到 0 以上）"),
+PROMO_PLAIN = (("already promoted", "这周已经考过一个了"), ("no unvaulted candidate", "没有新的候选（扣掉运气后置信度都没到 95%）"),
                ("PBO", "过拟合概率（PBO）太高或算不出"))
 
 
