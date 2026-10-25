@@ -69,3 +69,44 @@ def test_verdict():
     # 去掉最佳单笔后为负 -> 不是 WORTH_SHADOW
     assert rs.verdict([_row("w1", net=20), _row("w2", net=-5), _row("w3", net=1)])[0] == "INCONCLUSIVE"
     assert rs.verdict([])[0] == "INCONCLUSIVE"
+
+
+def _utc(ns):
+    from datetime import datetime, timezone
+    return datetime.fromtimestamp(ns / NS, timezone.utc)
+
+
+def test_dst_nominal_times():
+    # 2026-10-29 EDT: 18:00 ET = 22:00Z, 09:30 ET = 13:30Z；2026-11-02 EST: 23:00Z / 14:30Z
+    a = _utc(rs.nominal_ns(date(2026, 10, 29), "SP500", kind="daily_18"))
+    b = _utc(rs.nominal_ns(date(2026, 11, 2), "SP500", kind="daily_18"))
+    assert (a.hour, a.minute) == (22, 0) and (b.hour, b.minute) == (23, 0)
+    c = _utc(rs.nominal_ns(date(2026, 10, 29), "SP500", kind="idx_cash_open"))
+    d = _utc(rs.nominal_ns(date(2026, 11, 2), "XYZ100", kind="idx_cash_open"))
+    assert (c.hour, c.minute) == (13, 30) and (d.hour, d.minute) == (14, 30)
+
+
+def test_gen_events():
+    ev = rs.gen_events("all", date(2026, 10, 25), date(2026, 11, 1))  # Sun..Sun
+    kinds = {k: [(d, n) for kk, d, n in ev if kk == k] for k in rs.KINDS}
+    assert {d for d, _ in kinds["daily_18"]} == {date(2026, 10, d) for d in (26, 27, 28, 29)}
+    assert {d.weekday() for d, _ in kinds["idx_cash_open"]} == {0, 1, 2, 3, 4}
+    assert {d for d, _ in kinds["weekly"]} == {date(2026, 10, 25), date(2026, 11, 1)}
+    assert all(k == "weekly" for k, _, _ in rs.gen_events("weekly", date(2026, 10, 25), date(2026, 11, 1)))
+
+
+def test_verdict_group_by_week():
+    # 周一、周二同一 ISO 周：合计为正 -> 1 周全正；按 weekend(日期)分组则 1/2 为负，不触发 >half
+    rows = [dict(_row("2026-10-26", net=-3), date="2026-10-26", kind="daily_18"),
+            dict(_row("2026-10-27", net=10), date="2026-10-27", kind="daily_18")]
+    assert rs.verdict(rows, group="week")[0] == "WORTH_SHADOW" or rs.verdict(rows, group="week")[0] == "INCONCLUSIVE"
+    assert "为负" not in rs.verdict(rows, group="week")[1]
+    # 三周中两周为负 -> REJECT 且文案为"周"
+    neg = [dict(_row("2026-10-12", net=-5), date="2026-10-12"), dict(_row("2026-10-19", net=-5), date="2026-10-19"),
+           dict(_row("2026-10-26", net=30), date="2026-10-26")]
+    v, why = rs.verdict(neg, group="week")
+    assert v == "REJECT" and "2/3 个周净值为负" in why
+    # 同一周内两天各为负仍算 1 周
+    same = [dict(_row("2026-10-26", net=-1), date="2026-10-26"), dict(_row("2026-10-27", net=-1), date="2026-10-27"),
+            dict(_row("2026-10-12", net=50), date="2026-10-12")]
+    assert "为负" not in rs.verdict(same, group="week")[1]
