@@ -133,3 +133,19 @@ def test_ctrl_not_collapsed_across_kinds():
             dict(_row("2026-10-26", ctrl=8.0), kind="idx_cash_open", date="2026-10-26")]
     v, why = rs.verdict(rows, group="week")
     assert v == "INCONCLUSIVE" and "对照(b) 16.0" in why
+
+
+def test_asia_nominal_utc():
+    # 2026-10-28 (Wed)：KST/JST=UTC+9，HKT/CST=UTC+8
+    hm = lambda k: (lambda t: (t.hour, t.minute))(_utc(rs.nominal_ns(date(2026, 10, 28), "X", kind=k)))
+    assert hm("kr_open") == (0, 1) and hm("kr_pm") == (7, 5)
+    assert hm("jp_open") == (0, 0) and hm("jp_pm") == (3, 30)
+    assert hm("hk_open") == (1, 30) and hm("hk_pm") == (5, 0)
+    assert hm("cn_open") == (1, 30) and hm("cn_pm") == (5, 0)
+
+
+def test_asia_gen_events_weekdays_and_empty():
+    ev = rs.gen_events("asia", date(2026, 10, 24), date(2026, 11, 1), {"kr": ["SMSN"], "jp": [], "hk": [], "cn": []})
+    assert {k for k, _, _ in ev} == {"kr_open", "kr_pm"} and {d.weekday() for _, d, _ in ev} == {0, 1, 2, 3, 4}
+    assert rs.gen_events("asia", date(2026, 10, 26), date(2026, 10, 30), {m: [] for m in rs.ASIA}) == []
+    assert all(k in rs.KINDS for k in rs.ASIA_KINDS) and len(rs.ASIA_KINDS) == 8

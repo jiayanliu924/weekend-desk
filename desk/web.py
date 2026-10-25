@@ -401,7 +401,7 @@ def strategy_line(settings) -> str:
 
 # ------------------------------------------------------------------ pages
 _BJ = ZoneInfo("Asia/Shanghai")
-_ZH_COIN = {"BRENTOIL": "原油", "SP500": "标普500", "XYZ100": "纳指100"}
+_ZH_COIN = {"BRENTOIL": "原油", "SP500": "标普500", "XYZ100": "纳指100", "SMSN": "三星", "SKHX": "SK海力士", "KIOXIA": "铠侠"}
 _ZH_WD = "一二三四五六日"
 
 

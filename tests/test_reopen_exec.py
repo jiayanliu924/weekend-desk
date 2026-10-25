@@ -560,3 +560,30 @@ def test_review_account_stop_includes_reopen(s):
     led.append("closed", "p1", {"pos_id": "p1", "coin": "xyz:SP500", "reason": "time_stop", "pnl_usd": -12.0, "t_ms": 1})
     c = account_stop.components(s)
     assert c["reopen_usd"] == -12.0 and c["total_usd"] <= -12.0
+
+
+def test_asia_events_scheduled(s):
+    s.raw["reopen"] = {**s.raw["reopen"], "coins": [], "asia_coins": {"kr": ["SMSN", "SKHX"], "jp": ["KIOXIA"], "hk": [], "cn": []}}
+    cf = rx.cfg(s)
+    # 周三 2026-10-28 韩股 09:01 KST = 00:01Z = 10-27 20:01 EDT -> ET 日期 10-27
+    evs = rx.events_on(date(2026, 10, 27), cf)
+    kr = next(e for e in evs if e.kind == "kr_open")
+    assert kr.names == ["SKHX", "SMSN"] and datetime.fromtimestamp(kr.nominal_ns / NS, timezone.utc) == datetime(2026, 10, 28, 0, 1, tzinfo=timezone.utc)
+    assert any(e.kind == "jp_open" and e.names == ["KIOXIA"] for e in evs)
+    assert rx.event_from_key(kr.key, cf).nominal_ns == kr.nominal_ns
+    assert not any(e.kind.startswith(("hk", "cn")) for e in rx.next_events(datetime(2026, 10, 26, tzinfo=timezone.utc), cf))
+    now = datetime(2026, 10, 28, 0, 0, tzinfo=timezone.utc)
+    assert kr.key in rx.due(now, s, set())
+
+
+def test_asia_empty_lists_ok(s):
+    s.raw["reopen"] = {**s.raw["reopen"], "coins": [], "asia_coins": {}}
+    cf = rx.cfg(s)
+    assert cf["asia_coins"] == {"kr": [], "jp": [], "hk": [], "cn": []}
+    assert rx.next_events(datetime(2026, 10, 26, tzinfo=timezone.utc), cf) == []
+    assert rx.due(datetime(2026, 10, 28, 0, 0, tzinfo=timezone.utc), s, set()) == []
+
+
+def test_group_xyz():
+    g = rx.group_xyz(["xyz:SMSN", "xyz:KIOXIA", "xyz:NVDA"])
+    assert g["已配置/已知 韩国"] == ["SMSN"] and g["已配置/已知 日本"] == ["KIOXIA"] and g["其他"] == ["NVDA"]

@@ -25,7 +25,15 @@ INDEXES = ["SP500", "XYZ100", "BRENTOIL", "GOLD", "SILVER", "NATGAS", "WTIOIL", 
 NOMINAL = {**{c: time(20, 5) for c in STOCKS}, **{c: time(18, 0) for c in INDEXES}}  # 周日 ET；SMSN 排除
 CASH_OPEN = time(9, 30)
 CASH_OPEN_NAMES = ["SP500", "XYZ100"]
-KINDS = ("weekly", "daily_18", "idx_cash_open")
+# 亚洲股票重开（trade.xyz 文档：休市期间内部定价，开盘/午休后恢复）。(本地 tz, [本地重开时刻...])；周一到周五，不含各国假日
+ASIA = {"kr": ("Asia/Seoul", (time(9, 1), time(16, 5)), ("open", "pm")),
+        "jp": ("Asia/Tokyo", (time(9, 0), time(12, 30)), ("open", "pm")),
+        "hk": ("Asia/Hong_Kong", (time(9, 30), time(13, 0)), ("open", "pm")),
+        "cn": ("Asia/Shanghai", (time(9, 30), time(13, 0)), ("open", "pm"))}
+ASIA_KINDS = tuple(f"{m}_{s}" for m in ASIA for s in ("open", "pm"))
+# 有证据的币名（config.toml / knowledge/universe_overrides.toml）；hk/cn 暂无 xyz 上的证据 -> 空
+ASIA_COINS = {"kr": ["SMSN", "SKHX"], "jp": ["KIOXIA"], "hk": [], "cn": []}
+KINDS = ("weekly", "daily_18", "idx_cash_open") + ASIA_KINDS
 KS = (5, 10, 20)
 NOTIONAL = 5000.0
 CTRL_TOL_BPS = 10.0  # 对照(b)"<= 0 + small"的容差（合计 bps）
@@ -81,13 +89,17 @@ def read_trades(settings, coin, a_ns, b_ns):
 # ---------------- 工具 ----------------
 def nominal_ns(day: date, name: str, tz: str = "America/New_York", kind: str = "weekly") -> int:
     """名义重开时刻（本地 ET 墙钟 -> UTC，自动处理 DST）。"""
+    if kind in ASIA_KINDS:
+        mk, sess = kind.split("_")
+        atz, ts, _ = ASIA[mk]
+        return int(datetime.combine(day, ts[0 if sess == "open" else 1], ZoneInfo(atz)).astimezone(timezone.utc).timestamp()) * NS
     t = CASH_OPEN if kind == "idx_cash_open" else NOMINAL[name] if kind == "weekly" else time(18, 0)
     dt = datetime.combine(day, t, ZoneInfo(tz))
     return int(dt.astimezone(timezone.utc).timestamp()) * NS
 
 
-def gen_events(kind: str, start: date, end: date):
-    """[(kind, date, name)]，start..end 含端点。weekly: 周日 全部；daily_18: 周一-周四 指数；idx_cash_open: 周一-周五 现货指数。"""
+def gen_events(kind: str, start: date, end: date, asia: dict | None = None):
+    """[(kind, date, name)]，start..end 含端点（日期 = 该市场本地日期；亚洲事件 Mon-Fri）。kind="asia"/"all" 含亚洲；也可直接给 kr_open 等。weekly: 周日 全部；daily_18: 周一-周四 指数；idx_cash_open: 周一-周五 现货指数。"""
     out = []
     d = start
     while d <= end:
@@ -98,6 +110,12 @@ def gen_events(kind: str, start: date, end: date):
             out += [("daily_18", d, n) for n in INDEXES]
         if kind in ("daily", "all") and wd < 5:
             out += [("idx_cash_open", d, n) for n in CASH_OPEN_NAMES]
+        if wd < 5 and kind in ("asia", "all") + ASIA_KINDS:
+            for m, names in (asia if asia is not None else ASIA_COINS).items():
+                for sess in ("open", "pm"):
+                    k = f"{m}_{sess}"
+                    if kind in ("asia", "all", k):
+                        out += [(k, d, n) for n in names]
         d += timedelta(days=1)
     return out
 
@@ -375,7 +393,7 @@ def run(settings, events, out_dir):
 
 def main(argv=None):
     ap = argparse.ArgumentParser()
-    ap.add_argument("--kind", choices=["weekly", "daily", "all"], default="all")
+    ap.add_argument("--kind", choices=["weekly", "daily", "asia", "all"], default="all")
     ap.add_argument("--start")
     ap.add_argument("--end")
     ap.add_argument("--weekends", default=None, help="逗号分隔的周日日期；给出则只跑 weekly")

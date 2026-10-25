@@ -80,6 +80,7 @@ DEFAULTS = {
     "poll_s": 3.0, "pre_s": 120.0, "t0_wait_s": 600.0, "entry_window_s": 120.0,
     "exit_wait_s": 600.0, "hard_stop_s": 900.0, "stale_s": 10.0,
     "exit_slippage_bps": 50.0, "max_book_spread_bps": 100.0, "depth_fraction": 0.10,
+    "asia_coins": {"kr": [], "jp": [], "hk": [], "cn": []},   # 亚洲股票重开：{kr/jp/hk/cn: [币名]}，空列表 = 不盯
     "notify": False,            # 手机推送默认关（Kea 不要）；记录和日志照写
     "fee_maker_bps": 3.0, "fee_taker_bps": 9.0, "ioc_attempts": 12,
 }
@@ -119,6 +120,8 @@ def cfg(settings) -> dict:
     raw = settings.raw if hasattr(settings, "raw") else settings
     d.update(raw.get("reopen") or {})
     d["coins"] = [str(c) for c in (d.get("coins") or [])]
+    ac = d.get("asia_coins") if isinstance(d.get("asia_coins"), dict) else {}
+    d["asia_coins"] = {m: [str(c) for c in (ac.get(m) or [])] for m in rs.ASIA}
     f = lambda k: float(d[k])  # noqa: E731
     d["k_bps"] = max(0.0, f("k_bps"))
     d["notional_usd"] = max(0.0, min(f("notional_usd"), NOTIONAL_HARD_CAP))
@@ -297,7 +300,15 @@ def events_on(day: date, cf: dict) -> list[Event]:
     for kind, d, name in rows:
         if name in want:
             by.setdefault((kind, rs.nominal_ns(d, name, kind=kind)), []).append(name)
-    return [Event(k, day, nom, sorted(ns)) for (k, nom), ns in sorted(by.items(), key=lambda kv: kv[0][1])]
+    # 亚洲事件按市场本地日期生成；Event.day 仍是 ET 日期 -> 取本地日期 day-1..day+1 里名义时刻落在该 ET 日的
+    asia = cf.get("asia_coins") or {}
+    if any(asia.values()):
+        for dd in (day - timedelta(days=1), day, day + timedelta(days=1)):
+            for kind, d, name in rs.gen_events("asia", dd, dd, asia):
+                nom = rs.nominal_ns(d, name, kind=kind)
+                if datetime.fromtimestamp(nom / NS, timezone.utc).astimezone(ET).date() == day:
+                    by.setdefault((kind, nom), []).append(name)
+    return [Event(k, day, nom, sorted(set(ns))) for (k, nom), ns in sorted(by.items(), key=lambda kv: kv[0][1])]
 
 
 def next_events(now: datetime, cf: dict, days: int = 9) -> list[Event]:
@@ -926,7 +937,7 @@ def due(now: datetime, settings, done: set) -> list[str]:
     """事件名义时刻前 5 分钟起到后 3 分钟内，每个事件一个 key；有未平仓位时每分钟一个看守 key。mode=off 也唤醒（干跑写决策日志）。"""
     out: list[str] = []
     cf = cfg(settings)
-    if cf["coins"]:
+    if cf["coins"] or any(cf["asia_coins"].values()):
         d0 = now.astimezone(ET).date()
         for i in (-1, 0, 1):
             for ev in events_on(d0 + timedelta(days=i), cf):
@@ -994,15 +1005,44 @@ def status_lines(settings) -> list[str]:
     return lines
 
 
+def group_xyz(names: list[str], cf_coins: dict | None = None) -> dict:
+    """币名分组：已配置的亚洲名 / 已知 xyz 清单（ASIA_COINS 证据）/ 其他。纯函数，便于测试。"""
+    g: dict = {"已配置/已知 韩国": [], "已配置/已知 日本": [], "已配置/已知 香港": [], "已配置/已知 中国A股": [], "其他": []}
+    lab = {"kr": "已配置/已知 韩国", "jp": "已配置/已知 日本", "hk": "已配置/已知 香港", "cn": "已配置/已知 中国A股"}
+    known = {m: set(rs.ASIA_COINS.get(m, [])) | set((cf_coins or {}).get(m, [])) for m in lab}
+    for n in sorted(names):
+        base = n.split(":")[-1]
+        m = next((m for m in lab if base in known[m]), None)
+        g[lab[m] if m else "其他"].append(base)
+    return g
+
+
+def list_xyz() -> int:
+    """只读：xyz dex meta（metaAndAssetCtxs）里的全部币名。不建钱包、不下单。"""
+    from hyperliquid.info import Info
+    from hyperliquid.utils import constants
+    info = Info(constants.MAINNET_API_URL, skip_ws=True, perp_dexs=["", autotrade.DEX])
+    mc = info.post("/info", {"type": "metaAndAssetCtxs", "dex": autotrade.DEX})
+    names = [u["name"] for u in mc[0]["universe"] if not u.get("isDelisted")]
+    for label, ns in group_xyz(names).items():
+        if ns:
+            print(f"{label} ({len(ns)}): {' '.join(ns)}")
+    print(f"共 {len(names)} 个。把亚洲股票填进 config.toml [reopen] asia_coins = {{ kr=[...], jp=[...], hk=[...], cn=[...] }}")
+    return 0
+
+
 def main(argv=None) -> int:
     from . import config
     ap = argparse.ArgumentParser(description="重开 forced-flow 真钱执行器")
     ap.add_argument("--status", action="store_true")
+    ap.add_argument("--list-xyz", action="store_true", help="只读：列出 xyz dex 所有币名（按市场分组），方便填 [reopen].asia_coins；不下单")
     ap.add_argument("--set-live", action="store_true", help="打开真下单（mode=live）")
     ap.add_argument("--set-off", action="store_true", help="关闭（mode=off，干跑；已有仓位仍会管理到平完）")
     ap.add_argument("--clear-halt", action="store_true", help="清除 halt_entries 标志（先核对持仓和账本）")
     ap.add_argument("--once", action="store_true", help="现在就跑一个事件做干跑测试：名义时刻 = 现在 + pre_s，强制不下单，跑到窗口结束")
     a = ap.parse_args(argv)
+    if a.list_xyz:
+        return list_xyz()
     s = config.load()
     if a.set_live and a.set_off:
         ap.error("--set-live 和 --set-off 不能一起用")

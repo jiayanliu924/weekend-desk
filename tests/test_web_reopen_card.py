@@ -51,3 +51,10 @@ def test_corrupt(env):
     s, web = env
     rx._led(s).path.write_text("{not json\n")
     assert "重开真钱单" in web.reopen_card_html(s)
+
+
+def test_next_event_asia(env):
+    s, web = env
+    s.raw["reopen"] = {**s.raw["reopen"], "coins": [], "asia_coins": {"kr": ["SMSN"], "jp": [], "hk": [], "cn": []}}
+    h = web.reopen_card_html(s, datetime(2026, 10, 27, 12, 0, tzinfo=timezone.utc))   # 周二 05:00 PT
+    assert "三星" in h and "加州 周二 17:01" in h and "北京 周三 08:01" in h
