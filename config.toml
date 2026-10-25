@@ -473,7 +473,7 @@ manual_cooldown_min = 30
 # 怀疑派 + 风控回测前预测 → 开发段回测打分 → 反思写 playbook。周一加跑金库晋级（一周最多 1 个）。
 # 一轮（LLM 调用 + 回测）永远在独立进程里跑（scheduler 用 subprocess.Popen 拉起 python -m desk.lab_room --round），绝不在下单进程里；
 # 那个进程自带内存上限和最低优先级。enabled = false：调度器永远不拉起。LLM 费用仍受 [agents] budget_day_usd / budget_month_usd 硬上限约束。
-enabled = false   # 2026-10-25 砍掉：v2 期权 641 笔、全额手续费后总净利 -$62,836、最大回撤 $74,725
+enabled = true
 # 每天几点拉起（加州时间 HH:MM；之后 4 小时内都算"到点"，防止重启错过）
 daily_pt = "07:30"
 # 研究室进程的地址空间上限（MB，resource.RLIMIT_AS）；超了只杀它自己
