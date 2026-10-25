@@ -195,7 +195,7 @@ canvas{max-width:100%}
 @media (prefers-reduced-motion:reduce){*{transition:none!important}}
 """
 
-TABS = [("/", "概览"), ("/agents", "Agent 讨论室"), ("/day", "每日记录"), ("/weekends", "周末预测"), ("/options", "期权研究"), ("/labs", "赚钱排行"),
+TABS = [("/", "概览"), ("/agents", "Agent 讨论室"), ("/lab", "期权研究室"), ("/day", "每日记录"), ("/weekends", "周末预测"), ("/options", "期权研究"), ("/labs", "赚钱排行"),
         ("/money", "放真钱会怎样"), ("/history", "历史回测"), ("/guide", "这是什么"), ("/qa", "测试"), ("/settings", "设置")]
 
 
@@ -1547,6 +1547,113 @@ def labs_page(req: Request):
              + "".join(f"<li><b>{E(h)}</b>：{E(t)}</li>" for h, t in la.COLUMNS)
              + '</ul><p class="sub">杠杆和“样本外”都是在同一段历史里挑的，实际几乎一定比这里差；没过门槛的不要放真钱。</p>')
     return page(req, "/labs", "赚钱排行", body)
+
+
+LAB_STATUS_CN = {"scored": "有效", "invalid": "无效", "duplicate": "重复", "incomplete": "数据不全",
+                 "ineligible": "样本太少", "near_duplicate": "和已测方案几乎一样", "error": "引擎出错"}
+
+
+def _lab_day(ts: str | None) -> str:
+    if not ts:
+        return "—"
+    try:
+        return datetime.fromisoformat(ts).astimezone(PT).strftime("%Y-%m-%d")
+    except ValueError:
+        return "—"
+
+
+@app.get("/lab", response_class=HTMLResponse)
+def lab_page(req: Request):
+    """期权研究室（卡 L5）：只读。数据只经 options_lab 的读取函数和 arena.standings / roster / _playbook 取得；
+    金库只显示 哈希 / 日期 / 过没过，不显示任何数字。所有 agent 写的文字都过 html.escape。"""
+    if (r := _guard(req)):
+        return r
+    from . import agents, arena, lab_room
+    from . import options_lab as lab
+    env = lab_room.lab_env(S)
+    body = ("<h1>期权研究室</h1>"
+            "<p class=\"sub\">几个 AI 每天提期权策略，代码用真实报价回测、按结果打分；通过开发段的方案，极少数才进金库考试。"
+            "这一页只看过程和结论，金库的数字不在网页上。</p>")
+    try:
+        limits = lab_room.honest_limits(S)
+        n_trials = lab.n_trials(env)
+    except Exception as e:  # noqa: BLE001
+        return page(req, "/lab", "期权研究室", body + f'<p class="note">研究室数据读取失败：{E(str(e))}</p>')
+    body += ('<div class="card"><div class="k">诚实限制（knowledge/options_lab_loop.md §7）</div>'
+             + "".join(f"<p>{E(x)}</p>" for x in limits) + "</div>"
+             f'<div class="grid"><div class="card"><div class="k">全局试验次数</div><div class="v s">{E(str(n_trials))}</div>'
+             '<div class="k">每回测一个新方案、每次金库考试各加 1；次数越多，晋级门槛越高</div></div></div>')
+    try:
+        raw = lab.read_log(env)
+        vault = lab.vaulted_hashes(env)
+        st = arena.standings(S, agents.AGENTS)
+        ros = {a["id"]: a for a in arena.roster(S, agents.AGENTS)}
+        table = st["table"]
+        names = {k: t["name"] for k, t in table.items()}
+    except Exception as e:  # noqa: BLE001
+        return page(req, "/lab", "期权研究室", body + f'<p class="note">研究室数据读取失败：{E(str(e))}</p>')
+    if not raw:
+        body += '<div class="card"><p>研究室还没跑过第一轮。</p></div>'
+        return page(req, "/lab", "期权研究室", body)
+
+    racers = sorted(((k, t) for k, t in table.items() if t["room"] == "OPT_LAB"), key=lambda x: -x[1]["score30"])
+    critics = [(k, t) for k, t in table.items() if t["room"] == "lab_critic"]
+    racer_rows = "".join(
+        f'<tr><td><b>{E(str(t["name"]))}</b></td><td class="ev">{E(str(ros.get(k, {}).get("stance", "")))}</td>'
+        f'<td>第 {E(str(t["gen"]))} 代</td><td class="{_cls(t["score30"])}">{t["score30"]:+.1f}</td>'
+        f'<td>{"冠军" if t["champion"] else ""}</td></tr>' for k, t in racers)
+    critic_rows = "".join(
+        f'<tr><td><b>{E(str(t["name"]))}</b></td><td class="{_cls(t["score30"])}">{t["score30"]:+.1f}</td>'
+        f'<td>{E(str(t["n_outcome"]))}</td></tr>' for k, t in critics)
+    body += ('<h2>赛道排行</h2>'
+             '<div class="tw"><table><tr><th>agent</th><th>立场</th><th>代数</th><th>近 30 天积分</th><th>冠军</th></tr>'
+             f'{racer_rows or "<tr><td colspan=5>还没有</td></tr>"}</table></div>'
+             '<h2>两个评委</h2><p class="ev">评委只打分，不参加赛马，没有冠军。</p>'
+             '<div class="tw"><table><tr><th>评委</th><th>近 30 天积分</th><th>已结算</th></tr>'
+             f'{critic_rows or "<tr><td colspan=3>还没有</td></tr>"}</table></div>')
+
+    gone = {(e.get("hash"), t) for e in raw for t in (e.get("supersedes") or [])}
+    recent = [e for e in raw if (e.get("hash"), e.get("ts")) not in gone][-30:][::-1]
+    log_rows = ""
+    for e in recent:
+        d = e.get("dev") or {}
+        spec = e.get("spec")
+        summary = lab.brief_spec(spec) if spec else "（方案无效，没有结构）"
+        p = d.get("dsr_prob")
+        conf = f"{p * 100:.1f}%" if isinstance(p, (int, float)) else "—"
+        crash = "；".join(f"{k} {v:+,.0f}" for k, v in (d.get("overlap") or {}).items()) or "—"
+        pts = e.get("points")
+        pts_txt = f"{pts:+g}" if isinstance(pts, (int, float)) else "—"
+        reasons = [x for x in (e.get("points_reason"), e.get("reason")) if x]
+        reason = " · ".join(dict.fromkeys(reasons))
+        status = LAB_STATUS_CN.get(str(e.get("status")), str(e.get("status") or "—"))
+        log_rows += (f'<tr><td>{E(_pt(e["ts"]) if e.get("ts") else "—")}</td>'
+                     f'<td>{E(str(names.get(e.get("who"), e.get("who") or "?")))}</td>'
+                     f'<td class="ev">{E(str(summary))}</td><td>{E(status)}</td>'
+                     f'<td>{E(str(d.get("n_trades", "—")))}</td><td>{E(conf)}</td>'
+                     f'<td>{E(crash)}</td><td class="{_cls(pts)}">{E(pts_txt)}</td>'
+                     f'<td class="ev">{E(reason) or "—"}</td></tr>')
+    body += ('<h2>研究日志（最近 30 个提案）</h2>'
+             '<div class="tw"><table><tr><th>时间（加州）</th><th>谁</th><th>方案结构</th><th>状态</th><th>开发段笔数</th>'
+             '<th>置信度</th><th>暴跌窗口盈亏（$）</th><th>得分</th><th>原因</th></tr>'
+             f'{log_rows}</table></div>')
+
+    vrows = ""
+    for h, v in sorted(vault.items(), key=lambda kv: str(kv[1].get("ts", "")), reverse=True):
+        res = "出错" if v.get("vault_error") else ("过" if v.get("passed") else "没过")
+        vrows += (f'<tr><td>{E(_lab_day(v.get("ts")))}</td><td><code>{E(str(h))}</code></td>'
+                  f'<td class="{"bad" if res != "过" else "good"}">{E(res)}</td></tr>')
+    body += ('<h2>晋级记录（金库考试）</h2>'
+             '<p class="ev">金库只显示过没过；数字不上网页。完整金库报告在服务器的 data/reports 目录里（文件名 lab_vault_&lt;哈希&gt;.md）。</p>'
+             '<div class="tw"><table><tr><th>日期</th><th>方案哈希</th><th>结果</th></tr>'
+             f'{vrows or "<tr><td colspan=3>还没有方案进过金库</td></tr>"}</table></div>')
+
+    books = "".join(
+        f'<div class="card"><div class="k">{E(str(t["name"]))}（第 {E(str(t["gen"]))} 代）的打法</div>'
+        f'<div class="ev" style="white-space:pre-wrap">{E(str(arena._playbook(S, k) or "")[:300]) or "还没写"}</div></div>'
+        for k, t in racers)
+    body += f'<h2>各 agent 当前的打法（playbook，最多 300 字）</h2><div class="grid">{books or "<p>还没有</p>"}</div>'
+    return page(req, "/lab", "期权研究室", body)
 
 
 @app.get("/qa", response_class=HTMLResponse)
