@@ -580,11 +580,11 @@ daily_minute_pt = 5
 [reopen]
 # 重开 forced-flow 真钱执行器（desk/reopen_exec.py）。开关在 data/state/reopen_live.json（默认 off = 干跑，只写决策日志）；
 # 下面的数字都会被代码硬上限再夹一次（单笔 ≤ $1000、同时 ≤ 3、当日止损 ≤ $15、累计止损 ≤ $50）。
-coins = ["SP500", "XYZ100", "BRENTOIL", "GOLD", "SILVER", "NATGAS", "WTIOIL", "PLATINUM", "COPPER", "NVDA", "TSLA", "INTC", "HOOD", "PLTR", "MSFT", "MU", "AMZN", "CRWV", "SNDK", "CRCL", "META", "GOOGL", "AAPL", "MSTR", "AMD", "CBRS"]   # 2026-10-26 Kea：加 17 只美股（周日 17:05 PT 重开）
+coins = ["SP500", "XYZ100", "BRENTOIL", "GOLD", "SILVER", "NATGAS", "CL", "HO", "PALLADIUM", "PLATINUM", "COPPER", "NVDA", "TSLA", "INTC", "HOOD", "PLTR", "MSFT", "MU", "AMZN", "CRWV", "SNDK", "CRCL", "META", "GOOGL", "AAPL", "MSTR", "AMD", "CBRS"]   # 2026-10-26 Kea：加 17 只美股（周日 17:05 PT 重开）
 # 亚洲股票重开（韩 09:01/16:05 KST；日 09:00/12:30 JST；港 09:30/13:00 HKT；A 股 09:30/13:00 CST，周一到周五）。只填有证据的名字：
 # kr: SMSN（config.toml）、SKHX（knowledge/universe_overrides.toml，官方韩国资产页）；jp: KIOXIA（同上）；hk / cn 暂无 xyz 上的证据。
 # 用 `python -m desk.reopen_exec --list-xyz` 列出全部 xyz 币名后再补。
-asia_coins = { kr = ["SMSN", "SKHX"], jp = ["KIOXIA"], hk = [], cn = [] }
+asia_coins = { kr=["SMSN","SKHY","HYUNDAI","KR200"], jp=["SOFTBANK","JP225"], hk=[], cn=["CAMBRICON","GIGADEV"] }   # 2026-10-26 按 --list-xyz 实际名单
 notify = false             # 2026-10-26 Kea：不要手机推送（记录照写）
 k_bps = 5.0                 # 2026-10-26 Kea：10 → 5，信号更多
 notional_usd = 500.0        # 每笔名义，1x 逐仓

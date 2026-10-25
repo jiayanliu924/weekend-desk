@@ -21,7 +21,7 @@ from . import config, features, rawstore
 
 STOCKS = ["NVDA", "TSLA", "INTC", "HOOD", "PLTR", "MSFT", "MU", "AMZN", "CRWV", "SNDK", "CRCL", "META",
           "GOOGL", "AAPL", "MSTR", "AMD", "CBRS"]
-INDEXES = ["SP500", "XYZ100", "BRENTOIL", "GOLD", "SILVER", "NATGAS", "WTIOIL", "PLATINUM", "COPPER"]
+INDEXES = ["SP500", "XYZ100", "BRENTOIL", "GOLD", "SILVER", "NATGAS", "CL", "HO", "PALLADIUM", "PLATINUM", "COPPER"]
 NOMINAL = {**{c: time(20, 5) for c in STOCKS}, **{c: time(18, 0) for c in INDEXES}}  # 周日 ET；SMSN 排除
 CASH_OPEN = time(9, 30)
 CASH_OPEN_NAMES = ["SP500", "XYZ100"]
@@ -32,7 +32,7 @@ ASIA = {"kr": ("Asia/Seoul", (time(9, 1), time(16, 5)), ("open", "pm")),
         "cn": ("Asia/Shanghai", (time(9, 30), time(13, 0)), ("open", "pm"))}
 ASIA_KINDS = tuple(f"{m}_{s}" for m in ASIA for s in ("open", "pm"))
 # 有证据的币名（config.toml / knowledge/universe_overrides.toml）；hk/cn 暂无 xyz 上的证据 -> 空
-ASIA_COINS = {"kr": ["SMSN", "SKHX"], "jp": ["KIOXIA"], "hk": [], "cn": []}
+ASIA_COINS = {"kr": ["SMSN", "SKHY", "HYUNDAI", "KR200"], "jp": ["SOFTBANK", "JP225"], "hk": [], "cn": ["CAMBRICON", "GIGADEV"]}
 KINDS = ("weekly", "daily_18", "idx_cash_open") + ASIA_KINDS
 KS = (5, 10, 20)
 NOTIONAL = 5000.0
