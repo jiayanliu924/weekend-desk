@@ -1424,6 +1424,10 @@ def write_outputs(out: dict, trades: list[dict], spec: dict, rdir: Path, now: da
 
 
 def main(argv=None) -> int:
+    try:
+        sys.stdout.reconfigure(line_buffering=True)        # 写进日志文件时逐行刷出，网页"后台任务进度"能看到进度
+    except (AttributeError, ValueError):
+        pass
     ap = argparse.ArgumentParser(prog="desk.options_v2_backtest")
     ap.add_argument("--strategies", nargs="+", help="F1 F1f F2 F3 F4 F4c 或完整 id")
     ap.add_argument("--underlyings", nargs="+")

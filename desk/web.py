@@ -1583,6 +1583,7 @@ def lab_page(req: Request):
              + "".join(f"<p>{E(x)}</p>" for x in limits) + "</div>"
              f'<div class="grid"><div class="card"><div class="k">全局试验次数</div><div class="v s">{E(str(n_trials))}</div>'
              '<div class="k">每回测一个新方案、每次金库考试各加 1；次数越多，晋级门槛越高</div></div></div>')
+    body += _bg_progress_html()
     v2 = Path(S.data) / "reports" / "options_v2.md"                                       # 预登记 v2 六种打法的回测报告（给人看；研究室 agents 不读网页）
     if v2.exists():
         import datetime as _dt
@@ -1767,3 +1768,37 @@ def push_pdf(req: Request, capital: float = Form(2000), lev: float = Form(2)):
     ok = notify.push_file(S, "Weekend Desk 报告", f"{_user(req)} 从网页推送", data, f"weekend-desk-{datetime.now(PT):%Y%m%d}.pdf")
     msg = "已推送到手机（ntfy）" if ok else "推送失败：服务器上没有设置推送频道"
     return RedirectResponse("/?" + urlencode({"msg": msg}), status_code=303)
+
+
+_BG_PAT = ("opra_fetch", "options_v2_backtest", "lab_room", "options_lab")
+
+
+def _bg_progress_html() -> str:
+    """后台任务进度（只读）：正在跑的回测/下载进程、补报价目录里的文件数、两份日志的最后几行。
+    让人（和 Claude 通过网页）不用登服务器就知道长任务跑到哪一步。日志内容过 html.escape。"""
+    running = []
+    try:
+        for d in Path("/proc").iterdir():
+            if not d.name.isdigit():
+                continue
+            try:
+                cmd = (d / "cmdline").read_bytes().replace(b"\0", b" ").decode("utf-8", "replace").strip()
+            except OSError:
+                continue
+            if "python" in cmd and any(k in cmd for k in _BG_PAT):
+                running.append(cmd[-160:])
+    except OSError:
+        pass
+    extra = Path(S.data) / "opra" / "cbbo1m_extra_v2"
+    nfiles = sum(1 for _ in extra.rglob("*.parquet")) if extra.exists() else 0
+    logs = []
+    for name in ("all_run.log", "lab/round.log"):
+        f = Path(S.data) / name
+        if f.exists():
+            import datetime as _dt
+            tail = f.read_text(encoding="utf-8", errors="replace").splitlines()[-8:]
+            when = _dt.datetime.fromtimestamp(f.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+            logs.append(f'<div class="k">{E(name)}（最后更新 {E(when)}）</div><pre style="white-space:pre-wrap;font-size:12px">{E(chr(10).join(tail))}</pre>')
+    run_txt = "".join(f"<li><code>{E(c)}</code></li>" for c in running) or "<li>没有后台回测/下载在跑</li>"
+    return ('<div class="card"><div class="k">后台任务进度</div>'
+            f"<ul>{run_txt}</ul><p>补报价已下载文件数：{nfiles}</p>" + "".join(logs) + "</div>")

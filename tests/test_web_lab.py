@@ -208,3 +208,15 @@ def test_lab_page_shows_v2_report_head_escaped(env):
     (rep / "options_v2.md").write_text("# 结论\n<script>alert(1)</script>\nF1 过关", encoding="utf-8")
     html_ = c.get("/lab").text
     assert "F1 过关" in html_ and "<script>alert(1)</script>" not in html_ and "&lt;script&gt;" in html_
+
+
+def test_lab_page_shows_background_progress(env):
+    s, web = env
+    d = Path(s.data)
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "all_run.log").write_text("line1\n<b>下载中</b> 3/8\n", encoding="utf-8")
+    (d / "opra" / "cbbo1m_extra_v2" / "SPY").mkdir(parents=True, exist_ok=True)
+    (d / "opra" / "cbbo1m_extra_v2" / "SPY" / "2024-08.parquet").write_bytes(b"x")
+    html_ = login(web).get("/lab").text
+    assert "后台任务进度" in html_ and "补报价已下载文件数：1" in html_
+    assert "&lt;b&gt;下载中&lt;/b&gt; 3/8" in html_ and "<b>下载中</b>" not in html_

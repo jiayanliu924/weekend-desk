@@ -720,6 +720,10 @@ def run_extra(settings, src, db, unds: list[str], mode: str, yes: bool = False, 
 
 
 def main(argv=None) -> int:
+    try:
+        sys.stdout.reconfigure(line_buffering=True)        # 写进日志文件时逐行刷出，网页"后台任务进度"能看到进度
+    except (AttributeError, ValueError):
+        pass
     ap = argparse.ArgumentParser(prog="desk.opra_fetch")
     g = ap.add_mutually_exclusive_group(required=True)
     g.add_argument("--plan", action="store_true", help="只算价格，不下载")
