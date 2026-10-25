@@ -580,8 +580,8 @@ daily_minute_pt = 5
 [reopen]
 # 重开 forced-flow 真钱执行器（desk/reopen_exec.py）。开关在 data/state/reopen_live.json（默认 off = 干跑，只写决策日志）；
 # 下面的数字都会被代码硬上限再夹一次（单笔 ≤ $1000、同时 ≤ 3、当日止损 ≤ $15、累计止损 ≤ $50）。
-coins = ["SP500", "XYZ100", "BRENTOIL"]   # 研究事件表里的名字；其他币等判定后再加
-k_bps = 10.0                # S·(mid/oracle − 1) 超过这个 bps 才挂单
+coins = ["SP500", "XYZ100", "BRENTOIL", "NVDA", "TSLA", "INTC", "HOOD", "PLTR", "MSFT", "MU", "AMZN", "CRWV", "SNDK", "CRCL", "META", "GOOGL", "AAPL", "MSTR", "AMD", "CBRS"]   # 2026-10-26 Kea：加 17 只美股（周日 17:05 PT 重开）
+k_bps = 5.0                 # 2026-10-26 Kea：10 → 5，信号更多
 notional_usd = 500.0        # 每笔名义，1x 逐仓
 max_concurrent = 3
 daily_loss_stop_usd = 15.0
