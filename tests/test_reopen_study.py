@@ -110,3 +110,26 @@ def test_verdict_group_by_week():
     same = [dict(_row("2026-10-26", net=-1), date="2026-10-26"), dict(_row("2026-10-27", net=-1), date="2026-10-27"),
             dict(_row("2026-10-12", net=50), date="2026-10-12")]
     assert "为负" not in rs.verdict(same, group="week")[1]
+
+
+def test_entry_no_lookahead():
+    # oracle 先停在 100.2（T0），到 T0+100s 才跳到 101(=ref)。mid=100.25：相对当时 oracle 只 +5bps，
+    # 相对未来 ref 是 -74bps。旧代码按 ref 判 S<0 过冲就"买"进场（用了未来信息）；正确：k=10 不触发。
+    t0 = NOM + 120 * NS
+    ctx = []
+    for s in range(-700, 3700):
+        orc = 100.0 if s < 0 else (100.2 if s < 100 else 101.0)
+        mid = 100.0 if s < 0 else 100.25
+        ctx.append((t0 + s * NS, orc, mid, 1000.0))
+    book = [(t0 - 10 * NS, 100.2, 100.3)]
+    trades = [(t0 + 2 * NS, 100.1, 1.0, "A"), (t0 + 3 * NS, 100.4, 1.0, "B")]
+    rows = rs.analyze_event("SP500", "2026-10-11", t0, True, ctx, book, trades)
+    assert all(r["filled"] == 0 for r in rows if r["k"] >= 10)
+
+
+def test_ctrl_not_collapsed_across_kinds():
+    # 同币同日 daily_18 和 idx_cash_open 的对照(b)应分别计入；旧 key (coin, weekend) 会互相覆盖
+    rows = [dict(_row("2026-10-26", ctrl=8.0), kind="daily_18", date="2026-10-26"),
+            dict(_row("2026-10-26", ctrl=8.0), kind="idx_cash_open", date="2026-10-26")]
+    v, why = rs.verdict(rows, group="week")
+    assert v == "INCONCLUSIVE" and "对照(b) 16.0" in why

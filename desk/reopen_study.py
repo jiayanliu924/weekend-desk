@@ -221,16 +221,25 @@ def analyze_event(coin, weekend, t0, inferred, ctx, book, trades, kind="weekly")
                    t0_inferred=int(inferred), G=G, M0=M0, max_overshoot_bps=mo, liq_proxy=liq, k=k, filled=0,
                    gross_bps="", net_bps_main="", net_bps_ctrl60="", net_usd_main="",
                    ctrl_b_net_bps="" if ctrl_b is None else ctrl_b)
-        t_in = next((s for s in range(0, 121) if ovr[s] is not None and S * ovr[s] * 1e4 > k), None)
+        # 入场只用 t_in 时已知的信息：方向和过冲都对照"当时的" oracle，而不是 T0+120s 的 ref（防 look-ahead）。
+        t_in, Se = None, 0
+        for s in range(0, 121):
+            o_s, m_s = ser.at(s, 1), ser.at(s, 2)
+            if not o_s or not m_s:
+                continue
+            Se = _sign(o_s / pre_or - 1)
+            if Se and Se * (m_s / o_s - 1) * 1e4 > k:
+                t_in = s
+                break
         b = _best_book(btimes, book, T(t_in)) if t_in is not None else None
         if b:
-            px = b[2] if S > 0 else b[1]   # S>0 卖在 best ask；S<0 买在 best bid
-            fill = trade_cross(trades, T(t_in), T(120), px, sell_side=S > 0)
+            px = b[2] if Se > 0 else b[1]   # Se>0 卖在 best ask；Se<0 买在 best bid
+            fill = trade_cross(trades, T(t_in), T(120), px, sell_side=Se > 0)
             if fill is not None:
                 row["filled"] = 1
-                direction = -S
+                direction = -Se
                 t_exit_ctrl = fill + 60 * NS if fill >= T(60) else T(60)
-                xf = trade_cross_exit(trades, fill, fill + 600 * NS, ref, buying_back=S > 0)
+                xf = trade_cross_exit(trades, fill, fill + 600 * NS, ref, buying_back=Se > 0)
                 if xf is not None:
                     exit_px, maker = ref, True
                 else:
@@ -282,7 +291,7 @@ def verdict(rows, group="weekend"):
         why.append(f"成交率 {fill_rate:.0%} < 20%")
     if why:
         return "REJECT", "; ".join(why)
-    ctrl = {(r["coin"], r["weekend"]): r["ctrl_b_net_bps"] for r in k10 if _f(r["ctrl_b_net_bps"])}
+    ctrl = {(r["coin"], r.get("kind", "weekly"), r["weekend"]): r["ctrl_b_net_bps"] for r in k10 if _f(r["ctrl_b_net_bps"])}
     ctrl_sum = sum(ctrl.values())
     drop_best = tot - max(nets)
     if (med_os is not None and med_os >= 20 and liq_share is not None and liq_share >= 0.5 and tot > 0
