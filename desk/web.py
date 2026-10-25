@@ -1583,6 +1583,15 @@ def lab_page(req: Request):
              + "".join(f"<p>{E(x)}</p>" for x in limits) + "</div>"
              f'<div class="grid"><div class="card"><div class="k">全局试验次数</div><div class="v s">{E(str(n_trials))}</div>'
              '<div class="k">每回测一个新方案、每次金库考试各加 1；次数越多，晋级门槛越高</div></div></div>')
+    v2 = Path(S.data) / "reports" / "options_v2.md"                                       # 预登记 v2 六种打法的回测报告（给人看；研究室 agents 不读网页）
+    if v2.exists():
+        import datetime as _dt
+        when = _dt.datetime.fromtimestamp(v2.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+        head = "\n".join(v2.read_text(encoding="utf-8", errors="replace").splitlines()[:60])
+        body += (f'<div class="card"><div class="k">v2 回测报告（预登记 6 种打法，{E(when)} 生成；前 60 行，全文在服务器 data/reports/options_v2.md）</div>'
+                 f'<pre style="white-space:pre-wrap;font-size:13px">{E(head)}</pre></div>')
+    else:
+        body += '<div class="card"><p>v2 回测报告还没生成：服务器上还没跑 v2 回测。</p></div>'
     try:
         raw = lab.read_log(env)
         vault = lab.vaulted_hashes(env)

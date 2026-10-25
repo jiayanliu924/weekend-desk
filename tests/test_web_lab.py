@@ -196,3 +196,15 @@ def test_malicious_playbook_is_escaped_and_capped(env):
     assert "<script>location" not in t
     assert "&lt;script&gt;location=" in t
     assert "A" * keep in t and "A" * (keep + 1) not in t
+
+
+
+def test_lab_page_shows_v2_report_head_escaped(env):
+    s, web = env
+    rep = Path(s.data) / "reports"
+    rep.mkdir(parents=True, exist_ok=True)
+    c = login(web)
+    assert "v2 回测报告还没生成" in c.get("/lab").text
+    (rep / "options_v2.md").write_text("# 结论\n<script>alert(1)</script>\nF1 过关", encoding="utf-8")
+    html_ = c.get("/lab").text
+    assert "F1 过关" in html_ and "<script>alert(1)</script>" not in html_ and "&lt;script&gt;" in html_
