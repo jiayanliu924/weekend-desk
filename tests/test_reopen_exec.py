@@ -585,5 +585,5 @@ def test_asia_empty_lists_ok(s):
 
 
 def test_group_xyz():
-    g = rx.group_xyz(["xyz:SMSN", "xyz:KIOXIA", "xyz:NVDA"])
-    assert g["已配置/已知 韩国"] == ["SMSN"] and g["已配置/已知 日本"] == ["KIOXIA"] and g["其他"] == ["NVDA"]
+    g = rx.group_xyz(["xyz:SMSN", "xyz:SOFTBANK", "xyz:NVDA"])
+    assert g["已配置/已知 韩国"] == ["SMSN"] and g["已配置/已知 日本"] == ["SOFTBANK"] and g["其他"] == ["NVDA"]
