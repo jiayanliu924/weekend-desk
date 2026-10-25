@@ -11,7 +11,9 @@ ROOT = Path(__file__).resolve().parent.parent
 
 
 def load_env(path: Path) -> None:
-    if not path.exists():
+    # 测试进程（tests/conftest.py 设 DESK_TEST=1，子进程继承）一律不读真实 .env：
+    # 否则在服务器上跑测试时，子进程会从 /opt/weekend-desk/.env 读到真 API key，真的去调大模型、花钱。
+    if os.environ.get("DESK_TEST") or not path.exists():
         return
     for line in path.read_text().splitlines():
         line = line.strip()

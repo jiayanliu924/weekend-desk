@@ -6,6 +6,7 @@ def _no_real_side_effects(monkeypatch):
     """Tests must never push to the real phone channel or call the real LLM."""
     monkeypatch.delenv("NTFY_TOPIC", raising=False)
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setenv("DESK_TEST", "1")                 # 子进程也不读真实 .env（见 config.load_env）
 
 
 def as_v1(cfg_path):
@@ -33,3 +34,4 @@ def core7(cfg_path):
     import tomllib
     names = [i["name"] for i in tomllib.loads(out)["market"]["instruments"]]
     assert names == ["XYZ100", "SP500", "BRENTOIL", "NVDA", "TSLA", "INTC", "SMSN"], names
+
