@@ -28,6 +28,11 @@ class Collector:
         self.ctx_every = c["ctx_every_sec"]
         self.w = {name: RawWriter(s.data, name) for name in
                   ("hl_book", "hl_trades", "hl_ctx", "hl_params", "hl_conn")}
+        self.auto_xyz = bool(c.get("auto_xyz", False))
+        self.auto_xyz_min_vlm = float(c.get("auto_xyz_min_day_ntl_vlm_usd", 50000))
+        self.auto_xyz_max = int(c.get("auto_xyz_max", 40))
+        self.auto_coins: list[str] = []      # 自动发现的 xyz 市场（只采集，不进交易）
+        self._ws = None
         self._last_l2: dict[str, float] = {}
         self._last_ctx: dict[str, float] = {}
         self.last_msg_at = 0.0
@@ -39,8 +44,9 @@ class Collector:
             try:
                 async with websockets.connect(WS_URL, ping_interval=None, max_size=2**23) as ws:
                     self.w["hl_conn"].add("ws", "connect", {"url": WS_URL})
-                    subs = [{"type": t, "coin": c} for c in self.insts for t in ("l2Book", "trades")]
-                    subs += [{"type": "activeAssetCtx", "coin": c} for c in self.coins]
+                    self._ws = ws
+                    subs = [{"type": t, "coin": c} for c in self.insts + self.auto_coins for t in ("l2Book", "trades")]
+                    subs += [{"type": "activeAssetCtx", "coin": c} for c in self.coins + self.auto_coins]
                     for sub in subs:
                         await ws.send(json.dumps({"method": "subscribe", "subscription": sub}))
                     backoff = 1
@@ -50,6 +56,7 @@ class Collector:
                             self._on_msg(msg)
                     finally:
                         pinger.cancel()
+                        self._ws = None
             except Exception as e:  # noqa: BLE001
                 log.warning("ws error: %s", e)
                 self.w["hl_conn"].add("ws", "disconnect", {"error": str(e)[:300]})
@@ -85,11 +92,55 @@ class Collector:
                 self._last_ctx[coin] = t
                 self.w["hl_ctx"].add("ws", coin, msg, r)
 
+    # ---------- auto xyz discovery (data only) ----------
+    def pick_auto_coins(self, xyz_payload) -> list[str]:
+        """从 xyz dex 的 metaAndAssetCtxs 里挑：未下架、能分类到休市时间表、24h 成交额过线、不在已有清单；按成交额降序封顶。"""
+        from . import universe
+        raw = {"dexs": {"xyz": xyz_payload}}
+        ov = universe.load_overrides(self.s.root)
+        have = set(self.coins)
+        cands = []
+        for m in universe.parse_markets(raw):
+            if m.is_delisted or m.coin in have:
+                continue
+            if universe.classify(m.coin, "xyz", ov)[0] == universe.UNKNOWN:
+                continue
+            if (m.day_ntl_vlm or 0) < self.auto_xyz_min_vlm:
+                continue
+            cands.append(m)
+        cands.sort(key=lambda m: -(m.day_ntl_vlm or 0))
+        return [m.coin for m in cands[: self.auto_xyz_max]]
+
+    async def refresh_auto(self, cli):
+        if not self.auto_xyz:
+            return
+        try:
+            payload = (await cli.post(INFO_URL, json={"type": "metaAndAssetCtxs", "dex": "xyz"})).json()
+            new = self.pick_auto_coins(payload)
+        except Exception as e:  # noqa: BLE001
+            log.warning("auto_xyz discovery failed: %s", e)
+            return
+        added = [c for c in new if c not in self.auto_coins]
+        self.auto_coins = self.auto_coins + added   # 只增不减：已订阅的不退订，避免丢数据
+        self.auto_coins = self.auto_coins[: max(self.auto_xyz_max, len(self.auto_coins))]
+        if added:
+            log.info("auto_xyz +%d coins: %s", len(added), added)
+            self.w["hl_conn"].add("ws", "auto_xyz", {"added": added, "total": len(self.auto_coins)})
+        ws = self._ws
+        if ws is not None and added:
+            try:
+                for c in added:
+                    for t in ("l2Book", "trades", "activeAssetCtx"):
+                        await ws.send(json.dumps({"method": "subscribe", "subscription": {"type": t, "coin": c}}))
+            except Exception as e:  # noqa: BLE001
+                log.warning("auto_xyz subscribe: %s", e)   # 重连时 run_ws 会带上 auto_coins
+
     # ---------- REST parameter snapshots ----------
     async def run_params(self):
         every = self.s["collect"]["params_every_sec"]
         async with httpx.AsyncClient(timeout=30) as cli:
             while True:
+                await self.refresh_auto(cli)
                 try:
                     dexs = (await cli.post(INFO_URL, json={"type": "perpDexs"})).json()
                     metas: dict[str, list] = {}

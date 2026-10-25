@@ -225,6 +225,10 @@ ctx_every_sec = 1
 # REST 参数快照间隔（第八章：每周记录预言机与部署方参数快照）
 params_every_sec = 600
 flush_every_sec = 60
+# 自动订阅 trade.xyz（xyz dex）所有"底层会休市"的活跃市场，只采集数据、不进交易（启动时 + 每次 params 刷新时发现，只增不减）
+auto_xyz = true
+auto_xyz_min_day_ntl_vlm_usd = 50000
+auto_xyz_max = 40
 
 [news]
 poll_every_sec = 300
