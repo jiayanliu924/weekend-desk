@@ -400,6 +400,133 @@ def strategy_line(settings) -> str:
 
 
 # ------------------------------------------------------------------ pages
+_BJ = ZoneInfo("Asia/Shanghai")
+_ZH_COIN = {"BRENTOIL": "原油", "SP500": "标普500", "XYZ100": "纳指100"}
+_ZH_WD = "一二三四五六日"
+
+
+def _zh_coin(c: str) -> str:
+    c = str(c).split(":")[-1]
+    return _ZH_COIN.get(c, c)
+
+
+def _zh_when(dt: datetime) -> str:
+    dt = dt.astimezone(PT)
+    return f"周{_ZH_WD[dt.weekday()]} {dt:%H:%M}"
+
+
+def _usd(v: float, sign: bool = True) -> str:
+    return f"{'+' if sign and v >= 0 else '-' if v < 0 else ''}${abs(v):,.2f}"
+
+
+def reopen_card_html(settings, now: datetime | None = None) -> str:
+    """首页「重开真钱单」卡：全部只读、不联网；任何一步读不到就写"还没有记录"，不拖垮首页。"""
+    from . import account_stop, reopen_exec as rx
+    now = now or datetime.now(UTC)
+    now_ms = int(now.timestamp() * 1000)
+    rows: list[str] = []
+
+    def line(label: str, val: str) -> None:
+        rows.append(f'<div class="ev" style="margin-top:6px"><b>{E(label)}</b>　{val}</div>')
+
+    try:
+        cf = rx.cfg(settings)
+        g = rx.get(settings)
+        live = g.get("mode") == "live"
+        halted = bool(g.get("halt_entries"))
+        sw = "开着（真钱）" if live else "关着"
+        if live and halted:
+            sw += f"，但已暂停开新单：{g.get('halt_reason') or ''}"
+        rows.append(f'<div class="v s {"good" if live and not halted else ""}">{E(sw)}</div>')
+    except Exception:  # noqa: BLE001
+        return ('<div class="card" style="margin-top:12px"><div class="k">重开真钱单</div>'
+                '<div class="ev">还没有记录</div></div>')
+    try:
+        evs = rx.next_events(now, cf)
+        if evs:
+            e0 = evs[0]
+            same = [e for e in evs if e.nominal_ns == e0.nominal_ns]
+            names = "、".join(_zh_coin(n) for e in same for n in e.names)
+            t = datetime.fromtimestamp(e0.nominal_ns / 1e9, UTC)
+            line("下一次盯盘", f"加州 {E(_zh_when(t))}　北京 周{_ZH_WD[t.astimezone(_BJ).weekday()]} {t.astimezone(_BJ):%H:%M}　盯：{E(names)}")
+        else:
+            line("下一次盯盘", "暂时没排上")
+    except Exception:  # noqa: BLE001
+        line("下一次盯盘", "还没有记录")
+    try:
+        st = rx.load_state(settings)
+        d0 = rx._day_start_ms(now_ms)
+        decs = [r for r in rx._led(settings).all() if r.get("kind") == "decision" and r.get("t_ms", 0) >= d0]
+        mine = [p for p in st["pos"].values() if p["open"].get("t_ms", 0) >= d0]
+        watched = {(r["event"], r["name"]) for r in decs}
+        out = []
+        for p in sorted(mine, key=lambda p: p["open"].get("t_ms", 0)):
+            ev = rx.event_from_key(p["open"].get("event", ""), cf)
+            when = _zh_when(datetime.fromtimestamp(ev.nominal_ns / 1e9, UTC)) if ev else "今天"
+            coin = _zh_coin(p["open"]["coin"])
+            c = p["closed"]
+            ent = next((o for o in p["orders"].values() if o["purpose"] == "entry"), None)
+            if c and c.get("reason") == "no_fill" or (c and abs(p["cash"]) < 1e-9 and not p["fees"]):
+                out.append(f"{when} {coin}：挂了单但没成交，没花钱")
+                continue
+            side = "卖出" if p["open"].get("dir", 0) < 0 else "买入"
+            back = "买回" if side == "卖出" else "卖回"
+            amt = p["open"].get("notional_target") or 500
+            if c:
+                mins = max(1, round((c.get("t_ms", 0) - (p["first_fill_ms"] or c.get("t_ms", 0))) / 60000))
+                pnl = c.get("pnl_usd", 0.0)
+                out.append(f"{when} {coin}：{side} ${amt:,.0f}，{mins} 分钟后{back}，{'赚' if pnl >= 0 else '亏'} ${abs(pnl):.2f}（已扣手续费）")
+            else:
+                out.append(f"{when} {coin}：{side} ${amt:,.0f}，还没平仓，在看着")
+        placed = {(p["open"].get("event"), _c) for p in mine for _c in [p["open"].get("coin")]}
+        skipped: dict = {}
+        last = {}
+        for r in decs:
+            if r["what"] in ("t0_detected", "blocked_retry"):
+                continue
+            last[(r["event"], r["name"])] = r
+        why_zh = {"window_closed": "价格没被推过头，没下单（正常）", "no_t0": "没等到开盘信号，没碰（正常）",
+                  "blocked": "安全检查没通过，没下单", "would_enter": "开关关着，只是演习，没下真单",
+                  "dry_signal": "开关关着，只是演习，没下真单"}
+        for (evk, nm), r in last.items():
+            if r["what"] == "entry":
+                continue
+            skipped.setdefault(why_zh.get(r["what"], "没下单"), []).append(_zh_coin(nm))
+        n_names = len({n for _, n in watched})
+        head = f"盯了 {n_names} 个品种，下了 {len(mine) - sum(1 for p in mine if p['closed'] and p['closed'].get('reason') == 'no_fill')} 单"
+        if not decs and not mine:
+            head = "今天还没盯盘，没下单"
+        items = "".join(f"<li>{E(x)}</li>" for x in out)
+        for why, ns in skipped.items():
+            items += f"<li>{E('、'.join(sorted(set(ns))))}：{E(why)}</li>"
+        line("今天", E(head) + (f'<ul style="margin:4px 0 0 18px">{items}</ul>' if items else ""))
+
+        done = [p for p in st["pos"].values() if p["closed"] and p["closed"].get("reason") != "no_fill"]
+        pn = [p["closed"].get("pnl_usd", 0.0) for p in done]
+        if not done:
+            line("累计", "还没有记录")
+        else:
+            w = sum(1 for v in pn if v > 0)
+            line("累计", f"共 {len(done)} 单，赚 {w} 单，亏 {len(done) - w} 单，合计 {'赚' if sum(pn) >= 0 else '亏'} ${abs(sum(pn)):.2f}（扣完手续费）")
+        day_loss = max(0.0, -rx.realized(st, d0))
+        cum_loss = max(0.0, -rx.realized(st))
+        acct = ""
+        try:
+            lim = account_stop.limit(settings)
+            tot = account_stop.components(settings)["total_usd"]
+            acct = f"；账户总止损 ${lim:.0f}，还剩 ${max(0.0, lim + min(0.0, tot)):.2f}"
+            if account_stop.tripped(settings):
+                acct += "（已触发，全部停了）"
+        except Exception:  # noqa: BLE001
+            acct = "；账户总止损暂时读不到"
+        line("止损", f"今天已亏 ${day_loss:.2f} / 上限 ${cf['daily_loss_stop_usd']:.0f}；累计已亏 ${cum_loss:.2f} / 上限 ${cf['cum_loss_stop_usd']:.0f}{E(acct)}")
+        line("进度", f"已成交 {len(done)} / 20 笔（满 20 笔赚钱，就放大到每笔 $2,500）")
+    except Exception:  # noqa: BLE001
+        line("今天", "还没有记录")
+    return ('<div class="card" style="margin-top:12px;border-left:3px solid var(--acc)"><div class="k">重开真钱单</div>'
+            + "".join(rows) + "</div>")
+
+
 @app.get("/", response_class=HTMLResponse)
 def overview(req: Request):
     if (r := _guard(req)):
@@ -547,6 +674,8 @@ def overview(req: Request):
 </div>
 
 {_positions_card()}
+
+{reopen_card_html(S)}
 
 <div class="card" style="margin-top:12px;border-left:3px solid var(--warn)">
   <div class="k">头条动量（影子 · 只记账）</div>

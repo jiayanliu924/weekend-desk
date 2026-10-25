@@ -80,6 +80,7 @@ DEFAULTS = {
     "poll_s": 3.0, "pre_s": 120.0, "t0_wait_s": 600.0, "entry_window_s": 120.0,
     "exit_wait_s": 600.0, "hard_stop_s": 900.0, "stale_s": 10.0,
     "exit_slippage_bps": 50.0, "max_book_spread_bps": 100.0, "depth_fraction": 0.10,
+    "notify": False,            # 手机推送默认关（Kea 不要）；记录和日志照写
     "fee_maker_bps": 3.0, "fee_taker_bps": 9.0, "ioc_attempts": 12,
 }
 
@@ -363,9 +364,20 @@ class MCtx:
         return (b["bid"] + b["ask"]) / 2 if b else fallback
 
 
+def _push(settings, title: str, body: str, priority: str = "default"):
+    """手机推送：默认关（[reopen] notify = false）。关着时只写日志，不发。"""
+    try:
+        if not cfg(settings).get("notify"):
+            log.info("reopen push suppressed: %s | %s", title, body[:200])
+            return False
+    except Exception:  # noqa: BLE001
+        return False
+    return notify.push(settings, title, body, priority=priority)
+
+
 def _alert(m: MCtx, title: str, body: str, pid: str = "-", priority: str = "max"):
     m.led.append("alert", pid, {"pos_id": pid, "title": title, "body": body[:500], "t_ms": m.now_ms})
-    notify.push(m.settings, title, body[:500], priority=priority)
+    _push(m.settings, title, body[:500], priority=priority)
 
 
 def _halt(m: MCtx, why: str):
@@ -427,7 +439,7 @@ def _record_fill(m: MCtx, pid: str, coin: str, cloid: str, is_buy: bool, sz: flo
     m.led.append("fill", pid, {"pos_id": pid, "coin": coin, "cloid": cloid, "signed_sz": sgn * sz, "px": px, "px_est": True if est else None,
                                "purpose": purpose, "fee_usd": _fee(m, purpose, sz, px), "t_ms": m.now_ms})
     side = "买" if is_buy else "卖"
-    notify.push(m.settings, f"重开成交：{coin} {side} {sz:g} @ {px:g}", f"{purpose}，名义约 ${sz * px:.0f}，仓位 {pid}", priority="high")
+    _push(m.settings, f"重开成交：{coin} {side} {sz:g} @ {px:g}", f"{purpose}，名义约 ${sz * px:.0f}，仓位 {pid}", priority="high")
 
 
 def _oids(settings, pid) -> dict:
@@ -488,7 +500,7 @@ def _close_pos(m: MCtx, pid: str, reason: str):
     m.led.append("closed", pid, {"pos_id": pid, "coin": p["open"]["coin"], "reason": reason, "pnl_usd": round(pnl, 4), "t_ms": m.now_ms})
     if reason != "no_fill":
         stop = reason in ("time_stop", "daily_loss_stop", "cum_loss_stop", "account_stop")
-        notify.push(m.settings, f"重开已平仓：{p['open']['coin']}" + ("（止损）" if stop else ""),
+        _push(m.settings, f"重开已平仓：{p['open']['coin']}" + ("（止损）" if stop else ""),
                     f"原因 {reason}，这一笔 ${pnl:+.2f}（含满额手续费估算），仓位 {pid}", priority="max" if stop else "high")
 
 
@@ -690,7 +702,7 @@ def try_enter(m: MCtx, ev: Event, coin: str, S: int, oracle: float, mid: float, 
     try:
         pf = autotrade._live_preflight(m.settings, cf, m.c, check_wallet=m.real)
         if pf:
-            notify.push(m.settings, f"重开下单未通过安全检查：{coin}", pf, priority="high")
+            _push(m.settings, f"重开下单未通过安全检查：{coin}", pf, priority="high")
             return {"entered": False, "why": pf, "retry": False}
         avail = m.c.balance().get("available")
         if avail is None or float(avail) < sz * px * 1.1 / LEVERAGE:
@@ -711,7 +723,7 @@ def try_enter(m: MCtx, ev: Event, coin: str, S: int, oracle: float, mid: float, 
     if r.get("error") and not r.get("unknown"):
         m.led.append("closed", pid, {"pos_id": pid, "coin": coin, "reason": "no_fill", "pnl_usd": 0.0, "t_ms": m.now_ms})
         return {"entered": False, "why": f"ALO 被拒：{r['error']}", "retry": False}
-    notify.push(m.settings, f"重开挂单：{coin} {'买' if is_buy else '卖'} {sz:g} @ {px:g}",
+    _push(m.settings, f"重开挂单：{coin} {'买' if is_buy else '卖'} {sz:g} @ {px:g}",
                 f"过冲 {S * (mid / oracle - 1) * 1e4:.1f} bps > {cf['k_bps']:g}，名义约 ${sz * px:.0f}，T0+{cf['entry_window_s']:.0f}s 没成交就撤", priority="high")
     return {"entered": True, "why": "已挂 ALO", "retry": False, "pos_id": pid}
 
@@ -843,7 +855,7 @@ class Runner:
             self.sleep(max(0.05, self.cf["poll_s"] + self.backoff_s - (self.clock() - t)))
         left = open_positions(load_state(self.settings))
         if left:
-            notify.push(self.settings, "重开事件结束时仍有未平仓位", f"{list(left)}。管理线程会继续看守。", priority="max")
+            _push(self.settings, "重开事件结束时仍有未平仓位", f"{list(left)}。管理线程会继续看守。", priority="max")
 
 
 _TICK_LOCK = threading.RLock()
@@ -928,7 +940,7 @@ def _spawn(name: str, fn, settings):
             fn()
         except Exception as e:  # noqa: BLE001
             log.exception("reopen thread %s", name)
-            notify.push(settings, "重开执行线程出错", f"{name}: {type(e).__name__}: {e}"[:300], priority="high")
+            _push(settings, "重开执行线程出错", f"{name}: {type(e).__name__}: {e}"[:300], priority="high")
     t = threading.Thread(target=body, name=f"reopen-{name}", daemon=True)
     _THREADS[name] = t
     t.start()

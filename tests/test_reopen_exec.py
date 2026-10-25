@@ -280,7 +280,17 @@ def _enter_and_fill(s, sim, fill_at, **cf):
     return r
 
 
+def test_pushes_off_by_default(s, pushes):
+    assert rx.cfg(s)["notify"] is False
+    rx._push(s, "t", "b")
+    assert pushes == []
+    s.raw["reopen"]["notify"] = True
+    rx._push(s, "t", "b")
+    assert len(pushes) == 1
+
+
 def test_exit_posted_at_oracle_and_filled_closes_with_pnl(s, pushes):
+    s.raw["reopen"]["notify"] = True
     rx.put(s, mode="live")
     sim = Sim()
     r = _enter_and_fill(s, sim, NOM_S + 20)
