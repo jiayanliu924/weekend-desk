@@ -6,6 +6,7 @@
 流程（每个合约、每个周末）：
 1. 锁定预测后（重开前 15 分钟）：如果规则说要出手、风控 agent 没有否决、规则没作废 → 挂"只做 maker"的限价单
    （买单挂在买一价、卖单挂在卖一价，不吃单）。仓位 = 本金上限 ÷ 合约数，且不超过盘口深度 10%，杠杆 1 倍。
+   （卡 G3，[autotrade] requote_entry=true 时：发单前先重读盘口，挂当前买一/卖一，偏离回到触发线以内就不下；重开前 5 分钟没成交的挂单撤掉重挂一次。）
 2. 重开前 1 分钟：没成交的挂单全部撤掉（没成交就当没做）。
 3. 重开后 5 分钟：有仓位就市价平掉，记录这一笔的真实盈亏。
 4. 累计真实亏损超过"最多亏"→ 自动切回 off 并推送警报。
@@ -133,6 +134,14 @@ class Client:
         """盘口中间价（只读；平仓前记一笔，事后复盘滑点用）。"""
         lv = self.info.l2_snapshot(coin)["levels"]
         return (float(lv[0][0]["px"]) + float(lv[1][0]["px"])) / 2
+
+    def top(self, coin: str) -> dict:
+        """当前买一/卖一（只读，卡 G3 发单前刷新盘口用）。一侧为空 → 该侧 None；返回结构不对 → 抛错（调用方当"刷新失败"处理）。"""
+        lv = self.info.l2_snapshot(coin)["levels"]
+        if len(lv) < 2:
+            raise ValueError("l2_snapshot levels 结构不对")
+        side = lambda x: float(x[0]["px"]) if x else None  # noqa: E731
+        return {"bid": side(lv[0]), "ask": side(lv[1])}
 
 
 _client_factory = None   # tests replace this
@@ -369,6 +378,77 @@ def _mid_of(c, coin: str) -> float | None:
         return None
 
 
+# ------------------------------------------------------------------ 卡 G3：发单前刷新盘口 / 重挂
+REQUOTE_AT_MIN = 5          # 重开前几分钟重挂
+REQUOTE_WINDOW_MIN = 2      # 重挂 job 的触发窗口长度：[重开前 5 分钟, 重开前 3 分钟)，过窗不补（仍远在重开前 1 分钟撤单之前）
+R_GONE = "发单前价格已回归，没有边际"
+R_EMPTY = "盘口一侧为空"
+R_STALE_NOTE = "刷新盘口失败，用锁定价"
+
+
+def requote_enabled(settings) -> bool:
+    """[autotrade] requote_entry。段缺失/键缺失 = False（老行为）。"""
+    try:
+        return bool((settings["autotrade"] or {}).get("requote_entry", False))
+    except (KeyError, TypeError):
+        return False
+
+
+def _fresh_top(c, coin: str) -> tuple[float | None, float | None]:
+    """刷新后的 (买一, 卖一)；一侧缺失/非正数 → 该侧 None。读取失败直接抛错。"""
+    t = c.top(coin)
+    pos = lambda x: (_f(x) if (_f(x) or 0) > 0 else None)  # noqa: E731
+    return pos(t.get("bid")), pos(t.get("ask"))
+
+
+def _edge_gone(settings, feats: dict, bid: float, ask: float) -> tuple[str | None, float | None]:
+    """用刷新后的中间价重算相对周五收盘锚价（features.fri_close，算 dev_bps 用的同一个价）的偏离。
+    |新偏离| ≤ v2 触发线（[strategy] fade_threshold_bps，和 model.decide_v2 同一个值、同一个比较）或与锁定时方向相反 → (R_GONE, 新偏离)。
+    缺锚价（老记录）→ 判断不了，返回 (None, None)。"""
+    fri = _f(feats.get("fri_close"))
+    if not fri or fri <= 0:
+        return None, None
+    dev = ((bid + ask) / 2 / fri - 1) * 1e4
+    dev0 = _f(feats.get("dev_bps"))
+    if dev0 is None and _f(feats.get("dec_mid")):
+        dev0 = (_f(feats.get("dec_mid")) / fri - 1) * 1e4
+    thr = float(model.strategy_cfg(settings)["fade_threshold_bps"])
+    if abs(dev) <= thr or (dev0 is not None and dev * dev0 < 0):
+        return R_GONE, dev
+    return None, dev
+
+
+def _cancel_err(resp) -> str | None:
+    """cancel 返回里有 error 状态（单子已成交/已不在）→ 原文；其余 None。"""
+    try:
+        for s in resp["response"]["data"]["statuses"]:
+            if isinstance(s, dict) and s.get("error") is not None:
+                return str(s["error"])[:300]
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+def _lock_feats(settings, wid: str) -> dict:
+    try:
+        return (Ledger(settings.data).weekend(wid).get("lock") or {}).get("features", {}) or {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def requote_due(settings, w) -> bool:
+    """调度器问：这个合约现在要不要跑重挂 job。开关开 + live 模式 + 有 sent 的 entry + 还没撤单/平仓/重挂过。"""
+    try:
+        if not requote_enabled(settings) or get(settings)["mode"] != "live":
+            return False
+        rows = _led(settings).all()
+        if not any(r["kind"] == "entry" and r["weekend"] == w.wid and r.get("sent") for r in rows):
+            return False
+        return not any(r["kind"] in ("requote", "cancel", "exit") and r["weekend"] == w.wid for r in rows)
+    except Exception:  # noqa: BLE001
+        return False
+
+
 # ------------------------------------------------------------------ the three steps
 def entry(settings, w, lock: dict | None) -> dict | None:
     cfg = get(settings)
@@ -415,7 +495,14 @@ def entry(settings, w, lock: dict | None) -> dict | None:
     worst = feats.get("max_abs_dev_bps") or risk.get("worst_adverse_bps", 500.0)
     joint_cap = risk.get("joint_first_loss_frac", 0.25) * cfg["capital_usd"] / n / (worst / 1e4)
     notional = min(notional, joint_cap)
-    depth = min([d for d in (feats.get("bid_depth_usd"), feats.get("ask_depth_usd")) if d] or [0])
+    requote = requote_enabled(settings)
+    if requote:      # 卡 G3：买/卖任一侧深度缺失 = 0 深度 = 不出手（原来是"缺的一侧忽略、取另一侧"，两侧都缺时反而不设上限）
+        if not (feats.get("bid_depth_usd") and feats.get("ask_depth_usd")):
+            note_nolive(settings, w.wid, name, R_EMPTY)
+            return None
+        depth = min(feats["bid_depth_usd"], feats["ask_depth_usd"])
+    else:
+        depth = min([d for d in (feats.get("bid_depth_usd"), feats.get("ask_depth_usd")) if d] or [0])
     if depth:
         notional = min(notional, depth * risk["max_depth_fraction"])
     is_buy = a["side"] > 0
@@ -434,6 +521,23 @@ def entry(settings, w, lock: dict | None) -> dict | None:
             notify.push(settings, f"自动下单未通过安全检查：{name}", pf, priority="high")
             return led.append("entry", w.wid, {**plan, "sent": False, "skipped": pf})
         dec = c.sz_decimals(coin)
+        rq_extra: dict = {}
+        if requote:      # 卡 G3：发单前重读盘口，挂当前买一/卖一（仍是 Alo）；还有没有边际要重新判断
+            try:
+                bid, ask = _fresh_top(c, coin)
+            except Exception as e:  # noqa: BLE001
+                log.warning("requote refresh failed (%s): %s", name, e)
+                rq_extra["requote_note"] = R_STALE_NOTE
+            else:
+                if not bid or not ask:
+                    note_nolive(settings, w.wid, name, R_EMPTY)
+                    return None
+                gone, dev_now = _edge_gone(settings, feats, bid, ask)
+                if gone:
+                    note_nolive(settings, w.wid, name, gone)
+                    return None
+                rq_extra.update(px_lock=px_raw, dev_bps_now=None if dev_now is None else round(dev_now, 2))
+                px_raw = plan["px"] = bid if is_buy else ask
         px = round_px(float(px_raw), dec)
         sz = round_sz(notional / px, dec)
         if sz <= 0:
@@ -444,7 +548,7 @@ def entry(settings, w, lock: dict | None) -> dict | None:
         rejected = pr["exch_status"] == "error"
         extra = {"error": "下单被拒：" + pr["exch_error"]} if rejected else {}      # daily_report 认 error 字段，显示成"挂单失败"
         rec = led.append("entry", w.wid, {**plan, "sent": not rejected, "sz": sz, "px": px, "resp": resp,
-                                          "t_ms": int(time.time() * 1000), **pr, **extra})
+                                          "t_ms": int(time.time() * 1000), **pr, **extra, **rq_extra})
         if rejected:
             notify.push(settings, f"自动下单被拒：{name} {plan['side']}", f"下单被拒：{pr['exch_error']}", priority="high")
         else:
@@ -455,6 +559,88 @@ def entry(settings, w, lock: dict | None) -> dict | None:
         log.exception("entry failed")
         notify.push(settings, f"挂单失败：{name}", str(e)[:300], priority="high")
         return led.append("entry", w.wid, {**plan, "sent": False, "error": str(e)[:300]})
+
+
+def requote_unfilled(settings, w) -> dict | None:
+    """卡 G3：重开前 5 分钟，对本周末 sent 且仍有未成交剩余的挂单：撤掉 → 刷新盘口 → 同样的边际检查 → 按剩余数量在新买一/卖一重挂 Alo。
+    每个周末每个合约最多 1 次（账本里已有 kind=requote 就不再做）。只在开关开 + live 模式 + 总止损没触发时做。
+    撤单/平仓/看门狗/名义上限都不受影响：新单数量 ≤ 原单剩余，重开前 1 分钟的撤单照旧撤掉该合约所有挂单。"""
+    if not requote_enabled(settings) or get(settings)["mode"] != "live":
+        return None
+    led = _led(settings)
+    rows = led.all()
+    ent = next((r for r in rows if r["kind"] == "entry" and r["weekend"] == w.wid), None)
+    if not ent or not ent.get("sent") or ent.get("side") not in ("买", "卖"):
+        return None
+    if any(r["kind"] in ("requote", "cancel", "exit") and r["weekend"] == w.wid for r in rows):
+        return None
+    from . import account_stop
+    if account_stop.check(settings).get("tripped"):
+        return None
+    coin, name, is_buy = ent["coin"], ent.get("name"), ent["side"] == "买"
+    rec: dict = {"coin": coin, "name": name, "side": ent["side"], "old_px": None, "new_px": None, "remaining_sz": None,
+                 "exch_status": None, "exch_error": None, "oid": None, "skipped": None}
+    try:
+        c = client()
+        orders = [o for o in c.open_orders(coin) if ent.get("oid") is None or o.get("oid") == ent.get("oid")]
+        orders = [o for o in orders if abs(_f(o.get("sz")) or 0) > 0]
+        if not orders:      # 已经全部成交（或单子已不在）：没有剩余可重挂，不写记录
+            return None
+        rem = sum(abs(_f(o["sz"])) for o in orders)
+        old_px = _f(orders[0].get("limitPx")) or _f(ent.get("px"))
+        rec.update(old_px=old_px, remaining_sz=rem)
+        for o in orders:
+            cerr = _cancel_err(c.cancel(coin, o["oid"]))
+            if cerr:      # 撤不掉（多半是刚好成交了）：不重挂，免得双份
+                rec.update(skipped="撤单失败，不重挂：" + cerr, exch_error=cerr)
+                notify.push(settings, f"重挂中止：{name} {ent['side']}", rec["skipped"], priority="high")
+                return led.append("requote", w.wid, rec)
+        try:      # 读单到撤单之间若又成交了一部分，剩余量按成交记录扣掉（只会变小）
+            if _f(ent.get("sz")):
+                fl = [f for f in c.fills(coin, ent.get("t_ms", 0) - 60_000)
+                      if not str(f.get("dir", "")).startswith("Close") and f.get("side") in (None, "B" if is_buy else "A")]
+                rem = min(rem, max(0.0, _f(ent["sz"]) - sum(abs(_f(f.get("sz")) or 0.0) for f in fl)))
+        except Exception:  # noqa: BLE001
+            pass
+        dec = c.sz_decimals(coin)
+        sz = round_sz(rem, dec)
+        rec["remaining_sz"] = sz
+        if sz <= 0:
+            rec["skipped"] = "撤单后剩余不足最小单位（多半已成交），不重挂"
+            return led.append("requote", w.wid, rec)
+        px_new = old_px
+        try:
+            bid, ask = _fresh_top(c, coin)
+        except Exception as e:  # noqa: BLE001
+            log.warning("requote refresh failed (%s): %s", name, e)
+            rec["requote_note"] = R_STALE_NOTE
+        else:
+            if not bid or not ask:
+                rec["skipped"] = R_EMPTY
+            else:
+                gone, dev_now = _edge_gone(settings, _lock_feats(settings, w.wid), bid, ask)
+                rec["dev_bps_now"] = None if dev_now is None else round(dev_now, 2)
+                if gone:
+                    rec["skipped"] = gone
+                else:
+                    px_new = bid if is_buy else ask
+        if rec["skipped"] or not px_new:
+            rec["skipped"] = rec["skipped"] or "没有可用价格，不重挂"
+            notify.push(settings, f"已撤单未重挂：{name} {ent['side']}", rec["skipped"], priority="high")
+            return led.append("requote", w.wid, rec)
+        px_new = round_px(float(px_new), dec)
+        resp = c.post_only(coin, is_buy, sz, px_new)
+        pr = parse_order_resp(resp)
+        rec.update(new_px=px_new, exch_status=pr["exch_status"], exch_error=pr["exch_error"], oid=pr["oid"])
+        if pr["exch_status"] == "error":
+            notify.push(settings, f"重挂被拒：{name} {ent['side']}", f"下单被拒：{pr['exch_error']}（原单已撤）", priority="high")
+        else:
+            notify.push(settings, f"已重挂：{name} {ent['side']}", f"{sz} 张 {old_px} → {px_new}，开盘前没成交会自动撤单", priority="high")
+        return led.append("requote", w.wid, rec)
+    except Exception as e:  # noqa: BLE001
+        log.exception("requote failed")
+        notify.push(settings, f"重挂失败：{name}", str(e)[:300], priority="high")
+        return led.append("requote", w.wid, {**rec, "exch_error": str(e)[:300]})
 
 
 def cancel_unfilled(settings, w) -> dict | None:

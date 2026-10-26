@@ -9,7 +9,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from . import agents, jobs, notify, options, options_shock, positions, rawstore, report
+from . import agents, autotrade, jobs, notify, options, options_shock, positions, rawstore, report
 from .clock import current_or_next_weekend, last_completed_weekend
 from .collector import Collector
 from .news import NewsPoller
@@ -42,6 +42,11 @@ def due_jobs(now: datetime, settings, done: set) -> list[tuple[str, object]]:
             if k("lock") in done and wk.resume - timedelta(minutes=2) <= now < wk.exit and k("live_entry") not in done \
                     and k("live_missed") not in done:
                 out.append((k("live_missed"), wk))
+            # 卡 G3 重挂：重开前 5 分钟起的 2 分钟窗口（早于 1 分钟撤单），按各合约自己的重开时刻；只在开关开 + live + 有挂出去的 entry 时才出任务
+            rq0 = wk.resume - timedelta(minutes=autotrade.REQUOTE_AT_MIN)
+            if rq0 <= now < rq0 + timedelta(minutes=autotrade.REQUOTE_WINDOW_MIN) and k("live_requote") not in done:
+                if autotrade.requote_due(settings, wk):
+                    out.append((k("live_requote"), wk))
             if wk.resume - timedelta(minutes=1) <= now < wk.exit and k("live_cancel") not in done:
                 out.append((k("live_cancel"), wk))
             # 看门狗：重开到正式平仓之间，每分钟看一次"已实现+未实现"是否破上限（防重开瞬间跳空）
@@ -204,7 +209,6 @@ def run_job(key: str, wk, settings):
     if name == "outcome":
         return jobs.job_outcome(settings, wk, push=False)
     if name.startswith("live_"):
-        from . import autotrade
         from .ledger import Ledger
         if name.startswith("live_guard"):
             return autotrade.kill_check(settings)
@@ -212,6 +216,8 @@ def run_job(key: str, wk, settings):
             return autotrade.note_missed_window(settings, wk)
         if name == "live_entry":
             return autotrade.entry(settings, wk, Ledger(settings.data).weekend(wk.wid).get("lock"))
+        if name == "live_requote":
+            return autotrade.requote_unfilled(settings, wk)
         if name == "live_cancel":
             return autotrade.cancel_unfilled(settings, wk)
         return autotrade.exit_(settings, wk)
