@@ -55,7 +55,7 @@ PER_COIN_MAX = 1
 DAILY_STOP_CAP = 15.0
 CUM_STOP_CAP = 50.0
 STALE_CAP_S = 10.0
-ENTRY_WINDOW_CAP_S = 120.0
+ENTRY_WINDOW_CAP_S = 180.0
 HARD_STOP_CAP_S = 900.0
 EXIT_WAIT_CAP_S = 600.0
 DEPTH_FRAC_CAP = 0.10
@@ -79,13 +79,16 @@ DEFAULTS = {
     "coins": ["SP500", "XYZ100", "BRENTOIL"],   # 研究事件表里的名字；其他币等判定后再加
     "k_bps": 10.0, "notional_usd": 500.0, "max_concurrent": 3,
     "daily_loss_stop_usd": 15.0, "cum_loss_stop_usd": 50.0, "min_balance_usd": 5.0,
-    "poll_s": 3.0, "pre_s": 120.0, "t0_wait_s": 600.0, "entry_window_s": 120.0,
+    "poll_s": 3.0, "pre_s": 120.0, "t0_wait_s": 600.0, "entry_window_s": 180.0,
     "exit_wait_s": 600.0, "hard_stop_s": 900.0, "stale_s": 10.0,
     "exit_slippage_bps": 50.0, "max_book_spread_bps": 100.0, "depth_fraction": 0.10,
     "asia_coins": {"kr": [], "jp": [], "hk": [], "cn": []},   # 亚洲股票重开：{kr/jp/hk/cn: [币名]}，空列表 = 不盯
     "notify": False,            # 手机推送默认关（Kea 不要）；记录和日志照写
     "fee_maker_bps": 3.0, "fee_taker_bps": 9.0, "ioc_attempts": 12,
+    "hip3_fee_mult": 2.0,          # HIP-3（xyz:）手续费 = 主永续 × 2；userFees 给的是主永续费率
+    "hip3_growth_verified": False, # 只有亲自核实过 growth 折扣才放开 6 bps 往返地板
 }
+HIP3_RT_FLOOR_BPS = 6.0            # 2 × 3.0 bps（2026-10-26 SMSN 实测：$500 maker 费 $0.15 = 3 bps/边）
 
 
 # ------------------------------------------------------------------ 开关 / 配置
@@ -136,6 +139,8 @@ def cfg(settings) -> dict:
     d["exit_wait_s"] = max(1.0, min(f("exit_wait_s"), EXIT_WAIT_CAP_S))
     d["poll_s"] = max(POLL_FLOOR_S, f("poll_s"))
     d["depth_fraction"] = max(0.0, min(f("depth_fraction"), DEPTH_FRAC_CAP))
+    d["hip3_fee_mult"] = max(1.0, f("hip3_fee_mult"))
+    d["hip3_growth_verified"] = bool(d.get("hip3_growth_verified"))
     return d
 
 
@@ -307,29 +312,35 @@ class Event:
 
 FEE_TTL_S = 6 * 3600
 FEE_MARGIN_BPS = 3.0
-_FEE_CACHE: dict = {"t": 0.0, "rt": None, "src": "full"}
+_FEE_CACHE: dict = {"t": 0.0, "mk": None, "src": "full"}
 
 
-def round_trip_fee_bps(c, now_s: float | None = None) -> tuple[float, str]:
-    """实际 maker 进 + maker 出 的 bps（userFees，缓存 6h）；查不到 → 满额 2×3 bps。"""
+def round_trip_fee_bps(c, now_s: float | None = None, cf: dict | None = None) -> tuple[float, str]:
+    """HIP-3 maker 进 + maker 出 的 bps：2 × userAddRate × hip3_fee_mult（userFees 缓存 6h）；
+    没核实 growth 折扣（hip3_growth_verified=false）时地板 6 bps。查不到 userFees → 直接用地板。"""
+    cf = cf or DEFAULTS
     now_s = time.time() if now_s is None else now_s
-    if _FEE_CACHE["rt"] is not None and now_s - _FEE_CACHE["t"] < FEE_TTL_S:
-        return _FEE_CACHE["rt"], _FEE_CACHE["src"]
-    full = 2 * DEFAULTS["fee_maker_bps"]
-    rt, src = full, "full(fallback)"
-    try:
-        r = c.info.post("/info", {"type": "userFees", "user": c.address})
-        mk = float(r["userAddRate"]) * 1e4
-        if 0 <= mk <= 20:
-            rt, src = 2 * mk, "userFees"
-    except Exception:  # noqa: BLE001
-        pass
-    _FEE_CACHE.update(t=now_s, rt=rt, src=src)
-    return rt, src
+    if c is not None and not (_FEE_CACHE["mk"] is not None and now_s - _FEE_CACHE["t"] < FEE_TTL_S):
+        mk, src = None, "fallback"
+        try:
+            r = c.info.post("/info", {"type": "userFees", "user": c.address})
+            v = float(r["userAddRate"]) * 1e4
+            if 0 <= v <= 20:
+                mk, src = v, "userFees"
+        except Exception:  # noqa: BLE001
+            pass
+        _FEE_CACHE.update(t=now_s, mk=mk, src=src)
+    mk = _FEE_CACHE["mk"] if c is not None else None
+    src = _FEE_CACHE["src"] if c is not None else "default"
+    mult = float(cf.get("hip3_fee_mult", 2.0))
+    rt = 2 * mk * mult if mk is not None else HIP3_RT_FLOOR_BPS
+    if not cf.get("hip3_growth_verified") and rt < HIP3_RT_FLOOR_BPS:
+        rt, src = HIP3_RT_FLOOR_BPS, f"{src}→HIP-3 地板"
+    return rt, f"{src}×{mult:g}" if mk is not None else src
 
 
 def eff_k_bps(cf: dict, c=None) -> float:
-    rt, _ = round_trip_fee_bps(c) if c is not None else (2 * DEFAULTS["fee_maker_bps"], "full")
+    rt, _ = round_trip_fee_bps(c, cf=cf)
     return max(cf["k_bps"], rt + FEE_MARGIN_BPS)
 
 
@@ -873,6 +884,7 @@ class Runner:
         self.t0: dict = {}
         self.final: dict = {}            # name -> 结论（已决策 / 窗口过了 / 没找到 T0）
         self.max_ovr = {n: 0.0 for n in ev.names}
+        self.settled: dict = {}          # name -> oracle 追价结束的 ns（之前不判过冲）
         self.last_ok_ms: float | None = None
         self.backoff_s = 0.0
         self.logged: set = set()
@@ -955,6 +967,12 @@ class Runner:
             pre = rs.Series(self.samples[n], t0).at(-5, 1)
             if not pre or not oracle:
                 continue
+            if n not in self.settled:
+                if not rs.oracle_settled(self.samples[n], t0, now_ns):
+                    self._once(n, "settling", seconds_after_t0=round((now_ns - t0) / NS, 1), oracle=oracle, oracle_pre_t0=pre)
+                    continue
+                self.settled[n] = now_ns
+                self._log(n, "settled", seconds_after_t0=round((now_ns - t0) / NS, 1), oracle=oracle, oracle_pre_t0=pre)
             G = oracle / pre - 1
             S = rs._sign(G)
             if S == 0:
@@ -968,7 +986,8 @@ class Runner:
             if res["entered"] or not res.get("retry"):
                 self.final[n] = "entered" if res["entered"] else ("dry_signal" if res.get("dry") else "blocked")
                 self._log(n, "entry" if res["entered"] else ("would_enter" if res.get("dry") else "blocked"),
-                          S=S, G=G, overshoot_bps=round(ovr, 1), eff_k_bps=round(ek, 2), oracle=oracle, mid=mid, why=res["why"], pos_id=res.get("pos_id"))
+                          S=S, G=G, overshoot_bps=round(ovr, 1), eff_k_bps=round(ek, 2), oracle=oracle, mid=mid,
+                          oracle_at_entry=oracle, mid_at_entry=mid, seconds_after_t0=round((now_ns - t0) / NS, 1), why=res["why"], pos_id=res.get("pos_id"))
             else:
                 self._once(n, "blocked_retry", why=res["why"])
         with _TICK_LOCK:
@@ -1091,7 +1110,8 @@ def status_lines(settings) -> list[str]:
     m = MCtx(settings, None, cf, int(time.time() * 1000), True)
     realized_day, realized_cum = realized(st, _day_start_ms(m.now_ms)), realized(st)
     lines = [f"模式 {g['mode']}（off = 干跑，只写决策日志）；halt_entries={g['halt_entries']} {g.get('halt_reason') or ''}",
-             f"币 {cf['coins']}，k={cf['k_bps']:g} bps（有效 k={eff_k_bps(cf, None):g}，下单时按实际 maker 费率往返+3 重算），每笔 ${cf['notional_usd']:.0f}，同时 ≤ {cf['max_concurrent']}，"
+             f"币 {cf['coins']}，k={cf['k_bps']:g} bps（往返费 {round_trip_fee_bps(None, cf=cf)[0]:g} bps = HIP-3 ×{cf['hip3_fee_mult']:g}"
+             f"{'' if cf['hip3_growth_verified'] else '，地板 6'}；有效 k={eff_k_bps(cf, None):g}；T0 后先等 oracle 稳定再判），每笔 ${cf['notional_usd']:.0f}，同时 ≤ {cf['max_concurrent']}，"
              f"当日止损 ${cf['daily_loss_stop_usd']:.0f}，累计止损 ${cf['cum_loss_stop_usd']:.0f}",
              f"已实现：今日 ${realized_day:+.2f}，累计 ${realized_cum:+.2f}（未平仓位的浮盈亏要连交易所才算）"]
     for pid, p in open_positions(st).items():

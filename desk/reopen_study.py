@@ -213,8 +213,23 @@ def liq_count(ser, trades, S, t0, nsec=3600):
     return n
 
 
-def analyze_event(coin, weekend, t0, inferred, ctx, book, trades, kind="weekly"):
-    """返回 [row per k]；无法计算则 []。"""
+SETTLE_N, SETTLE_STEP_BPS, SETTLE_MIN_S = 3, 2.0, 6.0
+
+
+def oracle_settled(rows, t0_ns, now_ns, n=SETTLE_N, max_step_bps=SETTLE_STEP_BPS, min_s=SETTLE_MIN_S) -> bool:
+    """oracle 追价是否结束：T0 后已过 min_s 秒，且最近 n 步（都在 T0 之后、不晚于 now）每步 |Δoracle| < max_step_bps。
+    relayer 每 ~3s 最多挪 ±50 bps，大跳空要好几步才追完；没追完时"mid 低于 oracle"其实是 oracle 还没到。"""
+    if now_ns - t0_ns < min_s * NS:
+        return False
+    i = bisect_right([r[0] for r in rows], now_ns)
+    win = rows[max(0, i - n - 1):i]
+    if len(win) < n + 1 or win[0][0] < t0_ns:
+        return False
+    return all(a[1] and abs(b[1] / a[1] - 1) * 1e4 < max_step_bps for a, b in zip(win, win[1:]))
+
+
+def analyze_event(coin, weekend, t0, inferred, ctx, book, trades, kind="weekly", settle=False, settle_window_s=180):
+    """返回 [row per k]；无法计算则 []。settle=True：先等 oracle 追价结束（oracle_settled）再判过冲，入场窗口 settle_window_s。"""
     ser = Series(ctx, t0)
     ref = ser.at(120, 1)
     pre_or = ser.at(-5, 1)
@@ -243,9 +258,12 @@ def analyze_event(coin, weekend, t0, inferred, ctx, book, trades, kind="weekly")
                    ctrl_b_net_bps="" if ctrl_b is None else ctrl_b)
         # 入场只用 t_in 时已知的信息：方向和过冲都对照"当时的" oracle，而不是 T0+120s 的 ref（防 look-ahead）。
         t_in, Se = None, 0
-        for s in range(0, 121):
+        win_s = settle_window_s if settle else 120
+        for s in range(0, win_s + 1):
             o_s, m_s = ser.at(s, 1), ser.at(s, 2)
             if not o_s or not m_s:
+                continue
+            if settle and not oracle_settled(ctx, t0, T(s)):
                 continue
             Se = _sign(o_s / pre_or - 1)
             if Se and Se * (m_s / o_s - 1) * 1e4 > k:
@@ -254,7 +272,7 @@ def analyze_event(coin, weekend, t0, inferred, ctx, book, trades, kind="weekly")
         b = _best_book(btimes, book, T(t_in)) if t_in is not None else None
         if b:
             px = b[2] if Se > 0 else b[1]   # Se>0 卖在 best ask；Se<0 买在 best bid
-            fill = trade_cross(trades, T(t_in), T(120), px, sell_side=Se > 0)
+            fill = trade_cross(trades, T(t_in), T(win_s), px, sell_side=Se > 0)
             if fill is not None:
                 row["filled"] = 1
                 direction = -Se
@@ -357,7 +375,7 @@ def summarize(rows):
     _summarize_one(rows, "week")
 
 
-def run(settings, events, out_dir):
+def run(settings, events, out_dir, settle=False):
     """events: [(kind, date, name)]；一次一个币 × 一个窗口。"""
     rows = []
     for kind, day, name in events:
@@ -374,9 +392,9 @@ def run(settings, events, out_dir):
             print(f"跳过 {kind} {wk} {name}: 名义时间后无样本")
             continue
         ctx = [c for c in ctx if c[0] <= t0 + 3601 * NS]
-        book = read_book(settings, coin, t0 - 120 * NS, t0 + 121 * NS)
+        book = read_book(settings, coin, t0 - 120 * NS, t0 + 181 * NS)
         trades = read_trades(settings, coin, t0 - 600 * NS, t0 + 3601 * NS)
-        r = analyze_event(name, wk, t0, ok, ctx, book, trades, kind=kind)
+        r = analyze_event(name, wk, t0, ok, ctx, book, trades, kind=kind, settle=settle)
         if not r:
             print(f"跳过 {kind} {wk} {name}: ref/G 无法计算或 G==0")
             continue
@@ -400,6 +418,7 @@ def main(argv=None):
     ap.add_argument("--end")
     ap.add_argument("--weekends", default=None, help="逗号分隔的周日日期；给出则只跑 weekly")
     ap.add_argument("--out", default="data/reports/reopen_study")
+    ap.add_argument("--settle", action="store_true", help="先等 oracle 追价结束（连续 3 步 <2 bps 且 T0 后 ≥6s）再判过冲，窗口 180s（同实盘）")
     a = ap.parse_args(argv)
     s = config.load()
     if a.weekends is not None:
@@ -408,7 +427,7 @@ def main(argv=None):
         end = date.fromisoformat(a.end) if a.end else date.today()
         start = date.fromisoformat(a.start) if a.start else end - timedelta(days=21)
         events = gen_events(a.kind, start, end)
-    run(s, events, a.out)
+    run(s, events, a.out, settle=a.settle)
 
 
 if __name__ == "__main__":

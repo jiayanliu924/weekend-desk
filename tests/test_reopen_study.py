@@ -149,3 +149,21 @@ def test_asia_gen_events_weekdays_and_empty():
     assert {k for k, _, _ in ev} == {"kr_open", "kr_pm"} and {d.weekday() for _, d, _ in ev} == {0, 1, 2, 3, 4}
     assert rs.gen_events("asia", date(2026, 10, 26), date(2026, 10, 30), {m: [] for m in rs.ASIA}) == []
     assert all(k in rs.KINDS for k in rs.ASIA_KINDS) and len(rs.ASIA_KINDS) == 8
+
+
+def test_oracle_settled_and_study_settle_flag():
+    NS_ = rs.NS
+    t0 = 1_000 * NS_
+    rows = [(t0 - 6 * NS_, 100.0, 100.0, 1.0)]
+    o = 100.0
+    for i, d in enumerate((50, 50, 20)):
+        o *= 1 - d / 1e4
+        rows.append((t0 + 3 * i * NS_, o, o * (1 - 12e-4), 1.0))
+    assert not rs.oracle_settled(rows, t0, t0 + 6 * NS_)
+    for j in range(1, 6):
+        rows.append((t0 + (6 + 3 * j) * NS_, o, o * (1 - 12e-4), 1.0))
+    assert not rs.oracle_settled(rows, t0, t0 + 12 * NS_)
+    assert rs.oracle_settled(rows, t0, t0 + 15 * NS_)
+    a = rs.analyze_event("X", "w", t0, True, rows, [], [])
+    b = rs.analyze_event("X", "w", t0, True, rows, [], [], settle=True)
+    assert len(a) == len(b)

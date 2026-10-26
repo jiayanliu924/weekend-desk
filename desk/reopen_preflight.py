@@ -90,8 +90,8 @@ def main(argv=None) -> int:
     except Exception as e:  # noqa: BLE001
         fail(f"读余额报错：{e}")
     if c.address:
-        rt, src = rx.round_trip_fee_bps(c)
-        print(f"  · 往返手续费 {rt:.2f} bps（来源 {src}），实际门槛 {max(cf['k_bps'], rt + rx.FEE_MARGIN_BPS):.1f} bps")
+        rt, src = rx.round_trip_fee_bps(c, cf=cf)
+        print(f"  · 往返手续费 {rt:.2f} bps（HIP-3，来源 {src}；growth 折扣核实={cf['hip3_growth_verified']}），实际门槛 {max(cf['k_bps'], rt + rx.FEE_MARGIN_BPS):.1f} bps")
 
     if a.order_test:
         print(f"5. 真实挂单 + 撤单（{a.test_coin}，离市价 20%，不会成交）")

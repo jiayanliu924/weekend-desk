@@ -718,3 +718,59 @@ def test_fix7_detect_t0_min_ns_and_unchanged_rows_appended(s):
     m = rx.MCtx(s, sim, rx.cfg(s), int(sim.t * 1000), True)
     r.poll(m); sim.t += 3; r.poll(m)
     assert len(r.samples["SP500"]) == 2                   # 值不变也记
+
+
+# ------------------------------------------------------------------ 2026-10-26 SMSN 复盘：等 oracle 追完 + HIP-3 费用地板
+def test_settle_gate_no_entry_while_oracle_stepping_down(s):
+    """SMSN 复现：oracle 分 3 步往下追（−50, −50, −20 bps），mid 每步都略低于当时 oracle（−12 bps）→ 追价期间不下单。"""
+    rx.put(s, mode="live")
+    sim = Sim()
+    o = 100.0
+    for i, d in enumerate((50, 50, 20)):
+        o *= 1 - d / 1e4
+        jump(sim, o, o * (1 - 12e-4), at=NOM_S + 5 + 3 * i)
+    r = make(s, sim)
+    r.seed()
+    while sim.t < NOM_S + 5 + 12:      # 第三步之后不到 3 个平稳步
+        r.tick()
+        sim.sleep(3.0)
+    assert not sim.alos("entry")
+    whats = [x["what"] for x in rx._led(s).all() if x["kind"] == "decision"]
+    assert "settling" in whats and "settled" not in whats
+
+
+def test_settle_gate_then_buy_when_mid_15_below_settled_oracle(s):
+    rx.put(s, mode="live")
+    sim = Sim()
+    o = 100.0
+    for i, d in enumerate((50, 50, 20)):
+        o *= 1 - d / 1e4
+        jump(sim, o, o * (1 - 15e-4), at=NOM_S + 5 + 3 * i)
+    r = make(s, sim)
+    r.run()
+    ents = sim.alos("entry")
+    assert len(ents) == 1 and ents[0][1]["is_buy"] is True
+    dec = [x for x in rx._led(s).all() if x["kind"] == "decision"]
+    st_ = [x for x in dec if x["what"] == "settled"][0]
+    assert st_["seconds_after_t0"] >= 6
+    e = [x for x in dec if x["what"] == "entry"][0]
+    assert e["oracle_at_entry"] == pytest.approx(o) and e["mid_at_entry"] == pytest.approx(o * (1 - 15e-4))
+    assert e["seconds_after_t0"] >= st_["seconds_after_t0"] and e["eff_k_bps"] >= 9
+
+
+def test_hip3_fee_floor(s, monkeypatch):
+    class C:
+        address = "0x1"
+        class info:
+            @staticmethod
+            def post(path, body): return {"userAddRate": "0.00015"}
+    monkeypatch.setitem(rx._FEE_CACHE, "mk", None)
+    cf = rx.cfg(s)
+    assert cf["entry_window_s"] == 180.0 and cf["hip3_fee_mult"] == 2.0 and cf["hip3_growth_verified"] is False
+    rt, _ = rx.round_trip_fee_bps(C(), now_s=1e9, cf=cf)
+    assert rt == pytest.approx(6.0)                       # 2 × 1.5 × 2
+    assert rx.round_trip_fee_bps(None, cf=cf)[0] == 6.0
+    assert rx.eff_k_bps({**cf, "k_bps": 0.0}, None) >= 9.0
+    low = {**cf, "hip3_fee_mult": 1.0}
+    assert rx.round_trip_fee_bps(C(), now_s=1e9, cf=low)[0] == 6.0          # 地板
+    assert rx.round_trip_fee_bps(C(), now_s=1e9, cf={**low, "hip3_growth_verified": True})[0] == pytest.approx(3.0)
