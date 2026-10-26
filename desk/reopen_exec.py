@@ -1080,7 +1080,7 @@ def _alive(name: str) -> bool:
 def launch(settings, key: str):
     """调度器调用：立刻返回，真正的轮询在守护线程里（不占 job_loop，不拖慢周末策略 / 配对任务）。"""
     if key.startswith("reopenmgr:"):
-        if has_open(settings) and not any(_alive(n) for n in list(_THREADS)):
+        if has_open(settings) and not _alive("mgr"):          # 只看看守线程自己；别的事件线程在跑也要看守（manage_all 有锁）
             _spawn("mgr", lambda: manage_loop(settings), settings)
         return None
     ev = event_from_key(key, cfg(settings))
