@@ -21,7 +21,7 @@ from pathlib import Path
 
 log = logging.getLogger("qa")
 
-PROTECTED = ["/", "/agents", "/day", "/weekends", "/options", "/money", "/history", "/guide", "/settings", "/report.pdf"]
+PROTECTED = ["/admin", "/agents", "/day", "/weekends", "/options", "/money", "/history", "/guide", "/settings", "/report.pdf"]
 POST_ORIGIN = ["/push-pdf", "/agents/run", "/settings/key", "/settings/live", "/settings/wallet"]
 
 
@@ -73,7 +73,11 @@ def _cleanup(web, name):
 def functional(rep: Report):
     client, web = _client()
     # 匿名：受保护页面应跳登录
-    for path in ["/", "/agents", "/settings", "/money"]:
+    # 首页 / 是对外展示页（2026-10-26 起公开），只查它不泄露后台内容
+    pub = client.get("/")
+    rep.add("用户", "公开首页 / 能打开且不含后台内容", pub.status_code == 200 and "真实业绩" in pub.text and "设置" not in pub.text and "API" not in pub.text,
+            f"返回 {pub.status_code}", "高")
+    for path in ["/admin", "/agents", "/settings", "/money"]:
         r = client.get(path, follow_redirects=False)
         rep.add("用户", f"没登录访问 {path} 会被挡", r.status_code == 303 and "/login" in r.headers.get("location", ""),
                 f"返回 {r.status_code}", "高")
@@ -82,7 +86,7 @@ def functional(rep: Report):
     name, logged = _temp_login(client, web)
     try:
         rep.add("用户", "正确账号密码能登录", logged, "", "高")
-        pages = {"/": "成绩", "/agents": "讨论室", "/day?d=2026-10-04": "它读了什么", "/weekends": "周末",
+        pages = {"/admin": "成绩", "/agents": "讨论室", "/day?d=2026-10-04": "它读了什么", "/weekends": "周末",
                  "/options": "期权", "/money": "放真钱", "/history": "历史", "/guide": "这是什么", "/settings": "设置"}
         for path, kw in pages.items():
             r = client.get(path)
@@ -201,7 +205,7 @@ def _llm_review(settings, rep: Report, llm):
     try:
         client, web = _client()
         name, _ = _temp_login(client, web)
-        for pth in ["/", "/settings", "/money"]:
+        for pth in ["/admin", "/settings", "/money"]:
             pages_txt += f"\n--- 页面 {pth} 文案（节选）---\n" + re.sub(r"<[^>]+>", " ", client.get(pth).text)[:1500]
         _cleanup(web, name)
     except Exception:  # noqa: BLE001
