@@ -1,0 +1,1 @@
+{"name":"BC2_bear_call_trendR2_rich","why":"中期下跌趋势里（跌破50日线、均线下行、20天跌≥5%），上方有阻力，卖虚值看涨收权利金；买更高一档封顶，最大亏损事先知道。不裸卖。只在期权贵（IV30÷RV20≥1.2）时卖。","underlyings":"index_like","legs":[{"side":"sell","type":"call","strike_pct":1.03},{"side":"buy","type":"call","strike_pct":1.08}],"dte":38,"entry":[{"name":"trend_R2","value":true},{"name":"iv_rv_ge","value":1.2}]}
