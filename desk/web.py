@@ -442,6 +442,36 @@ def reopen_card_html(settings, now: datetime | None = None) -> str:
         return ('<div class="card" style="margin-top:12px"><div class="k">重开真钱单</div>'
                 '<div class="ev">还没有记录</div></div>')
     try:
+        st0 = rx.load_state(settings)
+        d00 = rx._day_start_ms(now_ms)
+        decs0 = [r for r in rx._led(settings).all() if r.get("kind") == "decision" and r.get("t_ms", 0) >= d00]
+        skipped_ev: dict = {}
+        for r in decs0:
+            if r.get("what") == "skipped_selfcheck":
+                skipped_ev[r["event"]] = r.get("why") or "自检没通过"
+        ran = {r["event"] for r in decs0 if r.get("what") != "skipped_selfcheck"}
+        mine0 = [p for p in st0["pos"].values() if p["open"].get("t_ms", 0) >= d00]
+        fills = sum(1 for p in mine0 if p.get("first_fill_ms"))
+        net = rx.realized(st0, d00)
+        sk = f"，跳过 {len(skipped_ev)} 场（{'；'.join(sorted(set(skipped_ev.values())))}）" if skipped_ev else "，跳过 0 场"
+        summ = f"今天跑了 {len(ran)} 场{sk}，成交 {fills} 单，{'赚' if net >= 0 else '亏'} ${abs(net):.2f}（已扣手续费）"
+        rows.append(f'<div class="ev" style="margin-top:6px"><b>{E(summ)}</b></div>')
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        h = rx.read_health(settings)
+        if h.get("ts"):
+            tt = _zh_when(datetime.fromtimestamp(h["ts"], UTC))
+            if h.get("ok"):
+                hv = f"正常（{tt}）"
+            else:
+                hv = f"不正常（{tt}）：{'；'.join(h.get('failures') or ['原因未记录'])}"
+        else:
+            hv = "还没有记录"
+        line("最近一次自检", E(hv))
+    except Exception:  # noqa: BLE001
+        pass
+    try:
         evs = rx.next_events(now, cf)
         if evs:
             e0 = evs[0]
@@ -487,7 +517,7 @@ def reopen_card_html(settings, now: datetime | None = None) -> str:
             last[(r["event"], r["name"])] = r
         why_zh = {"window_closed": "价格没被推过头，没下单（正常）", "no_t0": "没等到开盘信号，没碰（正常）",
                   "blocked": "安全检查没通过，没下单", "would_enter": "开关关着，只是演习，没下真单",
-                  "dry_signal": "开关关着，只是演习，没下真单"}
+                  "dry_signal": "开关关着，只是演习，没下真单", "skipped_selfcheck": "自检没通过，整场跳过"}
         for (evk, nm), r in last.items():
             if r["what"] == "entry":
                 continue

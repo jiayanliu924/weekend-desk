@@ -98,6 +98,34 @@ def _path(settings) -> Path:
     return p
 
 
+def health_path(settings) -> Path:
+    p = Path(settings.data) / "state" / "reopen_health.json"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def read_health(settings) -> dict:
+    try:
+        return json.loads(health_path(settings).read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def write_health(settings, **kw) -> dict:
+    """{event, ts, ok, failures, ...}；合并写，读写出错不影响交易。"""
+    d = read_health(settings)
+    d.update(kw)
+    d["ts"] = time.time()
+    try:
+        p = health_path(settings)
+        tmp = p.with_suffix(".tmp")
+        tmp.write_text(json.dumps(d, ensure_ascii=False))
+        tmp.replace(p)
+    except OSError:
+        log.warning("reopen health write failed")
+    return d
+
+
 def get(settings) -> dict:
     d = {"mode": "off", "halt_entries": False, "halt_reason": "", "updated_by": "", "ts": 0}
     try:
@@ -1022,13 +1050,77 @@ class Runner:
 _TICK_LOCK = threading.RLock()
 
 
+def self_check(settings, event_key: str, client=None) -> dict:
+    """事件前约 10 分钟自检（只读，不下单）：缺的币只在这个事件里去掉；开关 / 余额 / 止损等问题 → 整个事件跳过。"""
+    from . import reopen_preflight as pf
+    info: dict = {}
+    try:
+        c = client or _make_client(settings, need_trading=False)
+        fails = pf.checks(settings, c, info=info)
+    except Exception as e:  # noqa: BLE001
+        fails = [f"自检本身出错：{type(e).__name__}: {e}"]
+    miss = [f for f in fails if f.startswith("这些名字交易所上没有")]
+    hard = [f for f in fails if f not in miss]
+    drop = list(info.get("missing") or []) if miss else []
+    d = write_health(settings, event=event_key, ok=not fails, failures=fails, drop=drop, skip=bool(hard),
+                     skip_reason="；".join(hard))
+    log.info("reopen self_check %s: %s", event_key, d)
+    return d
+
+
+def _apply_health(settings, ev: Event, r_led=None) -> Event | None:
+    """按自检结果裁剪事件；返回 None = 整个事件跳过（原因写进决策日志，网页会显示）。"""
+    h = read_health(settings)
+    if h.get("event") != ev.key:
+        return ev
+    why = h.get("skip_reason") if h.get("skip") else ""
+    names = [n for n in ev.names if n not in (h.get("drop") or [])]
+    if h.get("drop"):
+        log.warning("reopen %s: 自检发现这些币不存在，本次去掉 %s", ev.key, h["drop"])
+    if not why and not names:
+        why = "名单里的币交易所上都没有"
+    if why:
+        led = r_led or _led(settings)
+        for n in ev.names:
+            led.append("decision", ev.key, {"event": ev.key, "name": n, "coin": None, "what": "skipped_selfcheck", "why": why,
+                                            "dry": False, "t_ms": int(time.time() * 1000)})
+        write_health(settings, skipped_event=ev.key)
+        return None
+    return Event(ev.kind, ev.day, ev.nominal_ns, names) if len(names) != len(ev.names) else ev
+
+
+def force_close_stale(settings, c, cf, clock=time.time) -> int:
+    """事件结束后兜底：有超过硬止损时间还没平的仓位 → 再走一遍 manage_all（强平路径），结果记进健康文件。"""
+    now_ms = int(clock() * 1000)
+    old = [pid for pid, p in open_positions(load_state(settings)).items()
+           if now_ms >= p["open"].get("t0_ms", p["open"].get("t_ms", now_ms)) + cf["hard_stop_s"] * 1000]
+    if not old:
+        return 0
+    try:
+        with _TICK_LOCK:
+            manage_all(MCtx(settings, c, cf, now_ms, False))
+    except Exception as e:  # noqa: BLE001
+        log.exception("reopen force close")
+        write_health(settings, force_close={"t_ms": now_ms, "pids": old, "error": f"{type(e).__name__}: {e}"[:200]})
+        return len(old)
+    left = [pid for pid in old if pid in open_positions(load_state(settings))]
+    write_health(settings, force_close={"t_ms": now_ms, "pids": old, "still_open": left})
+    return len(old)
+
+
 def run_event(settings, ev: Event, client=None, dry: bool | None = None, **kw) -> Runner:
     cf = cfg(settings)
     mode = get(settings)["mode"]
     dry = (mode != "live") if dry is None else dry
+    ev0 = ev
+    ev = _apply_health(settings, ev) if ev.kind != "test" else ev
     c = client or _make_client(settings, need_trading=not dry or has_open(settings))
+    if ev is None:
+        return Runner(settings, ev0, c, cf, dry, **kw)
     r = Runner(settings, ev, c, cf, dry, **kw)
     r.run()
+    if has_open(settings):
+        force_close_stale(settings, c, cf, kw.get("clock") or time.time)
     return r
 
 
@@ -1048,6 +1140,8 @@ def manage_loop(settings, client=None, clock=time.time, sleep=time.sleep, max_s:
             if is_rate_limited(e):
                 backoff = min(BACKOFF_MAX_S, max(cf["poll_s"], backoff * 2))
         sleep(cf["poll_s"] + backoff)
+    if has_open(settings):
+        force_close_stale(settings, c, cf, clock)
 
 
 # ------------------------------------------------------------------ 调度器接入（和 pairs_exec 一样跑在主进程里）
@@ -1065,6 +1159,11 @@ def due(now: datetime, settings, done: set) -> list[str]:
                 nom = ev.nominal_ns / NS
                 if nom - 300 <= now.timestamp() < nom + 180 and ev.key not in done:
                     out.append(ev.key)
+                ck = "reopencheck:" + ev.key
+                if nom - 600 < now.timestamp() <= nom - 300 and ck not in done:
+                    out.append(ck)
+        for k in [k for k in done if k.startswith("reopencheck:") and k.split(":")[3] < (d0 - timedelta(days=3)).isoformat()]:
+            done.discard(k)
         for k in [k for k in done if k.startswith("reopen:") and k.split(":")[2] < (d0 - timedelta(days=3)).isoformat()]:
             done.discard(k)
     slot = int(now.timestamp() // 60)
@@ -1085,6 +1184,11 @@ def launch(settings, key: str):
     if key.startswith("reopenmgr:"):
         if has_open(settings) and not _alive("mgr"):          # 只看看守线程自己；别的事件线程在跑也要看守（manage_all 有锁）
             _spawn("mgr", lambda: manage_loop(settings), settings)
+        return None
+    if key.startswith("reopencheck:"):
+        ek = key[len("reopencheck:"):]
+        if not _alive(key):
+            _spawn(key, lambda: self_check(settings, ek), settings)
         return None
     ev = event_from_key(key, cfg(settings))
     if ev is None:

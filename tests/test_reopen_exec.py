@@ -774,3 +774,25 @@ def test_hip3_fee_floor(s, monkeypatch):
     low = {**cf, "hip3_fee_mult": 1.0}
     assert rx.round_trip_fee_bps(C(), now_s=1e9, cf=low)[0] == 6.0          # 地板
     assert rx.round_trip_fee_bps(C(), now_s=1e9, cf={**low, "hip3_growth_verified": True})[0] == pytest.approx(3.0)
+
+
+def test_due_emits_reopencheck_key(s):
+    from datetime import timedelta
+    cf = rx.cfg(s)
+    ev = rx.events_on(date(2025, 10, 14), cf)[0]
+    nom = datetime.fromtimestamp(ev.nominal_ns / NS, timezone.utc)
+    ck = "reopencheck:" + ev.key
+    assert rx.due(nom - timedelta(minutes=8), s, set()) == [ck]
+    assert rx.due(nom - timedelta(minutes=8), s, {ck}) == []
+    assert rx.due(nom - timedelta(minutes=11), s, set()) == []
+
+
+def test_selfcheck_skip_and_drop(s):
+    cf = rx.cfg(s)
+    ev = rx.events_on(date(2025, 10, 14), cf)[0]
+    rx.write_health(s, event=ev.key, ok=False, failures=["x"], drop=["SP500"], skip=False, skip_reason="")
+    e2 = rx._apply_health(s, ev)
+    assert e2 is not None and "SP500" not in e2.names
+    rx.write_health(s, event=ev.key, skip=True, skip_reason="余额不够")
+    assert rx._apply_health(s, ev) is None
+    assert any(r["what"] == "skipped_selfcheck" for r in rx._led(s).all() if r["kind"] == "decision")

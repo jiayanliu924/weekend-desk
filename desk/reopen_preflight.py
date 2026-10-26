@@ -19,36 +19,35 @@ from . import reopen_study as rs
 NS = 1_000_000_000
 
 
-def main(argv=None) -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--order-test", action="store_true")
-    ap.add_argument("--test-coin", default="SP500")
-    a = ap.parse_args(argv)
-    s = config.load()
-    cf = rx.cfg(s)
+def checks(settings, c, say=None, info: dict | None = None, names: list | None = None) -> list[str]:
+    """检查 1–4（只读，不下单）→ 失败原因列表（空 = 全部通过）。info["missing"] 带回交易所上没有的品种名。"""
+    cf = rx.cfg(settings)
+    s = settings
     bad: list[str] = []
+    say = say or (lambda *_a, **_k: None)
 
     def ok(msg):
-        print("  ✓", msg)
+        say("  ✓", msg)
 
     def fail(msg):
-        print("  ✗", msg)
+        say("  ✗", msg)
         bad.append(msg)
 
-    names = list(dict.fromkeys(list(cf["coins"]) + [c for v in (cf.get("asia_coins") or {}).values() for c in v]))
+    names = names or list(dict.fromkeys(list(cf["coins"]) + [c for v in (cf.get("asia_coins") or {}).values() for c in v]))
     coins = {n: rx.coin_of(s, n) for n in names}
-    c = rx._make_client(s, need_trading=a.order_test)
 
-    print("1. 品种名字是否真实存在")
+    say("1. 品种名字是否真实存在")
     mc = c.info.post("/info", {"type": "metaAndAssetCtxs", "dex": autotrade.DEX})
     on_dex = {u["name"] for u in mc[0]["universe"] if not u.get("isDelisted")}
-    missing = [n for n, co in coins.items() if co not in on_dex]
+    missing = [co for co in coins.values() if co not in on_dex]
     if missing:
-        fail(f"这些名字交易所上没有：{missing}")
+        if info is not None:
+            info["missing"] = [n for n, co in coins.items() if co in missing]
+        fail(f"这些名字交易所上没有：{[n for n, co in coins.items() if co in missing]}")
     else:
         ok(f"{len(coins)} 个全部存在")
 
-    print("2. 实时价格")
+    say("2. 实时价格")
     good = [co for co in coins.values() if co in on_dex]
     try:
         cx = c.ctxs(good)
@@ -57,7 +56,7 @@ def main(argv=None) -> int:
     except Exception as e:  # noqa: BLE001
         fail(f"查价格报错：{type(e).__name__}: {e}")
 
-    print("3. 过去 10 分钟历史数据")
+    say("3. 过去 10 分钟历史数据")
     now_ns = int(time.time() * NS)
     thin = []
     for n, co in coins.items():
@@ -70,11 +69,11 @@ def main(argv=None) -> int:
         if len(rows) < 5:
             thin.append(n)
     if thin:
-        print(f"  ! 这些没有历史数据（不算失败，开盘前 5 分钟会实时补）：{thin}")
+        say(f"  ! 这些没有历史数据（不算失败，开盘前 5 分钟会实时补）：{thin}")
     else:
         ok("全部有历史数据")
 
-    print("4. 开关 / 止损 / 余额 / 手续费")
+    say("4. 开关 / 止损 / 余额 / 手续费")
     h = rx.get(s)
     ok("开关 live") if h.get("mode") == "live" else fail(f"开关是 {h.get('mode')}，不是 live")
     fail(f"被锁住：{h.get('halt_reason')}") if h.get("halt_entries") else ok("没有被止损锁住")
@@ -91,7 +90,27 @@ def main(argv=None) -> int:
         fail(f"读余额报错：{e}")
     if c.address:
         rt, src = rx.round_trip_fee_bps(c, cf=cf)
-        print(f"  · 往返手续费 {rt:.2f} bps（HIP-3，来源 {src}；growth 折扣核实={cf['hip3_growth_verified']}），实际门槛 {max(cf['k_bps'], rt + rx.FEE_MARGIN_BPS):.1f} bps")
+        say(f"  · 往返手续费 {rt:.2f} bps（HIP-3，来源 {src}；growth 折扣核实={cf['hip3_growth_verified']}），实际门槛 {max(cf['k_bps'], rt + rx.FEE_MARGIN_BPS):.1f} bps")
+
+    return bad
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--order-test", action="store_true")
+    ap.add_argument("--test-coin", default="SP500")
+    a = ap.parse_args(argv)
+    s = config.load()
+    cf = rx.cfg(s)
+    c = rx._make_client(s, need_trading=a.order_test)
+    bad = checks(s, c, say=print)
+
+    def ok(msg):
+        print("  ✓", msg)
+
+    def fail(msg):
+        print("  ✗", msg)
+        bad.append(msg)
 
     if a.order_test:
         print(f"5. 真实挂单 + 撤单（{a.test_coin}，离市价 20%，不会成交）")

@@ -49,3 +49,17 @@ def test_preflight_flags_missing_and_runs_order_test(monkeypatch, capsys):
     assert "交易所上没有" in out and rc == 1            # 真实配置里有不在假名单里的币
     assert f.placed and f.placed[0][2] <= 80.0 and f.cancelled == [7]
     assert "撤单成功" in out
+
+
+def test_checks_returns_failures_without_printing(tmp_path, monkeypatch, capsys):
+    from desk import config
+    s = config.load()
+    f = Fake()
+    out = pf.checks(s, f)
+    assert capsys.readouterr().out == ""
+    assert isinstance(out, list)
+    info = {}
+    out = pf.checks(s, f, info=info, names=["SP500", "NOSUCH"])
+    assert any("交易所上没有" in x for x in out) and info["missing"] == ["NOSUCH"]
+    f.balance = lambda: {"available": 10.0}
+    assert any("余额" in x for x in pf.checks(s, f, names=["SP500"]))

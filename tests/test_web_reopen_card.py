@@ -58,3 +58,13 @@ def test_next_event_asia(env):
     s.raw["reopen"] = {**s.raw["reopen"], "coins": [], "asia_coins": {"kr": ["SMSN"], "jp": [], "hk": [], "cn": []}}
     h = web.reopen_card_html(s, datetime(2026, 10, 27, 12, 0, tzinfo=timezone.utc))   # 周二 05:00 PT
     assert "三星" in h and "加州 周二 17:01" in h and "北京 周三 08:01" in h
+
+
+def test_status_line_and_selfcheck(env):
+    s, web = env
+    rx.write_health(s, event="e", ok=False, failures=["余额不够"])
+    h = web.reopen_card_html(s)
+    assert "今天跑了 0 场" in h and "成交 0 单" in h
+    assert "最近一次自检" in h and "不正常" in h and "余额不够" in h
+    rx.write_health(s, ok=True, failures=[])
+    assert "正常" in web.reopen_card_html(s)
