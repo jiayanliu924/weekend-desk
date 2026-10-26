@@ -119,7 +119,7 @@ def test_overview_shows_shadow_comparison_table(env):  # noqa: F811
     s, web = env
     c = TestClient(web.app)
     c.post("/login", data={"username": "kea", "password": "correct horse battery"})
-    r = c.get("/")
+    r = c.get("/admin")
     assert r.status_code == 200 and "影子策略对照" in r.text
     for lab in ("主策略（实际 action）", model.SHADOW_LABELS["follow50"], model.SHADOW_LABELS["fade50"], model.SHADOW_LABELS["regime"],
                 model.SHADOW_LABELS["v2"], model.SHADOW_LABELS["fade50_stocks"], "当前主策略："):

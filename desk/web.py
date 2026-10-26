@@ -107,6 +107,8 @@ _secret = os.environ.get("WEB_SECRET") or secrets.token_hex(32)
 app.add_middleware(SessionMiddleware, secret_key=_secret, https_only=os.environ.get("WEB_INSECURE") != "1",
                    same_site="lax", max_age=14 * 86400)
 _fails: dict[str, list[float]] = {}
+from .public import router as _public_router  # noqa: E402
+app.include_router(_public_router)
 
 
 def _user(req: Request) -> str | None:
@@ -196,7 +198,7 @@ canvas{max-width:100%}
 @media (prefers-reduced-motion:reduce){*{transition:none!important}}
 """
 
-TABS = [("/", "概览"), ("/agents", "Agent 讨论室"), ("/lab", "期权研究室"), ("/day", "每日记录"), ("/weekends", "周末预测"), ("/options", "期权研究"), ("/labs", "赚钱排行"),
+TABS = [("/admin", "概览"), ("/agents", "Agent 讨论室"), ("/lab", "期权研究室"), ("/day", "每日记录"), ("/weekends", "周末预测"), ("/options", "期权研究"), ("/labs", "赚钱排行"),
         ("/money", "放真钱会怎样"), ("/history", "历史回测"), ("/guide", "这是什么"), ("/qa", "测试"), ("/settings", "设置")]
 
 
@@ -309,7 +311,7 @@ def login(req: Request, username: str = Form(...), password: str = Form(...)):
         req.session.clear()
         req.session["user"] = username.strip()
         _fails.pop(ip, None)
-        return RedirectResponse("/", status_code=303)
+        return RedirectResponse("/admin", status_code=303)
     _fails[ip] = recent + [now]
     return HTMLResponse(LOGIN.format(css=CSS, msg='<p class="bad">用户名或密码不对。</p>'), status_code=401)
 
@@ -595,7 +597,7 @@ def reopen_card_html(settings, now: datetime | None = None) -> str:
             + "".join(rows) + _daily_pdf_links(settings) + reopen_daily_log_html(settings, now) + "</div>")
 
 
-@app.get("/", response_class=HTMLResponse)
+@app.get("/admin", response_class=HTMLResponse)
 def overview(req: Request):
     if (r := _guard(req)):
         return r
@@ -764,7 +766,7 @@ def overview(req: Request):
 <form method="post" action="/push-pdf" style="margin:0"><button class="ghost" type="submit">推送到手机</button></form>
 <span class="ev">每天早上 7 点会自动推一份</span></div>
 {('<p class="note">' + E(pushed) + '</p>') if pushed else ''}"""
-    return page(req, "/", "概览", body)
+    return page(req, "/admin", "概览", body)
 
 
 @app.get("/day", response_class=HTMLResponse)

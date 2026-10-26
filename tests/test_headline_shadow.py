@@ -205,5 +205,5 @@ def test_web_card(s, monkeypatch):
     web.add_user(s, "kea", "correct horse battery")
     c = TestClient(web.app)
     c.post("/login", data={"username": "kea", "password": "correct horse battery"})
-    html = c.get("/").text
+    html = c.get("/admin").text
     assert "头条动量（影子 · 只记账）" in html and "3 条新头条" in html and "进行中（1）" in html

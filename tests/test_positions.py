@@ -235,7 +235,7 @@ def test_web_card_and_form(env, monkeypatch):  # noqa: F811
     c = TestClient(web.app)
     c.post("/login", data={"username": "kea", "password": "correct horse battery"})
     monkeypatch.delenv("HL_ACCOUNT_ADDRESS", raising=False)
-    assert "还没填钱包地址" in c.get("/").text
+    assert "还没填钱包地址" in c.get("/admin").text
     monkeypatch.setenv("HL_ACCOUNT_ADDRESS", "0x" + "a" * 40)
     r = c.post("/settings/position", data={"coin": COIN, "sl": "100.12", "soft_low": "101.5", "soft_high": "102.5", "dwell_min": "10",
                                             "exit_at": "2026-10-12T11:30-07:00", "open_rule": "看空油价", "event_status": "ongoing"})
@@ -244,6 +244,6 @@ def test_web_card_and_form(env, monkeypatch):  # noqa: F811
     assert "没保存" in c.post("/settings/position", data={"coin": COIN, "exit_at": "明天"}).text
     reg, _ = positions.process(positions.load(s), snap(101.0))
     positions.save(s, reg)
-    home = c.get("/").text
+    home = c.get("/admin").text
     assert "仓位看守（包括你手动开的仓）" in home and "软下限 101.5" in home and "看空油价" in home
     assert "仓位规则（仓位看守）" in c.get("/settings").text

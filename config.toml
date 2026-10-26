@@ -592,3 +592,6 @@ max_concurrent = 3
 daily_loss_stop_usd = 15.0
 cum_loss_stop_usd = 50.0
 min_balance_usd = 5.0
+
+[site]
+contact_email = ""   # 公开首页的联系邮箱；留空则不显示联系栏

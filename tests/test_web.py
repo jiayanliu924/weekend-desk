@@ -48,12 +48,12 @@ def env(tmp_path, monkeypatch):
 def test_login_required_and_works(env):
     s, web = env
     c = TestClient(web.app)
-    assert c.get("/", follow_redirects=False).status_code == 303
+    assert c.get("/admin", follow_redirects=False).status_code == 303
     assert c.get("/report.pdf", follow_redirects=False).status_code == 303
     assert c.post("/login", data={"username": "kea", "password": "wrong-password"}).status_code == 401
     r = c.post("/login", data={"username": "kea", "password": "correct horse battery"}, follow_redirects=False)
     assert r.status_code == 303
-    for path, text in [("/", "本周末打算"), ("/day?d=2026-10-04", "它读了什么"), ("/weekends", "2026-10-02"),
+    for path, text in [("/admin", "本周末打算"), ("/day?d=2026-10-04", "它读了什么"), ("/weekends", "2026-10-02"),
                        ("/options", "期权研究"), ("/money?source=history&capital=10000&lev=5", "逐笔明细"),
                        ("/money?source=live", "分合约"), ("/history", "2026-09-11"), ("/guide", "怎么赚钱")]:
         resp = c.get(path)
@@ -131,3 +131,31 @@ def test_settings_key(env, monkeypatch):
     env_txt = (s.root / ".env").read_text()
     assert "ANTHROPIC_API_KEY=sk-ant-api03-goodgoodgood1234" in env_txt and "NTFY_TOPIC=abc" in env_txt
     assert "goodgoodgood" not in c.get("/settings").text      # page shows masked key only
+
+
+def test_public_home_and_reports(env):
+    import time as _t
+    from desk.ledger import Ledger
+    s, web = env
+    now = int(_t.time() * 1000)
+    led = Ledger(s.data, "reopen")
+    led.append("closed", "p1", {"pos_id": "p1", "coin": "xyz:GOLD", "reason": "exit", "pnl_usd": 1.5, "t_ms": now - 2000})
+    led.append("closed", "p2", {"pos_id": "p2", "coin": "xyz:SP500", "reason": "time_stop", "pnl_usd": -0.5, "t_ms": now - 1000})
+    led.append("closed", "p3", {"pos_id": "p3", "coin": "xyz:GOLD", "reason": "no_fill", "pnl_usd": 0.0, "t_ms": now})
+    d = Path(s.data) / "reports" / "daily"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "重开日报_2026-10-20.pdf").write_bytes(b"%PDF-1.4 x")
+    (Path(s.data) / "reports" / "secret.pdf").write_bytes(b"%PDF-secret")
+    c = TestClient(web.app)
+    r = c.get("/")
+    assert r.status_code == 200
+    html = r.text
+    assert "+$1.00" in html and "黄金" in html and "标普500" in html and "真实成交笔数" in html
+    body = html.replace("不含任何回测或模拟", "")
+    for w in ("回测", "研究", "lab", "backtest"):
+        assert w not in body.lower()
+    assert "管理后台" in html and "过往业绩不代表未来收益" in html
+    assert c.get("/reports/重开日报_2026-10-20.pdf").status_code == 200
+    for bad in ("..%2Fsecret.pdf", "%2e%2e%2fsecret.pdf", "nope.pdf", "重开日报_2026-10-20.txt"):
+        assert c.get("/reports/" + bad).status_code in (404, 405), bad
+    assert c.get("/admin", follow_redirects=False).status_code == 303
