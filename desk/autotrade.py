@@ -19,6 +19,7 @@ import json
 import logging
 import math
 import os
+import re
 import time
 from pathlib import Path
 
@@ -258,19 +259,95 @@ def kill_check(settings, c=None) -> dict | None:
     return {"killed": False, "total_usd": total}
 
 
-def _vetoed(settings, name: str) -> str | None:
-    """风控 agent 最近 24 小时的否决。"""
+_VETO_CODES = ("事件", "价格异常", "缺数据", "平台")        # 和 agents.VETO_CODES 一致；agents 读不到时的兜底
+_VETO_REASON_WORDS = ("财报", "议息", "事件", "插针", "异常", "缺", "没有", "平台", "流动性",
+                      "偏离", "盘口", "预言机", "交易所", "过旧", "FOMC", "CPI", "非农",
+                      "业绩", "美联储", "降息", "加息", "拆股", "停牌", "宕机", "清算", "新闻", "战争", "制裁")
+# 只讲"样本/实盘周末数量不够"的说法（先剥掉这些片段，再看有没有别的具体原因词；"没有 30 个周末"里的"没有"不算具体原因）
+_SAMPLE_PHRASE = re.compile(
+    r"(还?没有|还?缺少?|不足|不够|不满|尚?未满|少于)\s*(足够的?|充足的?|积累|攒够?|跑满|达到|满)?\s*(\d+\s*个?)?\s*(实盘|真钱)?\s*(样本|周末)(?!价|行情|盘|标记|报价|数据)"
+    r"|(样本|周末)(数量|数)?\s*(还?没有|还?没|不足|不够|太少|偏少|较少|很少|过少|有限|还少)")
+
+
+def _veto_codes() -> tuple:
+    try:
+        from . import agents
+        return tuple(agents.VETO_CODES)
+    except Exception:  # noqa: BLE001
+        return _VETO_CODES
+
+
+_CODE_EN = (("event", "事件"), ("earnings", "事件"), ("anomaly", "价格异常"), ("wick", "价格异常"), ("price", "价格异常"),
+            ("data", "缺数据"), ("missing", "缺数据"), ("platform", "平台"), ("exchange", "平台"), ("liquidity", "平台"))
+_CODE_STRIP = " \t\r\n。，．.,、；;：:"
+
+
+def _norm_code(code, codes: tuple) -> str | None:
+    """把模型写的 code 归一成四类之一；认不出（含"|"抄模板、同时含两个以上类名、非字符串）→ None。"""
+    if not isinstance(code, str):
+        return None
+    c = code.strip(_CODE_STRIP)
+    if not c or "|" in c or "｜" in c:
+        return None
+    if sum(1 for k in codes if k in c) >= 2:
+        return None
+    if c in codes:
+        return c
+    for k in codes:
+        if c.startswith(k):          # "事件类" 算 事件
+            return k
+    low = c.lower()
+    for en, k in _CODE_EN:
+        if low.startswith(en) and k in codes:
+            return k
+    return None
+
+
+def _only_sample_reason(why: str) -> bool:
+    """why 只讲样本少、没有任何具体原因词 → True（模型不守规矩时的兜底）。"""
+    if "样本" not in why:
+        return False
+    rest = _SAMPLE_PHRASE.sub(" ", why)
+    return not any(k in rest for k in _VETO_REASON_WORDS)
+
+
+def _veto_check(settings, name: str) -> tuple[str | None, str | None]:
+    """风控 agent 最近 24 小时对该合约的否决 → (生效的否决原因, 被忽略的否决原因)。
+    只认 code 属于 事件/价格异常/缺数据/平台 的否决；code 缺失（旧格式）或不在四类里 → 忽略；
+    code 合法但 why 只讲样本少 → 也忽略。被忽略的不拦单，原 why 由调用方写进 entry.veto_ignored。"""
     try:
         from . import agents
         r = agents.last_full_run(settings, within_h=24)
     except Exception:  # noqa: BLE001
-        return None
-    if not r:
-        return None
-    for v in r.get("rooms", {}).get("risk", {}).get("synth", {}).get("veto") or []:
-        if isinstance(v, dict) and str(v.get("name", "")).upper() == name.upper():
-            return str(v.get("why", ""))
-    return None
+        return None, None
+    codes = _veto_codes()
+    try:
+        vetoes = r["rooms"]["risk"]["synth"]["veto"] if r else None
+    except (KeyError, TypeError, IndexError):
+        vetoes = None
+    if not isinstance(vetoes, list):      # int / dict / str / None 一律当没有否决
+        return None, None
+    ignored: list[str] = []
+    for v in vetoes:
+        if not (isinstance(v, dict) and str(v.get("name", "")).upper() == name.upper()):
+            continue
+        why = str(v.get("why", ""))
+        code = _norm_code(v.get("code"), codes)
+        if code is None:
+            log.info("风控否决忽略（code 缺失或不在四类里）：%s code=%r why=%s", name, v.get("code"), why)
+            ignored.append(why or "（无原因）")
+            continue
+        if _only_sample_reason(why):
+            log.info("风控否决忽略（只讲样本少）：%s code=%s why=%s", name, code, why)
+            ignored.append(why)
+            continue
+        return why, "；".join(ignored) or None
+    return None, "；".join(ignored) or None
+
+
+def _vetoed(settings, name: str) -> str | None:
+    """风控 agent 最近 24 小时的有效否决（只认 code 属于四类的；旧格式/只讲样本少的忽略，返回 None）。"""
+    return _veto_check(settings, name)[0]
 
 
 # ------------------------------------------------------------------ 记录用的小工具（只读/只写账，不改下单行为）
@@ -636,7 +713,9 @@ def entry(settings, w, lock: dict | None) -> dict | None:
         return led.append("entry", w.wid, {**base, "skipped": a.get("reason", "规则说不出手")})
     if lock.get("features", {}).get("dislocated"):
         return led.append("entry", w.wid, {**base, "skipped": "中间价和标记价脱节（疑似插针），本周不下单（防被冤枉爆仓）"})
-    veto = _vetoed(settings, name)
+    veto, veto_ignored = _veto_check(settings, name)
+    if veto_ignored:      # 被忽略的否决：不拦单，但记下原话，网页/复盘能看到
+        base["veto_ignored"] = veto_ignored
     if veto:
         return led.append("entry", w.wid, {**base, "skipped": f"风控否决：{veto}"})
     lost = realized_total(settings)

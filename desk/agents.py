@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 import threading
@@ -97,7 +98,17 @@ TRADING_EXTRA = """, "proposal": [{"name": "合约名（7 个都要给）", "lea
 （你的提案会在开盘后按模拟盈亏自动打分：赚了加分、亏了扣分。skip 不赚不亏。）"""
 OPTIONS_EXTRA = """, "forecast_ratio": 你对"下一个期权对照样本"实际波动÷隐含波动的预测（一个数字，如 0.85）, "playbook": "一句话总结你的打法"
 （答案约 2 天后出来，比"历史平均"猜得准就加分，更差就扣分。）"""
-RISK_EXTRA = """, "veto": [{"name": "合约名", "why": "一句话"}]"""
+VETO_CODES = ("事件", "价格异常", "缺数据", "平台")      # 否决原因分类；autotrade._vetoed 只认这四类
+RISK_VETO_RULES = (
+    "否决规则（会直接让该合约不下真钱，请严格遵守）：\n"
+    "- 每个否决必须带 code，只能是下面四类之一，why 里写具体原因：\n"
+    "  事件 = 财报、议息等重大事件落在决策日前后；价格异常 = 插针、中间价与标记价偏离可疑、盘口异常；"
+    "缺数据 = 决策需要的价格数据缺失或过旧；平台 = 交易所、预言机、流动性风险。\n"
+    "- 实盘样本少、实盘时间短、\"还在验证期\"都不是否决理由，只能写在讨论里（points / dissent），不能放进 veto。"
+    "负责人已决定上真钱，样本只会靠真钱积累。\n"
+    "- 说不出上面四类中的具体原因，就不要否决。")
+RISK_EXTRA = (""", "veto": [{"name": "合约名", "code": "事件|价格异常|缺数据|平台 四选一", "why": "一句话，写具体原因"}]\n"""
+              + RISK_VETO_RULES)
 
 SYNTH_SCHEMA = """输出 JSON：
 {"plain": "本室结论，大白话（≤90字）", "consensus": "共识（一两句）", "dissent": [{"who": "成员ID", "view": "不同意见"}], "confidence": 0-100 的整数, "actions": ["接下来该做的具体事"]%s}"""
@@ -226,6 +237,29 @@ def _fmt_pt(ns):
     return datetime.fromtimestamp(ns / 1e9, tz=UTC).astimezone(PT).strftime("%m-%d %H:%M PT") if ns else "—"
 
 
+def _mark_fact(name: str, c: dict, age_min: float, settings) -> str:
+    """插针排查用的价格对照：最新价（链上中间价）、标记价、外部参考价（预言机价）三者的偏离，大白话。
+    标记价来自 Hyperliquid 每个资产的 markPx（采集 hl_ctx 里本来就有，只是以前没放进资料包）。"""
+    thr = float(settings["risk"].get("dislocation_bps", 25.0))      # 和下单前插针检测（features/mark.py）同一个阈值
+    mid_raw, mark_raw, orc_raw = c.get("midPx"), c.get("markPx"), c.get("oraclePx")
+    try:
+        mark, orc = float(mark_raw), float(orc_raw)
+        mid = float(mid_raw) if mid_raw else mark
+    except (TypeError, ValueError):
+        return f"{name}：最新一条行情里没有标记价，无法排查插针（标记价或外部参考价缺失、不是有效数字）；数据 {age_min:.0f} 分钟前。"
+    if not all(math.isfinite(x) for x in (mark, orc, mid)):      # NaN / inf 按缺失处理
+        return f"{name}：最新一条行情里没有标记价，无法排查插针（标记价或外部参考价缺失、不是有效数字）；数据 {age_min:.0f} 分钟前。"
+    if mark <= 0 or orc <= 0 or mid <= 0:
+        return f"{name}：最新一条行情里标记价/参考价不是有效数字，无法排查插针；数据 {age_min:.0f} 分钟前。"
+    gap_mm, gap_mo, gap_ko = (mid / mark - 1) * 1e4, (mid / orc - 1) * 1e4, (mark / orc - 1) * 1e4
+    verdict = (f"链上价与标记价差 {abs(gap_mm):.1f} 个万分点，超过 {thr:.0f}，可能是插针，要小心" if abs(gap_mm) > thr
+               else f"链上价与标记价只差 {abs(gap_mm):.1f} 个万分点，没超过 {thr:.0f}，没看到插针迹象")
+    return (f"{name}：最新价（链上中间价）{mid:,.2f}，标记价（链上做过平滑的价）{mark:,.2f}，外部参考价（预言机价）{orc:,.2f}；"
+            f"最新价比标记价 {gap_mm:+.1f}、最新价比参考价 {gap_mo:+.1f}、标记价比参考价 {gap_ko:+.1f}（单位：万分点）。"
+            f"规则：最新价与标记价的差超过 {thr:.0f} 个万分点，视为可能插针。{verdict}。"
+            f"（休市时外部参考价停在周五收盘，所以它和另外两个价差得大是正常的周末偏离，不算插针。）数据 {age_min:.0f} 分钟前。")
+
+
 def build_bundle(settings, now: datetime | None = None) -> Facts:
     from . import evaluate, options, sim
     from .features import last_ctx_before
@@ -258,6 +292,7 @@ def build_bundle(settings, now: datetime | None = None) -> Facts:
                   f"{inst['name']}：链上中间价 {m:,.2f}，外部参考价 {o:,.2f}，链上比外部 {(m / o - 1) * 1e4:+.1f} 个万分点；"
                   f"资金费率 {float(c.get('funding', 0)) * 100:.4f}%/小时，持仓 {float(c.get('openInterest', 0)):,.1f}；"
                   f"数据 {age:.0f} 分钟前。{timing}", at)
+            F.add(f"标记价 {inst['name']}", _mark_fact(inst["name"], c, age, settings), at)
 
     def history():
         p = Path(settings.data) / "reports" / "history_weekends.json"
@@ -432,11 +467,23 @@ def audit_checks(settings, facts: Facts, outputs: list[dict], started_ns: int, r
         "clock": {"ok": not late, "late_facts": late, "text": "所有资料都早于开会时间" if not late else f"{len(late)} 条资料晚于开会时间：{late}"},
         "cite": {**cite, "ok": cite["uncited"] == 0 and not cite["bad_ids"] and len(cite["unsourced_numbers"]) <= 2,
                  "text": f"论点 {cite['points']} 个，未引用 {cite['uncited']} 个，引用不存在 {len(cite['bad_ids'])} 个，找不到出处的数字 {len(cite['unsourced_numbers'])} 个"},
-        "rules": {"ok": now_hash == rules_at_start and not settings["live"]["enabled"],
-                  "text": ("开会期间规则未变" if now_hash == rules_at_start else "开会期间规则文件被修改！")
-                  + ("；实盘开关关闭" if not settings["live"]["enabled"] else "；注意：实盘开关已打开")},
+        "rules": _rules_check(settings, now_hash == rules_at_start),
         "plain": {"ok": not jargon, "text": "大白话检查通过" if not jargon else "这些大白话里还有术语：" + "，".join(jargon)},
     }
+
+
+def _rules_check(settings, rules_same: bool) -> dict:
+    """代码审计"规则与实盘锁"。周末线自动下单=live 时，真钱已由负责人开启，不能再写"实盘开关关闭"（旧 [live] 开关不控制下单）。"""
+    head = "开会期间规则未变" if rules_same else "开会期间规则文件被修改！"
+    try:
+        from . import autotrade
+        weekend_live = autotrade.get(settings)["mode"] == "live"
+    except Exception:  # noqa: BLE001
+        weekend_live = False
+    if weekend_live:
+        return {"ok": rules_same, "text": head + "；周末线真钱已开（自动下单=live）"}
+    old_on = bool(settings["live"]["enabled"])
+    return {"ok": rules_same and not old_on, "text": head + ("；注意：实盘开关已打开" if old_on else "；实盘开关关闭")}
 
 
 def _close(a: str, b: str) -> bool:
@@ -530,7 +577,8 @@ class Meeting:
             rounds.append(prev)
         # 本室结论：由主席模型整理
         extra = (', "proposal": [{"name": "合约名", "lean": "fade|follow|skip", "size": 0到1, "why": "一句话"}]' if room == "trading"
-                 else ', "veto": [{"name": "合约名", "why": "一句话"}]' if room == "risk" else "")
+                 else ', "veto": [{"name": "合约名", "code": "事件|价格异常|缺数据|平台 四选一", "why": "一句话，写具体原因"}]\n' + RISK_VETO_RULES
+                 if room == "risk" else "")
         transcript = "\n".join(f"第{i + 1}轮 {o['agent']}：{json.dumps(_strip(o['out']), ensure_ascii=False)}"
                                for i, rr in enumerate(rounds) for o in rr)
         champ = self.S["champions"].get(room)

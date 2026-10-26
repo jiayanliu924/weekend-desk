@@ -48,7 +48,7 @@ def fake_llm_factory(calls):
             if "交易室" in system:
                 out["proposal"] = [{"name": "NVDA", "lean": "fade", "size": 0.5, "why": "无新闻"}]
             if "风控室" in system:
-                out["veto"] = [{"name": "TSLA", "why": "跳空风险"}]
+                out["veto"] = [{"name": "TSLA", "code": "价格异常", "why": "跳空风险"}]
         elif '"specs"' in user:
             out = {"stance": "找规律", "plain": "偏离大的个股反向做。", "points": [{"claim": "回测", "cite": [c]}], "confidence": 40,
                    "specs": [{"kind": "weekend", "name": "大偏离反向", "instruments": "all", "direction": "fade",
