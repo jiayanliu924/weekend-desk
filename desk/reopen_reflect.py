@@ -22,7 +22,8 @@ SYSTEM = """你是一个交易复盘员，用最朴素的中文（大白话）�
 1 全程中文，不夹英文单词；币的代号和数字、$、bps 可以直接写。出现任何术语，紧跟括号用一句话解释并举例，例如：过冲（价格被推过头的部分）。
 2 要诚实：证据说明机制弱，就直说"现在看不出它管用"，不许打气，不许承诺会赚钱；样本少就说样本少，不下定论。
 3 只根据给你的事实写，不编数字，没有的数据就说没有。
-策略背景：外部市场（比如美股）关门时，链上合约价格被规则压着；重开时，参考价会分几步追上真实价格。我们只在参考价稳定之后、链上价格比参考价多偏出超过门槛的时候挂单，接那些被迫成交的单。门槛 = 往返手续费 + 3bps，约 9bps（bps：万分之一，9bps 就是 0.09%）。每笔不超过 $500，1 倍杠杆。当日止损 $15，全账户亏到 $20 就全停。跑满 20 笔再看结果。
+说明：事实里的「今天」「累计」是重开策略；「其他策略」是周末策略（周末合约价偏离周五收盘就反向挂单，赌周一回归）和跨平台配对（同一只股票两家链上交易所价差大时一买一卖等价差收回）的汇总，请在结论里点到三条线各自的表现，样本少就说样本少。
+策略背景（重开策略）：外部市场（比如美股）关门时，链上合约价格被规则压着；重开时，参考价会分几步追上真实价格。我们只在参考价稳定之后、链上价格比参考价多偏出超过门槛的时候挂单，接那些被迫成交的单。门槛 = 往返手续费 + 3bps，约 9bps（bps：万分之一，9bps 就是 0.09%）。每笔不超过 $500，1 倍杠杆。当日止损 $15，全账户亏到 $20 就全停。跑满 20 笔再看结果。
 只输出一个 JSON，不要别的字：
 {"一句话结论": "不超过40字", "今天为什么赚/亏": "不超过150字", "机制还成不成立": "不超过150字，要说清样本够不够", "改进方向": ["最多4条，每条不超过50字"], "明天看什么": "不超过80字"}"""
 
@@ -84,7 +85,18 @@ def build_facts(settings, day) -> dict:
         limit = float(account_stop.limit(settings))
     except Exception:  # noqa: BLE001
         pass
-    return {"日期": day.isoformat(),
+    other = {}
+    try:
+        from .daily_report import strategy_trades, strat_summary, _pt_day
+        tr = strategy_trades(settings)
+        for k, nm in (("weekend", "周末策略"), ("pairs", "跨平台配对")):
+            a = strat_summary([t for t in tr if _pt_day(t["ms"]) == day])[k]
+            b = strat_summary(tr)[k]
+            other[nm] = {"今天笔数": a["n"], "今天盈亏美元": round(a["total"], 4), "累计笔数": b["n"],
+                       "累计胜率": None if b["win"] is None else round(b["win"], 2), "累计盈亏美元": round(b["total"], 4)}
+    except Exception:  # noqa: BLE001
+        pass
+    return {"日期": day.isoformat(), "其他策略": other,
             "今天": {"跑了几场事件": len(run), "跳过的事件": skipped, "成交": today,
                     "各币最大过冲bps": {c: round(v, 1) for c, v in overs.items()}, "门槛bps": thr or None,
                     "价差挡单次数": blocks, "当天盈亏美元": round(sum(t["pnl"] for t in today), 4)},
@@ -130,6 +142,10 @@ def fallback(facts: dict) -> dict:
         imp.append(f"今天有 {len(t['跳过的事件'])} 场事件被跳过，要查清是什么原因。")
     imp = imp or ["先继续按现有规则跑，不改参数，攒够笔数再说。"]
     tom = "看明天的重开时刻：参考价走完几步之后，各币偏了多少bps，有没有超过门槛；还有挂单有没有成交。" + (f"全账户止损还剩 ${left:g}。" if left is not None else "")
+    oth = facts.get("其他策略") or {}
+    extra = "；".join(f"{k}累计 {v['累计笔数']} 笔、{'赚' if v['累计盈亏美元'] >= 0 else '亏'} ${abs(v['累计盈亏美元']):.2f}" for k, v in oth.items())
+    if extra:
+        mech += "另外，" + extra + "，笔数都不多，先看不出结论。"
     return {"一句话结论": head, "今天为什么赚/亏": why, "机制还成不成立": mech, "改进方向": imp[:4], "明天看什么": tom}
 
 

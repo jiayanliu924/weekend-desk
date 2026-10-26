@@ -1949,7 +1949,7 @@ def qa_pdf(req: Request, rid: str):
 
 def daily_pdfs(settings, n: int = 7) -> list[str]:
     d = Path(settings.data) / "reports" / "daily"
-    return [p.name for p in sorted(d.glob("重开日报_*.pdf"), reverse=True)[:n]] if d.is_dir() else []
+    return [p.name for p in sorted(d.glob("*日报_*.pdf"), reverse=True)[:n]] if d.is_dir() else []
 
 
 @app.get("/reports/daily/{name}")

@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo
 from fastapi import APIRouter, Response
 from fastapi.responses import HTMLResponse
 
-from .daily_report import zh_coin
+from .daily_report import STRATS, STRAT_ZH, strat_summary, strategy_trades, zh_coin
 from .ledger import Ledger
 
 PT = ZoneInfo("America/Los_Angeles")
@@ -23,23 +23,8 @@ def _settings():
 
 
 def real_trades(settings) -> list[dict]:
-    """仅真实资金平仓：重开账本 closed（非 no_fill）+ 实盘账本 exit 且盈亏非 0。按时间排序。"""
-    out: list[dict] = []
-    try:
-        for r in Ledger(settings.data, "reopen").all():
-            if r.get("kind") == "closed" and r.get("reason") != "no_fill":
-                out.append({"ms": float(r.get("t_ms") or 0), "coin": zh_coin(r.get("coin", "")), "pnl": float(r.get("pnl_usd") or 0)})
-    except Exception:  # noqa: BLE001
-        pass
-    try:
-        for r in Ledger(settings.data, "live").all():
-            p = float(r.get("pnl_usd") or 0)
-            if r.get("kind") == "exit" and p != 0:
-                ms = float(r.get("t_ms") or 0) or float(r.get("written_at") or 0) / 1e6
-                out.append({"ms": ms, "coin": zh_coin(r.get("name") or r.get("coin") or ""), "pnl": p})
-    except Exception:  # noqa: BLE001
-        pass
-    return sorted(out, key=lambda x: x["ms"])
+    """三条线的真实资金平仓（含 strat 字段），按时间排序。"""
+    return strategy_trades(settings)
 
 
 def stats(trades: list[dict], now: datetime | None = None) -> dict | None:
@@ -101,10 +86,14 @@ def render(settings, now: datetime | None = None) -> str:
         k = [("开始日期", f"{st['start']:%Y-%m-%d}"), ("运行天数", f"{st['days']} 天"), ("真实成交笔数", f"{st['n']} 笔"),
              ("胜率", f"{st['win'] * 100:.0f}%"), ("累计盈亏", _usd(st["total"])), ("最大回撤", _usd(-st["dd"]) if st["dd"] else "$0.00")]
         cards = "".join(f'<div class="k"><span>{a}</span><b>{E(b)}</b></div>' for a, b in k)
-        rows = "".join(f"<tr><td>{datetime.fromtimestamp(t['ms'] / 1000, PT):%Y-%m-%d}</td><td>{E(t['coin'])}</td><td>{E(_usd(t['pnl']))}</td></tr>"
+        rows = "".join(f"<tr><td>{datetime.fromtimestamp(t['ms'] / 1000, PT):%Y-%m-%d}</td><td>{E(STRAT_ZH.get(t['strat'], ''))}</td><td>{E(t['coin'])}</td><td>{E(_usd(t['pnl']))}</td></tr>"
                        for t in reversed(trades[-10:]))
+        sm = strat_summary(trades)
+        srows = "".join(f"<tr><td>{nm}</td><td>{sm[k]['n']}</td><td>{'-' if sm[k]['win'] is None else format(sm[k]['win'] * 100, '.0f') + '%'}</td><td>{E(_usd(sm[k]['total']))}</td></tr>"
+                        for k, nm in STRATS + (("all", "合计"),))
         perf = (f'<div class="grid">{cards}</div><p class="note">最大回撤按平仓顺序的累计盈亏计算。</p>'
-                f'<h3 style="font-size:16px;margin:18px 0 6px">最近 10 笔</h3><table><tr><th>日期</th><th>品种</th><th>盈亏</th></tr>{rows}</table>')
+                f'<h3 style="font-size:16px;margin:18px 0 6px">分策略业绩</h3><table><tr><th>策略</th><th>成交笔数</th><th>胜率</th><th>累计盈亏</th></tr>{srows}</table>'
+                f'<h3 style="font-size:16px;margin:18px 0 6px">最近 10 笔</h3><table><tr><th>日期</th><th>策略</th><th>品种</th><th>盈亏</th></tr>{rows}</table>')
     else:
         perf = "<p>运行中，暂无成交</p>"
     try:
@@ -124,8 +113,11 @@ def render(settings, now: datetime | None = None) -> str:
     return f"""<!doctype html><html lang="zh"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Weekend Desk</title><style>{CSS}</style></head><body><div class="w">
 <div class="hero"><h1>Weekend Desk</h1><p>用规则驱动的程序化策略，在外部市场重新开盘、链上合约被迫对齐的时刻，接住被迫成交的单子。</p></div>
-<section><h2>我们怎么赚钱</h2><p>股指、原油、黄金等市场收盘期间，链上的永续合约仍在交易；外部市场重新开盘时，合约价格会被迫向真实价格靠拢，期间常有人被迫成交。
-我们提前盯住参考价，只有价格偏离超过能覆盖手续费的门槛时，才在盘口挂一笔限价小单。价格回归即平仓；到时间未回归也强制平仓。每一步都由预先写好的规则执行，不凭主观判断。</p></section>
+<section><h2>我们怎么赚钱</h2>
+<h3 style="font-size:16px;margin:10px 0 4px">周末策略</h3><p>周末美股休市，链上合约照常交易。如果合约价格偏离周五收盘价太多，我们就反方向挂一笔限价单，赌周一开盘后价格回归。</p>
+<h3 style="font-size:16px;margin:10px 0 4px">重开策略</h3><p>股指、原油、黄金等市场收盘期间，链上的永续合约仍在交易；外部市场重新开盘时，合约价格会被迫向真实价格靠拢，期间常有人被迫成交。
+我们提前盯住参考价，只有价格偏离超过能覆盖手续费的门槛时，才在盘口挂一笔限价小单。价格回归即平仓；到时间未回归也强制平仓。每一步都由预先写好的规则执行，不凭主观判断。</p>
+<h3 style="font-size:16px;margin:10px 0 4px">跨平台配对</h3><p>同一只股票在两家链上交易所的价格差太大时，一边买、一边卖，等价差收回来再平仓。</p></section>
 <section><h2>真实业绩</h2><p class="note">全部为真实资金成交，不含任何回测或模拟。</p>{perf}</section>
 <section><h2>风控</h2>{risk}</section>
 <section><h2>每日报告</h2>{reps}</section>
