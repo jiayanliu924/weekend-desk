@@ -5,7 +5,8 @@ import asyncio
 import logging
 import time
 from dataclasses import replace
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from . import agents, jobs, notify, options, options_shock, positions, rawstore, report
@@ -75,6 +76,9 @@ def due_jobs(now: datetime, settings, done: set) -> list[tuple[str, object]]:
     h = settings["notify"].get("daily_pdf_hour_pt", 7)
     if h <= pt.hour < h + 4 and f"dailypdf:{pt.date()}" not in done:
         out.append((f"dailypdf:{pt.date()}", None))
+    # 重开日报 PDF：每天 08:00 PT 起 4 小时内生成昨天的（后台子进程，最低优先级）
+    if 8 <= pt.hour < 12 and f"reopendaily:{pt.date()}" not in done:
+        out.append((f"reopendaily:{pt.date()}", None))
     # 工作日持续抽取新闻 → 事件（周末窗口外也要有事件，头条动量和期权突发样本才看得到新闻）
     every_x = int(settings["llm"].get("continuous_every_min", 10) or 0)
     if every_x > 0:
@@ -145,6 +149,19 @@ def due_jobs(now: datetime, settings, done: set) -> list[tuple[str, object]]:
 
 
 def run_job(key: str, wk, settings):
+    if key.startswith("reopendaily:"):
+        import os
+        import subprocess
+        import sys
+        day = (date.fromisoformat(key.split(":", 1)[1]) - timedelta(days=1)).isoformat()
+        env = {**os.environ, "DESK_ROOT": str(settings.root), "DESK_DATA": str(settings.data)}
+        try:
+            return subprocess.Popen(["nice", "-n", "19", sys.executable, "-m", "desk.daily_report", "--day", day],
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True, env=env,
+                                    cwd=str(Path(__file__).resolve().parent.parent))
+        except Exception as e:  # noqa: BLE001
+            log.warning("reopen daily pdf failed: %s", e)
+            return None
     if key.startswith("reopen"):
         from . import reopen_exec
         return reopen_exec.launch(settings, key)

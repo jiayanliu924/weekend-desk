@@ -15,7 +15,7 @@ import secrets
 import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 from zoneinfo import ZoneInfo
 
 import duckdb
@@ -402,7 +402,7 @@ def strategy_line(settings) -> str:
 
 # ------------------------------------------------------------------ pages
 _BJ = ZoneInfo("Asia/Shanghai")
-_ZH_COIN = {"BRENTOIL": "原油", "SP500": "标普500", "XYZ100": "纳指100", "SMSN": "三星", "SKHY": "SK海力士", "HYUNDAI": "现代汽车", "KR200": "韩国200指数", "SOFTBANK": "软银", "JP225": "日经225", "CAMBRICON": "寒武纪", "GIGADEV": "兆易创新", "GOLD": "黄金", "SILVER": "白银", "NATGAS": "天然气", "CL": "WTI原油", "HO": "取暖油", "PALLADIUM": "钯金", "PLATINUM": "铂金", "COPPER": "铜", "NATURALGAS": "天然气", "NG": "天然气", "WTI": "WTI原油", "BRENT": "布伦特原油", "USOIL": "WTI原油", "XAU": "黄金", "XAG": "白银", "PAXG": "黄金", "ALUMINIUM": "铝", "ALUMINUM": "铝", "URANIUM": "铀", "TSLA": "特斯拉", "NVDA": "英伟达", "HOOD": "Robinhood", "CRCL": "Circle", "MSTR": "MicroStrategy", "COIN": "Coinbase"}
+from .daily_report import _ZH_COIN, _KIND_ZH, _reopen_row_reason, build_rows as _reopen_build_rows  # noqa: E402
 _ZH_WD = "一二三四五六日"
 
 
@@ -420,101 +420,10 @@ def _usd(v: float, sign: bool = True) -> str:
     return f"{'+' if sign and v >= 0 else '-' if v < 0 else ''}${abs(v):,.2f}"
 
 
-_KIND_ZH = {"kr_open": "韩国开盘", "kr_pm": "韩国午后", "jp_open": "日本开盘", "jp_pm": "日本午休后", "cn_open": "A股开盘", "cn_pm": "A股午休后",
-            "hk_open": "港股开盘", "hk_pm": "港股午休后", "daily_18": "商品指数15:00", "weekly": "周日美股", "idx_cash_open": "美股开盘"}
-_EXIT_ZH = {"time_stop": "到时间强制平仓", "oracle_exit": "价格回到参考价平仓", "exit_timeout": "平仓挂单超时，强制平仓",
-            "oracle_crossed_book": "参考价越过盘口，提前平仓", "exit": "正常平仓"}
-
-
-def _reopen_row_reason(decs: list, pos: dict | None, k_default: float) -> tuple[str, str]:
-    """→ (操作, 原因)，全部中文。decs = 该 (event, name) 的 decision 记录（按时间）。"""
-    by = {}
-    for r in decs:
-        by.setdefault(r.get("what"), []).append(r)
-    ent = (by.get("entry") or [None])[-1]
-    ovr = ek = None
-    if ent:
-        ovr, ek = ent.get("overshoot_bps"), ent.get("eff_k_bps")
-    if pos is not None:
-        c = pos.get("closed") or {}
-        if c.get("reason") == "no_fill" or not pos.get("first_fill_ms"):
-            why = f"挂单后没成交（过冲 {ovr:.1f} bps 超过门槛 {ek:.1f} bps）" if ovr is not None and ek is not None else "挂单后没成交"
-            return "挂单没成交，自动撤单", why
-        d = pos["open"].get("dir", 0)
-        ent_f = [f for f in pos["fills"] if (f["signed_sz"] > 0) == (d > 0)]
-        ex_f = [f for f in pos["fills"] if (f["signed_sz"] > 0) != (d > 0)]
-
-        def avg(fs):
-            q = sum(abs(f["signed_sz"]) for f in fs)
-            return (sum(abs(f["signed_sz"]) * (f.get("px") or 0) for f in fs) / q, q) if q else (None, 0)
-        pe, qe = avg(ent_f)
-        px_ex, _ = avg(ex_f)
-        side, back = ("卖出", "买回") if d < 0 else ("买入", "卖出")
-        op = f"{pe:g} {side} ${pe * qe:,.0f}"
-        op += f" → {px_ex:g} {back}" if px_ex is not None else " → 还没平仓，在看着"
-        why = f"过冲 {ovr:.1f} bps 超过门槛 {ek:.1f} bps；" if ovr is not None and ek is not None else "过冲超过门槛；"
-        why += _EXIT_ZH.get(pos.get("exit_reason") or c.get("reason") or "", "还没平仓" if not c else "已平仓")
-        return op, why
-    if "skipped_selfcheck" in by:
-        return "不下单", f"开盘前自检没通过：{by['skipped_selfcheck'][-1].get('why') or '原因未记录'}"
-    if "no_t0" in by:
-        return "不下单", "价格没跳（没有重开）"
-    retry = (by.get("blocked_retry") or [None])[-1]
-    blk = (by.get("blocked") or [None])[-1]
-    b = blk or retry
-    if b and (blk or "window_closed" in by or True):
-        w = str(b.get("why") or "")
-        m = re.search(r"价差 (\d+) bps", w)
-        if m:
-            return "不下单", f"盘口价差 {m.group(1)} bps 太宽（盘口太空，交易不了）"
-        if "读不到" in w:
-            return "不下单", "读不到盘口"
-        if "没更新" in w:
-            return "不下单", "行情数据太久没更新，不敢下单"
-        return "不下单", w or "安全检查没通过"
-    if "window_closed" in by:
-        mo = by["window_closed"][-1].get("max_overshoot_bps")
-        if "settled" not in by and "settling" in by:
-            return "不下单", "参考价还在追（未稳定），一直没法判断"
-        tail = [r.get("eff_k_bps") for r in decs if r.get("eff_k_bps") is not None]
-        k = tail[-1] if tail else k_default
-        if mo is None:
-            return "不下单", "价格没被推过头"
-        return "不下单", f"overshoot {mo:.1f} bps < 门槛 {k:.1f} bps"
-    if "would_enter" in by:
-        return "不下单", "开关关着，只是演习，没下真单"
-    return "不下单", "没有触发条件"
-
-
 def reopen_daily_log_html(settings, now: datetime | None = None, days: int = 7) -> str:
     """每天每个品种一行：加州时间 / 轮次 / 品种 / 操作 / 原因 / 盈亏。只读账本，不联网；出错返回空串。"""
     try:
-        from . import reopen_exec as rx
-        cf = rx.cfg(settings)
-        recs = rx._led(settings).all()
-        st = rx.load_state(settings)
-        for pid, p in st["pos"].items():
-            p["fills"] = [r for r in recs if r.get("kind") == "fill" and r.get("pos_id") == pid]
-        decs: dict = {}
-        for r in recs:
-            if r.get("kind") == "decision" and r.get("event") and r.get("name"):
-                decs.setdefault((r["event"], r["name"]), []).append(r)
-        posm: dict = {}
-        for p in st["pos"].values():
-            ek, nm = p["open"].get("event"), str(p["open"].get("coin", "")).split(":")[-1]
-            if ek:
-                posm[(ek, nm)] = p
-        rows = []
-        for key in set(decs) | set(posm):
-            try:
-                _, kind, ds, hhmm = key[0].split(":")
-                nom = datetime.strptime(f"{ds} {hhmm}", "%Y-%m-%d %H%M").replace(tzinfo=ZoneInfo("America/New_York")).astimezone(PT)
-            except Exception:  # noqa: BLE001
-                continue
-            op, why = _reopen_row_reason(decs.get(key, []), posm.get(key), float(cf.get("k_bps", 0) or 0))
-            p = posm.get(key)
-            pnl = float((p["closed"] or {}).get("pnl_usd", 0.0) or 0.0) if p and p.get("first_fill_ms") else 0.0
-            rows.append((nom, kind, key[1], op, why, pnl, bool(p and p.get("first_fill_ms"))))
+        rows = _reopen_build_rows(settings)
         if not rows:
             return ""
         byday: dict = {}
@@ -535,6 +444,17 @@ def reopen_daily_log_html(settings, now: datetime | None = None, days: int = 7) 
         return "".join(out)
     except Exception:  # noqa: BLE001
         return ""
+
+
+def _daily_pdf_links(settings) -> str:
+    try:
+        names = daily_pdfs(settings)
+    except Exception:  # noqa: BLE001
+        return ""
+    if not names:
+        return ""
+    return ('<div class="ev" style="margin-top:8px"><b>下载日报 PDF</b>　' + "　".join(
+        f'<a href="/reports/daily/{E(quote(n))}">{E(n[5:-4])}</a>' for n in names) + "</div>")
 
 
 def reopen_card_html(settings, now: datetime | None = None) -> str:
@@ -672,7 +592,7 @@ def reopen_card_html(settings, now: datetime | None = None) -> str:
     except Exception:  # noqa: BLE001
         line("今天", "还没有记录")
     return ('<div class="card" style="margin-top:12px;border-left:3px solid var(--acc)"><div class="k">重开真钱单</div>'
-            + "".join(rows) + reopen_daily_log_html(settings, now) + "</div>")
+            + "".join(rows) + _daily_pdf_links(settings) + reopen_daily_log_html(settings, now) + "</div>")
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -2023,6 +1943,27 @@ def qa_pdf(req: Request, rid: str):
         return Response("没有这次体检", status_code=404)
     data = pdfreport.qa_pdf(S, rec)
     return Response(data, media_type="application/pdf", headers={"Content-Disposition": f'attachment; filename="qa-{rid}.pdf"'})
+
+
+def daily_pdfs(settings, n: int = 7) -> list[str]:
+    d = Path(settings.data) / "reports" / "daily"
+    return [p.name for p in sorted(d.glob("重开日报_*.pdf"), reverse=True)[:n]] if d.is_dir() else []
+
+
+@app.get("/reports/daily/{name}")
+def daily_pdf_dl(req: Request, name: str):
+    if (r := _guard(req)):
+        return r
+    base = (Path(S.data) / "reports" / "daily").resolve()
+    try:
+        f = (base / name).resolve()
+        ok = f.parent == base and f.suffix == ".pdf" and f.is_file() and "/" not in name and "\\" not in name
+    except Exception:  # noqa: BLE001
+        ok = False
+    if not ok:
+        return Response("没有这份日报", status_code=404)
+    return Response(f.read_bytes(), media_type="application/pdf",
+                    headers={"Content-Disposition": "attachment; filename*=UTF-8''" + quote(f.name)})
 
 
 @app.get("/report.pdf")
