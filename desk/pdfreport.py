@@ -21,8 +21,21 @@ from . import evaluate, model, options, sim
 from .clock import friday_of, name_of
 from .ledger import Ledger
 
-pdfmetrics.registerFont(UnicodeCIDFont("STSong-Light"))
-F = "STSong-Light"
+def _cjk_font() -> str:
+    """优先把真字体嵌进 PDF（手机/微信预览才不会空白）；找不到才退回 reportlab 自带的不嵌入字体。"""
+    from reportlab.pdfbase.ttfonts import TTFont
+    for path, idx in (("/usr/share/fonts/truetype/wqy/wqy-microhei.ttc", 0), ("/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc", 0),
+                      ("/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf", 0)):
+        try:
+            pdfmetrics.registerFont(TTFont("CJK", path, subfontIndex=idx))
+            return "CJK"
+        except Exception:  # noqa: BLE001
+            continue
+    pdfmetrics.registerFont(UnicodeCIDFont("STSong-Light"))
+    return "STSong-Light"
+
+
+F = _cjk_font()
 H1 = ParagraphStyle("h1", wordWrap="CJK", fontName=F, fontSize=17, leading=22, spaceAfter=6)
 H2 = ParagraphStyle("h2", wordWrap="CJK", fontName=F, fontSize=12.5, leading=17, spaceBefore=10, spaceAfter=4,
                     textColor=colors.HexColor("#7a2a1e"))

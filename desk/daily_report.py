@@ -82,7 +82,7 @@ def _reopen_row_reason(decs: list, pos: dict | None, k_default: float) -> tuple[
         k = tail[-1] if tail else k_default
         if mo is None:
             return "不下单", "价格没被推过头"
-        return "不下单", f"overshoot {mo:.1f} bps < 门槛 {k:.1f} bps"
+        return "不下单", f"过冲 {mo:.1f} bps，没到门槛 {k:.1f} bps"
     if "would_enter" in by:
         return "不下单", "开关关着，只是演习，没下真单"
     return "不下单", "没有触发条件"
@@ -131,7 +131,15 @@ STRATEGY = ("每天固定时间，有些市场（美股、日韩、港股、A股
             "我们提前盯住参考价，只有价格被推过头、超过门槛（要盖得住手续费）时，才在盘口上挂一笔小单，押它会回到参考价。"
             "价格回来就平仓赚差价；一直不回来，到时间也强制平仓，不死扛。"
             "每笔固定小金额，每天和全账户都有止损线，亏到线就整体停手。"
+            "文中的 bps 是基点：1 bps = 0.01%，比如 9 bps 就是 0.09%。过冲是指价格被推过头、比参考价多偏出去的部分。"
             "盘口太空、数据没更新、价格没跳这些情况一律不下单，宁可错过。")
+
+
+def _zh_text(t) -> str:
+    """反思文字里的英文残留换成中文：xyz:SMSN → 三星，overshoot → 过冲。"""
+    t = re.sub(r"xyz:([A-Z0-9]+)", lambda m: zh_coin(m.group(1)), str(t or ""))
+    t = re.sub(r"(?i)overshoot", "过冲", t)
+    return re.sub(r"\b([A-Z]{2,}[0-9]*)\b", lambda m: _ZH_COIN.get(m.group(1), m.group(1)), t)
 
 
 def _section_reflect(settings, day: date) -> list:
@@ -140,13 +148,13 @@ def _section_reflect(settings, day: date) -> list:
         from . import reopen_reflect as rr  # 另一条线负责；没有就写占位
         facts = rr.build_facts(settings, day)
         r = rr.reflect(settings, facts)
-        out.append(Paragraph(f"<b>一句话结论：</b>{r.get('一句话结论', '')}", P))
-        out.append(Paragraph(f"<b>今天为什么赚/亏：</b>{r.get('今天为什么赚/亏', '')}", P))
-        out.append(Paragraph(f"<b>机制还成不成立：</b>{r.get('机制还成不成立', '')}", P))
+        out.append(Paragraph(f"<b>一句话结论：</b>{_zh_text(r.get('一句话结论', ''))}", P))
+        out.append(Paragraph(f"<b>今天为什么赚/亏：</b>{_zh_text(r.get('今天为什么赚/亏', ''))}", P))
+        out.append(Paragraph(f"<b>机制还成不成立：</b>{_zh_text(r.get('机制还成不成立', ''))}", P))
         out.append(Paragraph("<b>改进方向：</b>", P))
         for x in r.get("改进方向") or []:
-            out.append(Paragraph(f"· {x}", P))
-        out.append(Paragraph(f"<b>明天看什么：</b>{r.get('明天看什么', '')}", P))
+            out.append(Paragraph(f"· {_zh_text(x)}", P))
+        out.append(Paragraph(f"<b>明天看什么：</b>{_zh_text(r.get('明天看什么', ''))}", P))
     except Exception:  # noqa: BLE001
         out.append(Paragraph("反思还没有生成（反思模块未就绪或今天没有数据），明天补上。", P))
     return out
