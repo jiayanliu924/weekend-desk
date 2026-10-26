@@ -274,8 +274,8 @@ def _vetoed(settings, name: str) -> str | None:
 
 
 # ------------------------------------------------------------------ 记录用的小工具（只读/只写账，不改下单行为）
-EXIT_POLL_N = 5        # 平仓后最多读几次成交
-EXIT_POLL_S = 2.0      # 每次间隔（秒）
+EXIT_POLL_N = 3        # 平仓后最多读几次成交（单合约最长约 3 秒；多合约串行平仓，别拖慢）
+EXIT_POLL_S = 1.0      # 每次间隔（秒）
 
 
 def _sleep(sec: float) -> None:
@@ -340,7 +340,10 @@ def note_missed_window(settings, w) -> dict | None:
     led = _led(settings)
     if any(r["kind"] == "entry" and r["weekend"] == w.wid for r in led.all()):
         return None
-    has_lock = bool(Ledger(settings.data).weekend(w.wid).get("lock"))
+    lock = Ledger(settings.data).weekend(w.wid).get("lock")
+    has_lock = bool(lock)
+    if has_lock and not (lock.get("action") or {}).get("side"):      # 本来就不出手（side 0/空）：不算"错过"
+        return None
     return note_nolive(settings, w.wid, getattr(w, "name", None),
                        "错过发单窗口" if has_lock else "错过发单窗口（且没有锁定记录）")
 
@@ -419,14 +422,24 @@ def _edge_gone(settings, feats: dict, bid: float, ask: float) -> tuple[str | Non
 
 
 def _cancel_err(resp) -> str | None:
-    """cancel 返回里有 error 状态（单子已成交/已不在）→ 原文；其余 None。"""
+    """撤单返回的失败原文；确认成功才返回 None。顶层 {"status":"err","response":"文字"} → 原文；
+    不是 dict / 结构不认识 / statuses 里不是全部 "success" → 一律当失败（绝不默认成功，免得旧单还在又重挂出第二张）。"""
+    if not isinstance(resp, dict):
+        return "撤单返回无法识别"
+    if str(resp.get("status", "")).lower() == "err":
+        return str(resp.get("response"))[:300]
     try:
-        for s in resp["response"]["data"]["statuses"]:
+        sts = resp["response"]["data"]["statuses"]
+        if not isinstance(sts, list) or not sts:
+            return "撤单返回无法识别"
+        for s in sts:
             if isinstance(s, dict) and s.get("error") is not None:
                 return str(s["error"])[:300]
+        if all(s == "success" for s in sts) and str(resp.get("status", "")).lower() == "ok":
+            return None
     except Exception:  # noqa: BLE001
         pass
-    return None
+    return "撤单返回无法识别"
 
 
 def _lock_feats(settings, wid: str) -> dict:
@@ -436,17 +449,160 @@ def _lock_feats(settings, wid: str) -> dict:
         return {}
 
 
+REQUOTE_MIN_AGE_S = 60      # entry 发出不足这么久不重挂（刚挂上，排队位置还有价值）
+
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def _rq_finished(r: dict) -> bool:
+    """这条 requote 记录算"做过了"吗：stage=done / 没有 stage 字段（老记录）/ 有 skipped。只有 pending 的不算。"""
+    return r.get("stage") != "pending" or bool(r.get("skipped"))
+
+
 def requote_due(settings, w) -> bool:
-    """调度器问：这个合约现在要不要跑重挂 job。开关开 + live 模式 + 有 sent 的 entry + 还没撤单/平仓/重挂过。"""
+    """调度器问：这个合约现在要不要跑重挂 job。开关开 + live 模式 + 有 sent 的 entry + 还没撤单/平仓 + 没有"做完"的重挂记录
+    （只有 pending 记录 = 上次撤单后可能崩了，窗口内要重跑补挂）。"""
     try:
         if not requote_enabled(settings) or get(settings)["mode"] != "live":
             return False
         rows = _led(settings).all()
         if not any(r["kind"] == "entry" and r["weekend"] == w.wid and r.get("sent") for r in rows):
             return False
-        return not any(r["kind"] in ("requote", "cancel", "exit") and r["weekend"] == w.wid for r in rows)
+        if any(r["kind"] in ("cancel", "exit") and r["weekend"] == w.wid for r in rows):
+            return False
+        return not any(r["kind"] == "requote" and r["weekend"] == w.wid and _rq_finished(r) for r in rows)
     except Exception:  # noqa: BLE001
         return False
+
+
+def _judge_px(settings, c, w, coin: str, is_buy: bool, rec: dict) -> tuple[float | None, str | None]:
+    """刷新盘口 + 边际检查 → (新价, 不重挂的原因)。刷新失败 → (None, None) 并在 rec 里记 requote_note（调用方当"价格没变"处理）。"""
+    try:
+        bid, ask = _fresh_top(c, coin)
+    except Exception as e:  # noqa: BLE001
+        log.warning("requote refresh failed (%s): %s", rec.get("name"), e)
+        rec["requote_note"] = R_STALE_NOTE
+        return None, None
+    if not bid or not ask:
+        return None, R_EMPTY
+    gone, dev_now = _edge_gone(settings, _lock_feats(settings, w.wid), bid, ask)
+    rec["dev_bps_now"] = None if dev_now is None else round(dev_now, 2)
+    if gone:
+        return None, gone
+    return (bid if is_buy else ask), None
+
+
+def requote_unfilled(settings, w) -> dict | None:
+    """卡 G3：重开前 5 分钟，对本周末 sent 且仍有未成交剩余的挂单：先刷新盘口并做边际检查，再决定——
+      - 新价（round_px 后）和旧价一样 → 不撤不挂（保住排队位置），记 skipped="价格没变，保留原挂单"；
+      - entry 发出不足 60 秒 → 不动，记 skipped="刚挂不到 60 秒"；
+      - 边际消失 / 盘口一侧空 → 撤掉不重挂，记 skipped；
+      - 否则：先写 stage=pending 记录 → 撤单（返回不是明确成功就当失败，不重挂）→ 按剩余量在新买一/卖一重挂 Alo → 写 stage=done 记录。
+    每个周末每个合约最多 1 次（已有"做完"的 requote 记录就不再做）。pending 记录还在而没有 done = 上次撤单后进程崩了：
+    窗口内重跑时，旧单已不在、盘口上没有任何本合约挂单、entry 没有任何成交 → 按剩余量补挂（同样边际检查），否则只写 done 说明。
+    只在开关开 + live 模式 + 总止损没触发时做。撤单/平仓/看门狗/名义上限不受影响：新单数量 ≤ 原单剩余。"""
+    if not requote_enabled(settings) or get(settings)["mode"] != "live":
+        return None
+    led = _led(settings)
+    rows = led.all()
+    ent = next((r for r in rows if r["kind"] == "entry" and r["weekend"] == w.wid), None)
+    if not ent or not ent.get("sent") or ent.get("side") not in ("买", "卖"):
+        return None
+    if any(r["kind"] in ("cancel", "exit") and r["weekend"] == w.wid for r in rows):
+        return None
+    rq_rows = [r for r in rows if r["kind"] == "requote" and r["weekend"] == w.wid]
+    if any(_rq_finished(r) for r in rq_rows):
+        return None
+    pend = rq_rows[-1] if rq_rows else None
+    from . import account_stop
+    if account_stop.check(settings).get("tripped"):
+        return None
+    coin, name, is_buy = ent["coin"], ent.get("name"), ent["side"] == "买"
+    rec: dict = {"stage": "done", "coin": coin, "name": name, "side": ent["side"], "old_px": None, "new_px": None,
+                 "remaining_sz": None, "exch_status": None, "exch_error": None, "oid": None, "skipped": None}
+
+    def done(**kw) -> dict:
+        rec.update(kw)
+        return led.append("requote", w.wid, rec)
+
+    try:
+        c = client()
+        orders = [o for o in c.open_orders(coin) if abs(_f(o.get("sz")) or 0) > 0]
+        dec = c.sz_decimals(coin)
+        if pend:      # ---- 上次撤单后崩了：只在"确定没有任何东西在盘口上、也没成交"时补挂
+            rec.update(old_px=pend.get("old_px"), remaining_sz=pend.get("remaining_sz"), resumed=True)
+            if orders:
+                return done(skipped="重挂前中断，盘口上已有本合约挂单，不补挂")
+            try:
+                fl = _entry_fills(c, ent, is_buy)
+            except Exception as e:  # noqa: BLE001
+                return done(skipped="重挂前中断，读不到成交记录，不补挂", exch_error=str(e)[:300])
+            if fl > 0:
+                return done(skipped="重挂前中断，期间已有成交，不补挂")
+            sz = round_sz(_f(pend.get("remaining_sz")) or 0.0, dec)
+            rec["remaining_sz"] = sz
+            if sz <= 0:
+                return done(skipped="补挂量不足最小单位，不补挂")
+            px_new, skip = _judge_px(settings, c, w, coin, is_buy, rec)
+            if skip:
+                notify.push(settings, f"已撤单未补挂：{name} {ent['side']}", skip, priority="high")
+                return done(skipped=skip)
+            px_new = round_px(float(px_new if px_new else pend.get("old_px")), dec)
+        else:
+            own = [o for o in orders if ent.get("oid") is None or o.get("oid") == ent.get("oid")]
+            if not own:      # 已经全部成交（或单子已不在）：没有剩余可重挂，不写记录
+                return None
+            rem = sum(abs(_f(o["sz"])) for o in own)
+            old_px = _f(own[0].get("limitPx")) or _f(ent.get("px"))
+            rec.update(old_px=old_px, remaining_sz=rem)
+            age_ms = _now_ms() - (_f(ent.get("t_ms")) or 0) if ent.get("t_ms") else None
+            if age_ms is not None and age_ms < REQUOTE_MIN_AGE_S * 1000:
+                return done(skipped="刚挂不到 60 秒")
+            px_new, skip = _judge_px(settings, c, w, coin, is_buy, rec)
+            old_r = round_px(float(old_px), dec) if old_px else None
+            px_new = round_px(float(px_new), dec) if px_new else None
+            if not skip and (px_new is None or px_new == old_r):      # 价格没变（含刷新失败）：撤了就白丢排队位置
+                return done(skipped="价格没变，保留原挂单")
+            oids = [o["oid"] for o in own]
+            led.append("requote", w.wid, {**rec, "stage": "pending", "oid": oids[0], "oids": oids})      # 先留底：撤单后崩了能补挂
+            for o in own:
+                cerr = _cancel_err(c.cancel(coin, o["oid"]))
+                if cerr:      # 撤不掉（多半刚好成交了）或返回看不懂：不重挂，免得双份
+                    notify.push(settings, f"重挂中止：{name} {ent['side']}", "撤单失败：" + cerr, priority="high")
+                    return done(skipped="撤单失败：" + cerr, exch_error=cerr)
+            try:      # 读单到撤单之间若又成交了一部分，剩余量按成交记录扣掉（只会变小）
+                if _f(ent.get("sz")):
+                    rem = min(rem, max(0.0, _f(ent["sz"]) - _entry_fills(c, ent, is_buy)))
+            except Exception:  # noqa: BLE001
+                pass
+            sz = round_sz(rem, dec)
+            rec["remaining_sz"] = sz
+            if sz <= 0:
+                return done(skipped="撤单后剩余不足最小单位（多半已成交），不重挂")
+            if skip:
+                notify.push(settings, f"已撤单未重挂：{name} {ent['side']}", skip, priority="high")
+                return done(skipped=skip)
+        resp = c.post_only(coin, is_buy, sz, px_new)
+        pr = parse_order_resp(resp)
+        rec.update(new_px=px_new, exch_status=pr["exch_status"], exch_error=pr["exch_error"], oid=pr["oid"])
+        if pr["exch_status"] == "error":
+            notify.push(settings, f"重挂被拒：{name} {ent['side']}", f"下单被拒：{pr['exch_error']}（原单已撤）", priority="high")
+        else:
+            notify.push(settings, f"已重挂：{name} {ent['side']}", f"{sz} 张 {rec['old_px']} → {px_new}，开盘前没成交会自动撤单", priority="high")
+        return done()
+    except Exception as e:  # noqa: BLE001
+        log.exception("requote failed")
+        notify.push(settings, f"重挂失败：{name}", str(e)[:300], priority="high")
+        return done(exch_error=str(e)[:300])
+
+
+def _entry_fills(c, ent: dict, is_buy: bool) -> float:
+    """本 entry 方向的开仓成交总量（读不到就抛错，由调用方决定怎么办）。"""
+    fl = [f for f in c.fills(ent["coin"], ent.get("t_ms", 0) - 60_000)
+          if not str(f.get("dir", "")).startswith("Close") and f.get("side") in (None, "B" if is_buy else "A")]
+    return sum(abs(_f(f.get("sz")) or 0.0) for f in fl)
 
 
 # ------------------------------------------------------------------ the three steps
@@ -561,88 +717,6 @@ def entry(settings, w, lock: dict | None) -> dict | None:
         return led.append("entry", w.wid, {**plan, "sent": False, "error": str(e)[:300]})
 
 
-def requote_unfilled(settings, w) -> dict | None:
-    """卡 G3：重开前 5 分钟，对本周末 sent 且仍有未成交剩余的挂单：撤掉 → 刷新盘口 → 同样的边际检查 → 按剩余数量在新买一/卖一重挂 Alo。
-    每个周末每个合约最多 1 次（账本里已有 kind=requote 就不再做）。只在开关开 + live 模式 + 总止损没触发时做。
-    撤单/平仓/看门狗/名义上限都不受影响：新单数量 ≤ 原单剩余，重开前 1 分钟的撤单照旧撤掉该合约所有挂单。"""
-    if not requote_enabled(settings) or get(settings)["mode"] != "live":
-        return None
-    led = _led(settings)
-    rows = led.all()
-    ent = next((r for r in rows if r["kind"] == "entry" and r["weekend"] == w.wid), None)
-    if not ent or not ent.get("sent") or ent.get("side") not in ("买", "卖"):
-        return None
-    if any(r["kind"] in ("requote", "cancel", "exit") and r["weekend"] == w.wid for r in rows):
-        return None
-    from . import account_stop
-    if account_stop.check(settings).get("tripped"):
-        return None
-    coin, name, is_buy = ent["coin"], ent.get("name"), ent["side"] == "买"
-    rec: dict = {"coin": coin, "name": name, "side": ent["side"], "old_px": None, "new_px": None, "remaining_sz": None,
-                 "exch_status": None, "exch_error": None, "oid": None, "skipped": None}
-    try:
-        c = client()
-        orders = [o for o in c.open_orders(coin) if ent.get("oid") is None or o.get("oid") == ent.get("oid")]
-        orders = [o for o in orders if abs(_f(o.get("sz")) or 0) > 0]
-        if not orders:      # 已经全部成交（或单子已不在）：没有剩余可重挂，不写记录
-            return None
-        rem = sum(abs(_f(o["sz"])) for o in orders)
-        old_px = _f(orders[0].get("limitPx")) or _f(ent.get("px"))
-        rec.update(old_px=old_px, remaining_sz=rem)
-        for o in orders:
-            cerr = _cancel_err(c.cancel(coin, o["oid"]))
-            if cerr:      # 撤不掉（多半是刚好成交了）：不重挂，免得双份
-                rec.update(skipped="撤单失败，不重挂：" + cerr, exch_error=cerr)
-                notify.push(settings, f"重挂中止：{name} {ent['side']}", rec["skipped"], priority="high")
-                return led.append("requote", w.wid, rec)
-        try:      # 读单到撤单之间若又成交了一部分，剩余量按成交记录扣掉（只会变小）
-            if _f(ent.get("sz")):
-                fl = [f for f in c.fills(coin, ent.get("t_ms", 0) - 60_000)
-                      if not str(f.get("dir", "")).startswith("Close") and f.get("side") in (None, "B" if is_buy else "A")]
-                rem = min(rem, max(0.0, _f(ent["sz"]) - sum(abs(_f(f.get("sz")) or 0.0) for f in fl)))
-        except Exception:  # noqa: BLE001
-            pass
-        dec = c.sz_decimals(coin)
-        sz = round_sz(rem, dec)
-        rec["remaining_sz"] = sz
-        if sz <= 0:
-            rec["skipped"] = "撤单后剩余不足最小单位（多半已成交），不重挂"
-            return led.append("requote", w.wid, rec)
-        px_new = old_px
-        try:
-            bid, ask = _fresh_top(c, coin)
-        except Exception as e:  # noqa: BLE001
-            log.warning("requote refresh failed (%s): %s", name, e)
-            rec["requote_note"] = R_STALE_NOTE
-        else:
-            if not bid or not ask:
-                rec["skipped"] = R_EMPTY
-            else:
-                gone, dev_now = _edge_gone(settings, _lock_feats(settings, w.wid), bid, ask)
-                rec["dev_bps_now"] = None if dev_now is None else round(dev_now, 2)
-                if gone:
-                    rec["skipped"] = gone
-                else:
-                    px_new = bid if is_buy else ask
-        if rec["skipped"] or not px_new:
-            rec["skipped"] = rec["skipped"] or "没有可用价格，不重挂"
-            notify.push(settings, f"已撤单未重挂：{name} {ent['side']}", rec["skipped"], priority="high")
-            return led.append("requote", w.wid, rec)
-        px_new = round_px(float(px_new), dec)
-        resp = c.post_only(coin, is_buy, sz, px_new)
-        pr = parse_order_resp(resp)
-        rec.update(new_px=px_new, exch_status=pr["exch_status"], exch_error=pr["exch_error"], oid=pr["oid"])
-        if pr["exch_status"] == "error":
-            notify.push(settings, f"重挂被拒：{name} {ent['side']}", f"下单被拒：{pr['exch_error']}（原单已撤）", priority="high")
-        else:
-            notify.push(settings, f"已重挂：{name} {ent['side']}", f"{sz} 张 {old_px} → {px_new}，开盘前没成交会自动撤单", priority="high")
-        return led.append("requote", w.wid, rec)
-    except Exception as e:  # noqa: BLE001
-        log.exception("requote failed")
-        notify.push(settings, f"重挂失败：{name}", str(e)[:300], priority="high")
-        return led.append("requote", w.wid, {**rec, "exch_error": str(e)[:300]})
-
-
 def cancel_unfilled(settings, w) -> dict | None:
     led = _led(settings)
     ent = next((r for r in led.all() if r["kind"] == "entry" and r["weekend"] == w.wid), None)
@@ -676,42 +750,104 @@ def cancel_unfilled(settings, w) -> dict | None:
         return led.append("cancel", w.wid, {"coin": ent["coin"], "error": str(e)[:300]})
 
 
+def _exit_failed(settings, led, ent, w, e) -> dict:
+    notify.push(settings, f"平仓失败，请立刻去 Hyperliquid 手动平仓：{ent['name']}", str(e)[:300], priority="max")
+    return led.append("exit", w.wid, {"coin": ent["coin"], "error": str(e)[:300]})
+
+
+def _resp_fill(resp) -> tuple[float, float] | None:
+    """平仓市价单返回里的 (成交量, 均价)；认不出 → None。"""
+    try:
+        for st in resp["response"]["data"]["statuses"]:
+            fl = st.get("filled") if isinstance(st, dict) else None
+            if isinstance(fl, dict):
+                sz, px = _f(fl.get("totalSz")), _f(fl.get("avgPx"))
+                if sz and px:
+                    return abs(sz), px
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+def _resp_pnl_estimate(settings, ent, w, pos: float, resp) -> float | None:
+    """成交明细读不到时的兜底：按平仓返回的 avgPx/totalSz 和入场均价（撤单记录的 entry_avg_px，没有就用挂单价）估算，不含手续费。"""
+    rf = _resp_fill(resp)
+    if not rf or not pos:
+        return None
+    sz, exit_px = rf
+    entry_px = None
+    for r in _led(settings).all():
+        if r["kind"] == "cancel" and r["weekend"] == w.wid and _f(r.get("entry_avg_px")):
+            entry_px = _f(r["entry_avg_px"])
+    entry_px = entry_px or _f(ent.get("px"))
+    if not entry_px:
+        return None
+    return (exit_px - entry_px) * sz * (1 if pos > 0 else -1)
+
+
 def exit_(settings, w) -> dict | None:
     led = _led(settings)
     ent = next((r for r in led.all() if r["kind"] == "entry" and r["weekend"] == w.wid), None)
     if not ent or not ent.get("sent") or any(r["kind"] == "exit" and r["weekend"] == w.wid for r in led.all()):
         return None
-    try:
+    try:      # 平仓单发出去之前出任何错 = 真的没平成，要喊人手动平
         c = client()
         pos = c.position(ent["coin"])
         mid = _mid_of(c, ent["coin"]) if pos else None
         resp = c.close(ent["coin"]) if pos else None
-        since = ent.get("t_ms", 0) - 60_000
-        if pos:      # 等到看见平仓成交再算盈亏：最多读 EXIT_POLL_N 次，每次前等 EXIT_POLL_S 秒
-            complete = False
-            for _ in range(EXIT_POLL_N):
-                _sleep(EXIT_POLL_S)
-                fills = c.fills(ent["coin"], since)
-                if _close_seen(fills, pos):
-                    complete = True
+    except Exception as e:  # noqa: BLE001
+        return _exit_failed(settings, led, ent, w, e)
+    since = ent.get("t_ms", 0) - 60_000
+    fills: list = []
+    complete, poll_err = False, None
+    if pos:      # 平仓单已发出：等到看见平仓成交再算盈亏。最多读 EXIT_POLL_N 次，每次前等 EXIT_POLL_S 秒；读失败不丢已发出的平仓 resp
+        for _ in range(EXIT_POLL_N):
+            _sleep(EXIT_POLL_S)
+            try:
+                got = c.fills(ent["coin"], since)
+                if _close_seen(got, pos):
+                    fills, complete, poll_err = got, True, None
                     break
-        else:
+                fills = got
+            except Exception as e:  # noqa: BLE001
+                poll_err = str(e)[:200]      # 保留之前读到的成交，继续试下一次
+    else:
+        try:
             fills, complete = c.fills(ent["coin"], since), True      # 没仓位：没东西可等
+        except Exception as e:  # noqa: BLE001
+            return _exit_failed(settings, led, ent, w, e)
+    source = "fills"
+    try:
         pnl = sum(float(f.get("closedPnl", 0) or 0) - float(f.get("fee", 0) or 0) for f in fills)
         fee = sum(_f(f.get("fee")) or 0.0 for f in fills)
-        rec = led.append("exit", w.wid, {"coin": ent["coin"], "name": ent["name"], "position_before": pos, "resp": resp,
-                                         "n_fills": len(fills), "pnl_usd": round(pnl, 4),
-                                         "exit_avg_px": _wavg_px([f for f in fills if _is_close_fill(f)]),
-                                         "fee_usd": round(fee, 6), "mid_at_exit": mid, "fills_complete": complete})
-        msg = (f"{ent['name']}：没有成交，不赚不亏" if not fills else
-               f"{ent['name']}：已平仓，这一笔真实盈亏 ${pnl:+.2f}（含手续费）。累计 ${realized_total(settings):+.2f}")
-        if not complete:
-            msg += "（平仓成交回报没读全，盈亏可能不准，请对一下 Hyperliquid）"
+        close_px = _wavg_px([f for f in fills if _is_close_fill(f)])
+        has_close = any(_is_close_fill(f) for f in fills)
+    except Exception:  # noqa: BLE001
+        pnl, fee, close_px, has_close = 0.0, 0.0, None, False
+    if pos and not has_close:      # 一笔平仓成交都没读到：用平仓返回估算（总比记 0 强），并明确标成估算
+        est = _resp_pnl_estimate(settings, ent, w, pos, resp)
+        if est is not None:
+            pnl, source = est - fee, "resp_estimate"
+            rf = _resp_fill(resp)
+            close_px = rf[1] if rf else close_px
+    body = {"coin": ent["coin"], "name": ent["name"], "position_before": pos, "resp": resp,
+            "n_fills": len(fills), "pnl_usd": round(pnl, 4), "exit_avg_px": close_px,
+            "fee_usd": round(fee, 6), "mid_at_exit": mid, "fills_complete": complete, "pnl_source": source}
+    if poll_err:
+        body["poll_error"] = poll_err
+    rec = led.append("exit", w.wid, body)
+    try:
+        if complete:
+            msg = (f"{ent['name']}：没有成交，不赚不亏" if not fills else
+                   f"{ent['name']}：已平仓，这一笔真实盈亏 ${pnl:+.2f}（含手续费）。累计 ${realized_total(settings):+.2f}")
+        else:
+            msg = (f"{ent['name']}：已平仓，成交明细稍后核对。暂记盈亏 ${pnl:+.2f}"
+                   f"{'（按平仓返回估算，未含手续费）' if source == 'resp_estimate' else ''}"
+                   "（平仓成交回报没读全，盈亏可能不准，请对一下 Hyperliquid）")
         notify.push(settings, "自动下单结果", msg, priority="high")
-        return rec
-    except Exception as e:  # noqa: BLE001
-        notify.push(settings, f"平仓失败，请立刻去 Hyperliquid 手动平仓：{ent['name']}", str(e)[:300], priority="max")
-        return led.append("exit", w.wid, {"coin": ent["coin"], "error": str(e)[:300]})
+    except Exception:  # noqa: BLE001
+        log.exception("exit push failed")
+    return rec
 
 
 def summary(settings) -> dict:

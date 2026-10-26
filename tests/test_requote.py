@@ -50,6 +50,13 @@ class RqClient(FakeClient):
         return self.cancel_resp
 
 
+@pytest.fixture(autouse=True)
+def _aged(monkeypatch):
+    """默认当作 entry 已经挂了 10 分钟（重挂要求挂上 ≥60 秒）；个别测试自己改 autotrade._now_ms。"""
+    import time
+    monkeypatch.setattr(autotrade, "_now_ms", lambda: int(time.time() * 1000) + 600_000)
+
+
 @pytest.fixture
 def pushes(monkeypatch):
     out = []
@@ -67,6 +74,10 @@ def _setup(env, client, monkeypatch, requote=True):  # noqa: F811
 
 def _rows(s, kind):
     return [r for r in Ledger(s.data, "live").all() if r["kind"] == kind]
+
+
+def _rq(s, stage="done"):
+    return [r for r in _rows(s, "requote") if r.get("stage") == stage]
 
 
 def _store_lock(s, w, lock):
@@ -226,7 +237,7 @@ def test_requote_happy_path_once_only(env, monkeypatch, pushes):  # noqa: F811
     assert rec["exch_status"] == "resting" and rec["exch_error"] is None and rec["skipped"] is None and rec["oid"] == 101
     # 同一个周末同一个合约不会第二次重挂
     assert autotrade.requote_unfilled(s, w) is None and autotrade.requote_unfilled(s, w) is None
-    assert len(fc.orders) == 2 and fc.cancels == [100] and len(_rows(s, "requote")) == 1
+    assert len(fc.orders) == 2 and fc.cancels == [100] and len(_rq(s)) == 1 and len(_rq(s, "pending")) == 1
     assert autotrade.requote_due(s, w) is False
     # 重开前 1 分钟的撤单照旧：撤掉新单，记账
     c = autotrade.cancel_unfilled(s, w)
@@ -236,12 +247,14 @@ def test_requote_happy_path_once_only(env, monkeypatch, pushes):  # noqa: F811
 def test_requote_remaining_is_open_size_after_partial_fill(env, monkeypatch, pushes):  # noqa: F811
     s, w, fc, ent = _placed(env, monkeypatch)
     fc.open[0]["sz"] = "0.0010"                                              # 已成交一部分，只剩 0.0010
+    fc.book = {"bid": 29998.0, "ask": 30002.0}
     rec = autotrade.requote_unfilled(s, w)
     assert rec["remaining_sz"] == 0.001 and fc.orders[1][2] == 0.001
 
 
 def test_requote_remaining_shrinks_if_filled_between_read_and_cancel(env, monkeypatch, pushes):  # noqa: F811
     s, w, fc, ent = _placed(env, monkeypatch)
+    fc.book = {"bid": 29998.0, "ask": 30002.0}
     fc.fill_list = [{"sz": str(ent["sz"] - 0.0005), "side": "A", "dir": "Open Short", "px": "30005"}]   # 成交记录显示只剩 0.0005
     rec = autotrade.requote_unfilled(s, w)
     assert rec["remaining_sz"] == pytest.approx(0.0005) and fc.orders[1][2] == pytest.approx(0.0005)
@@ -261,7 +274,7 @@ def test_requote_edge_gone_cancels_but_does_not_repost(env, monkeypatch, pushes)
     assert fc.cancels == [100] and len(fc.orders) == 1                       # 撤了，没重挂
     assert rec["skipped"] == "发单前价格已回归，没有边际" and rec["new_px"] is None and rec["exch_status"] is None
     assert rec["old_px"] == 30005.0 and rec["remaining_sz"] == ent["sz"]
-    assert autotrade.requote_unfilled(s, w) is None and len(_rows(s, "requote")) == 1
+    assert autotrade.requote_unfilled(s, w) is None and len(_rq(s)) == 1
 
 
 def test_requote_edge_gone_on_sign_flip(env, monkeypatch, pushes):  # noqa: F811
@@ -277,24 +290,60 @@ def test_requote_empty_side_skips(env, monkeypatch, pushes):  # noqa: F811
     assert rec["skipped"] == "盘口一侧为空" and len(fc.orders) == 1 and fc.cancels == [100]
 
 
-def test_requote_refresh_exception_reposts_at_old_px(env, monkeypatch, pushes):  # noqa: F811
+def test_requote_refresh_exception_keeps_original_order(env, monkeypatch, pushes):  # noqa: F811
+    """刷新失败 = 新价就是旧价 → 不撤不挂，原单继续排队。"""
     s, w, fc, ent = _placed(env, monkeypatch)
     fc.top_exc = RuntimeError("l2 超时")
     rec = autotrade.requote_unfilled(s, w)
-    assert rec["requote_note"] == "刷新盘口失败，用锁定价" and rec["new_px"] == 30005.0 and rec["skipped"] is None
-    assert len(fc.orders) == 2 and fc.orders[1][3] == 30005.0
+    assert rec["requote_note"] == "刷新盘口失败，用锁定价" and rec["skipped"] == "价格没变，保留原挂单"
+    assert fc.cancels == [] and len(fc.orders) == 1 and [o["oid"] for o in fc.open] == [100]
 
 
-def test_requote_cancel_error_does_not_double_up(env, monkeypatch, pushes):  # noqa: F811
-    s, w, fc, ent = _placed(env, monkeypatch)
-    fc.cancel_resp = {"status": "ok", "response": {"type": "cancel", "data": {"statuses": [{"error": "Order was never placed, already canceled, or filled."}]}}}
+class StubbornCancel(RqClient):
+    """撤单"失败"：返回错误但旧单还留在盘口上（只有明确成功才会真撤）。"""
+
+    def cancel(self, coin, oid):
+        self.cancels.append(oid)
+        return self.cancel_resp
+
+
+@pytest.mark.parametrize("bad,expect", [
+    ({"status": "ok", "response": {"type": "cancel", "data": {"statuses": [{"error": "Order was never placed, already canceled, or filled."}]}}},
+     "already canceled"),
+    ({"status": "err", "response": "Too many cumulative requests sent"}, "Too many cumulative requests"),     # 顶层 err
+    (None, "撤单返回无法识别"),
+    ("garbage", "撤单返回无法识别"),
+    ({"status": "ok"}, "撤单返回无法识别"),
+    ({"status": "ok", "response": {"data": {"statuses": []}}}, "撤单返回无法识别"),
+    ({"status": "ok", "response": {"data": {"statuses": ["waiting"]}}}, "撤单返回无法识别"),
+    ({"weird": 1}, "撤单返回无法识别"),
+])
+def test_requote_cancel_failure_never_reposts(env, monkeypatch, pushes, bad, expect):  # noqa: F811
+    fc = StubbornCancel()
+    s, w = _setup(env, fc, monkeypatch)
+    lk = _rq_lock(side=-1)
+    _store_lock(s, w, lk)
+    ent = autotrade.entry(s, w, lk)
+    fc.book = {"bid": 29998.0, "ask": 30002.0}
+    fc.cancel_resp = bad
     rec = autotrade.requote_unfilled(s, w)
-    assert len(fc.orders) == 1 and rec["skipped"].startswith("撤单失败") and "already canceled" in rec["exch_error"]
+    assert len(fc.orders) == 1 and len(fc.open) == 1                          # 绝不出第二张
+    assert rec["skipped"].startswith("撤单失败：") and expect in rec["skipped"] and expect in rec["exch_error"]
+    assert rec["new_px"] is None and rec["stage"] == "done"
+    assert autotrade.requote_unfilled(s, w) is None and len(fc.orders) == 1   # 也不会再来一次
+
+
+def test_cancel_err_unit():
+    ok = {"status": "ok", "response": {"type": "cancel", "data": {"statuses": ["success"]}}}
+    assert autotrade._cancel_err(ok) is None
+    assert autotrade._cancel_err({"status": "err", "response": "boom"}) == "boom"
+    assert autotrade._cancel_err(None) == "撤单返回无法识别"
 
 
 def test_requote_rejected_repost_recorded(env, monkeypatch, pushes):  # noqa: F811
     s, w, fc, ent = _placed(env, monkeypatch)
     err = "Post only order would have immediately matched"
+    fc.book = {"bid": 29998.0, "ask": 30002.0}
     monkeypatch.setattr(fc, "post_only", lambda *a: {"status": "ok", "response": {"data": {"statuses": [{"error": err}]}}})
     rec = autotrade.requote_unfilled(s, w)
     assert rec["exch_status"] == "error" and rec["exch_error"] == err and rec["new_px"] is not None
@@ -333,6 +382,7 @@ def test_other_contracts_orders_untouched(env, monkeypatch, pushes):  # noqa: F8
     """只动自己 entry 的那张单（按 oid），同币种上别的线的挂单不碰。"""
     s, w, fc, ent = _placed(env, monkeypatch)
     fc.open.append({"coin": "xyz:XYZ100", "oid": 555, "sz": "1.0", "limitPx": "1", "side": "B"})
+    fc.book = {"bid": 29998.0, "ask": 30002.0}
     rec = autotrade.requote_unfilled(s, w)
     assert fc.cancels == [100] and rec["remaining_sz"] == ent["sz"]
 
@@ -389,20 +439,24 @@ def test_timeline_no_job_without_entry_or_live_or_switch(env, monkeypatch, pushe
     assert key not in ks()
     autotrade.put(s, mode="live")
     assert key in ks()
-    Ledger(s.data, "live").append("requote", w.wid, {"skipped": "x"})
+    Ledger(s.data, "live").append("requote", w.wid, {"stage": "pending", "oid": 100})
+    assert key in ks()                                                        # 只有 pending（撤后崩了）→ 窗口内还要跑
+    Ledger(s.data, "live").append("requote", w.wid, {"stage": "done", "skipped": "x"})
     assert key not in ks()
 
 
 def test_run_job_dispatches_requote_not_exit(env, monkeypatch, pushes):  # noqa: F811
     s, w, fc, ent = _placed(env, monkeypatch)
+    fc.book = {"bid": 29998.0, "ask": 30002.0}
     rec = scheduler.run_job(f"{w.wid}:live_requote", w, s)
-    assert rec["kind"] == "requote" and fc.closed == [] and _rows(s, "exit") == []
+    assert rec["kind"] == "requote" and rec["stage"] == "done" and fc.closed == [] and _rows(s, "exit") == []
     assert len(fc.orders) == 2
 
 
 def test_full_weekend_sequence(env, monkeypatch, pushes):  # noqa: F811
     """lock→entry→requote→cancel→exit 按时间顺序各跑一次，requote 在 cancel 前。"""
     s, w, fc, ent = _placed(env, monkeypatch)
+    fc.book = {"bid": 29998.0, "ask": 30002.0}
     done = {f"{w.wid}:lock", f"{w.wid}:live_entry"}
     order = []
     for sec in range(-15 * 60, 7 * 60, 20):
@@ -413,4 +467,113 @@ def test_full_weekend_sequence(env, monkeypatch, pushes):  # noqa: F811
                 done.add(k)
                 order.append(k.split(":")[-1])
     assert order == ["live_requote", "live_cancel", "live_exit"]
-    assert [r["kind"] for r in Ledger(s.data, "live").all() if r["kind"] in ("requote", "cancel", "exit")] == ["requote", "cancel", "exit"]
+    assert [r["kind"] for r in Ledger(s.data, "live").all() if r["kind"] in ("requote", "cancel", "exit")] == \
+        ["requote", "requote", "cancel", "exit"]                              # pending + done
+
+
+# ------------------------------------------------------------------ 5. 第 2 轮：价格没变 / 刚挂 / 崩溃补挂
+def test_requote_same_price_keeps_resting_order(env, monkeypatch, pushes):  # noqa: F811
+    s, w, fc, ent = _placed(env, monkeypatch)                                 # 默认盘口不变：卖一 30005 = 旧价
+    rec = autotrade.requote_unfilled(s, w)
+    assert rec["skipped"] == "价格没变，保留原挂单" and rec["old_px"] == 30005.0 and rec["new_px"] is None
+    assert fc.cancels == [] and len(fc.orders) == 1 and [o["oid"] for o in fc.open] == [100]
+    assert _rq(s, "pending") == [] and autotrade.requote_unfilled(s, w) is None
+
+
+def test_requote_same_price_compares_after_round_px(env, monkeypatch, pushes):  # noqa: F811
+    s, w, fc, ent = _placed(env, monkeypatch)
+    fc.book = {"bid": 29995.0, "ask": 30005.0000004}                          # round_px 后还是 30005
+    assert autotrade.requote_unfilled(s, w)["skipped"] == "价格没变，保留原挂单" and fc.cancels == []
+
+
+def test_requote_too_fresh_entry_not_touched(env, monkeypatch, pushes):  # noqa: F811
+    s, w, fc, ent = _placed(env, monkeypatch)
+    fc.book = {"bid": 29998.0, "ask": 30002.0}
+    monkeypatch.setattr(autotrade, "_now_ms", lambda: ent["t_ms"] + 59_000)
+    rec = autotrade.requote_unfilled(s, w)
+    assert rec["skipped"] == "刚挂不到 60 秒" and fc.cancels == [] and len(fc.orders) == 1 and fc.top_calls == 1
+
+
+def test_requote_age_boundary(env, monkeypatch, pushes):  # noqa: F811
+    s, w, fc, ent = _placed(env, monkeypatch)
+    fc.book = {"bid": 29998.0, "ask": 30002.0}
+    monkeypatch.setattr(autotrade, "_now_ms", lambda: ent["t_ms"] + 60_000)
+    assert autotrade.requote_unfilled(s, w)["new_px"] == 30002.0
+
+
+class Crash(BaseException):
+    """模拟进程在撤单后、重挂前崩掉（BaseException，不会被 except Exception 吞）。"""
+
+
+def test_crash_after_cancel_rerun_reposts_exactly_once(env, monkeypatch, pushes):  # noqa: F811
+    s, w, fc, ent = _placed(env, monkeypatch)
+    fc.book = {"bid": 29998.0, "ask": 30002.0}
+    real_post = fc.post_only
+    monkeypatch.setattr(fc, "post_only", lambda *a: (_ for _ in ()).throw(Crash()))
+    with pytest.raises(Crash):
+        autotrade.requote_unfilled(s, w)
+    assert fc.cancels == [100] and fc.open == [] and len(fc.orders) == 1       # 旧单已撤，新单没出
+    pend = _rq(s, "pending")
+    assert len(pend) == 1 and pend[0]["oid"] == 100 and pend[0]["old_px"] == 30005.0 and pend[0]["remaining_sz"] == ent["sz"]
+    assert _rq(s) == [] and autotrade.requote_due(s, w) is True                # 只有 pending 不算做过
+    monkeypatch.setattr(fc, "post_only", real_post)
+    rec = autotrade.requote_unfilled(s, w)                                     # 窗口内重跑 → 补挂
+    assert rec["stage"] == "done" and rec["resumed"] is True and rec["new_px"] == 30002.0 and rec["remaining_sz"] == ent["sz"]
+    assert len(fc.orders) == 2 and len(fc.open) == 1                           # 恰好 1 张
+    assert autotrade.requote_unfilled(s, w) is None and autotrade.requote_due(s, w) is False and len(fc.orders) == 2
+
+
+def test_crash_rerun_edge_gone_no_repost(env, monkeypatch, pushes):  # noqa: F811
+    s, w, fc, ent = _placed(env, monkeypatch)
+    fc.book = {"bid": 29998.0, "ask": 30002.0}
+    monkeypatch.setattr(fc, "post_only", lambda *a: (_ for _ in ()).throw(Crash()))
+    with pytest.raises(Crash):
+        autotrade.requote_unfilled(s, w)
+    fc.book = {"bid": 29720.0, "ask": 29730.0}
+    rec = autotrade.requote_unfilled(s, w)
+    assert rec["skipped"] == "发单前价格已回归，没有边际" and len(fc.orders) == 1 and fc.open == []
+
+
+def test_crash_rerun_with_fill_or_old_order_or_new_order_does_not_repost(env, monkeypatch, pushes):  # noqa: F811
+    for case in ("fill", "old_order", "new_order", "fills_unreadable"):
+        s, w, fc, ent = _placed(env, monkeypatch)
+        fc.book = {"bid": 29998.0, "ask": 30002.0}
+        real = fc.post_only
+        monkeypatch.setattr(fc, "post_only", lambda *a: (_ for _ in ()).throw(Crash()))
+        with pytest.raises(Crash):
+            autotrade.requote_unfilled(s, w)
+        monkeypatch.setattr(fc, "post_only", real)
+        n = len(fc.orders)
+        if case == "fill":
+            fc.fill_list = [{"sz": "0.0001", "side": "A", "dir": "Open Short"}]
+        elif case == "old_order":                                              # 撤单其实没成功，旧单还在
+            fc.open = [{"coin": "xyz:XYZ100", "oid": 100, "sz": str(ent["sz"]), "limitPx": "30005", "side": "A"}]
+        elif case == "new_order":                                              # 新单其实发出去了，只是没来得及写 done
+            fc.open = [{"coin": "xyz:XYZ100", "oid": 101, "sz": str(ent["sz"]), "limitPx": "30002", "side": "A"}]
+        else:
+            monkeypatch.setattr(fc, "fills", lambda *a: (_ for _ in ()).throw(RuntimeError("x")))
+        rec = autotrade.requote_unfilled(s, w)
+        assert rec["stage"] == "done" and rec["skipped"] and rec["new_px"] is None, case
+        assert len(fc.orders) == n and len(fc.open) <= 1, case
+        Ledger(s.data, "live").path.unlink()
+        fc.open, fc.fill_list = [], []
+
+
+def test_old_requote_records_without_stage_count_as_done(env, monkeypatch, pushes):  # noqa: F811
+    s, w, fc, ent = _placed(env, monkeypatch)
+    Ledger(s.data, "live").append("requote", w.wid, {"old_px": 1, "new_px": 2})       # 没有 stage 字段的老记录
+    assert autotrade.requote_due(s, w) is False and autotrade.requote_unfilled(s, w) is None
+
+
+# ------------------------------------------------------------------ 6. 第 2 轮：note_missed_window 不为"本来就不出手"写 nolive
+def test_missed_window_not_written_when_lock_has_no_side(env, monkeypatch):  # noqa: F811
+    s, w = _setup(env, RqClient(), monkeypatch)
+    for action in ({"side": 0, "reason": "x"}, {"reason": "x"}, {}):
+        lk = _rq_lock(side=-1)
+        lk["action"] = action
+        Ledger(s.data).append("lock", w.wid, lk)
+        assert autotrade.note_missed_window(s, w) is None
+        assert _rows(s, "nolive") == []
+        Ledger(s.data).path.unlink()
+    Ledger(s.data).append("lock", w.wid, _rq_lock(side=-1))
+    assert autotrade.note_missed_window(s, w)["reason"] == "错过发单窗口"

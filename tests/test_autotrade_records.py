@@ -230,21 +230,85 @@ def test_exit_polls_until_close_fill(env, monkeypatch):  # noqa: F811
     monkeypatch.setattr(autotrade, "_sleep", lambda sec: sleeps.append(sec))
     s, w = _open_and_pos(env, fc, monkeypatch)
     x = autotrade.exit_(s, w)
-    assert fc.reads == 3 and sleeps == [2.0, 2.0, 2.0]
+    assert fc.reads == 3 and sleeps == [1.0, 1.0, 1.0]
     assert x["fills_complete"] is True and x["n_fills"] == 2
     assert x["pnl_usd"] == pytest.approx(0.16)                       # 盈亏口径不变：Σ(closedPnl − fee)
     assert x["exit_avg_px"] == pytest.approx(29990) and x["fee_usd"] == pytest.approx(0.04) and x["mid_at_exit"] == 30020.0
 
 
-def test_exit_gives_up_after_5_polls(env, monkeypatch, pushes):  # noqa: F811
+def test_exit_gives_up_after_3_polls(env, monkeypatch, pushes):  # noqa: F811
     fc = LaggyFills(lag=99)
     sleeps = []
     monkeypatch.setattr(autotrade, "_sleep", lambda sec: sleeps.append(sec))
     s, w = _open_and_pos(env, fc, monkeypatch)
     x = autotrade.exit_(s, w)
-    assert fc.reads == 5 and len(sleeps) == 5 and x["fills_complete"] is False
+    assert fc.reads == 3 and sleeps == [1.0] * 3 and x["fills_complete"] is False
     assert x["pnl_usd"] == 0 and x["exit_avg_px"] is None and x["fee_usd"] == 0
     assert "没读全" in pushes[-1][1]
+
+
+class FlakyFills(FakeClient):
+    """第 1 次读成交只有开仓（没平仓成交），之后全抛错；close 返回带 avgPx/totalSz。"""
+
+    def __init__(self, first, close_resp=None):
+        super().__init__()
+        self.first, self.reads, self.close_resp = first, 0, close_resp
+
+    def close(self, coin):
+        super().close(coin)
+        return self.close_resp or {"status": "ok"}
+
+    def fills(self, coin, since):
+        self.reads += 1
+        if self.reads == 1:
+            return self.first
+        raise RuntimeError("fills 超时")
+
+
+OPEN_ONLY = [CLOSE_FILLS[0]]
+CLOSE_RESP = {"status": "ok", "response": {"type": "order", "data": {"statuses": [{"filled": {"totalSz": "0.0033", "avgPx": "29990.0", "oid": 9}}]}}}
+
+
+def test_exit_poll_exception_keeps_resp_and_estimates_pnl(env, monkeypatch, pushes):  # noqa: F811
+    fc = FlakyFills(OPEN_ONLY, CLOSE_RESP)
+    monkeypatch.setattr(autotrade, "_sleep", lambda sec: None)
+    s, w = _open_and_pos(env, fc, monkeypatch)
+    x = autotrade.exit_(s, w)
+    assert fc.reads == 3 and fc.closed == ["xyz:XYZ100"]
+    assert x["kind"] == "exit" and "error" not in x and x["resp"] == CLOSE_RESP
+    assert x["fills_complete"] is False and x["pnl_source"] == "resp_estimate" and x["poll_error"] == "fills 超时"
+    # 空头 0.0033 张：入场价 30010（挂单价）→ 平仓均价 29990：(30010-29990)*0.0033 = +0.066，再减已读到的手续费 0.01
+    assert x["pnl_usd"] == pytest.approx(0.066 - 0.01) and x["exit_avg_px"] == 29990.0
+    assert autotrade.realized_total(s) == pytest.approx(x["pnl_usd"])           # realized_total 读得到这笔
+    assert pushes[-1][0] == "自动下单结果" and "已平仓，成交明细稍后核对" in pushes[-1][1]
+    assert not any("平仓失败" in a for a, _ in pushes)
+
+
+def test_exit_second_poll_raises_uses_first_poll_fills(env, monkeypatch, pushes):  # noqa: F811
+    partial = [CLOSE_FILLS[0], {**CLOSE_FILLS[1], "sz": "0.0010", "closedPnl": "0.05", "fee": "0.01"}]   # 平了一部分
+    fc = FlakyFills(partial, CLOSE_RESP)
+    monkeypatch.setattr(autotrade, "_sleep", lambda sec: None)
+    s, w = _open_and_pos(env, fc, monkeypatch)
+    x = autotrade.exit_(s, w)
+    assert x["pnl_usd"] == pytest.approx((0 - 0.01) + (0.05 - 0.01)) and x["pnl_source"] == "fills"
+    assert x["fills_complete"] is False and x["n_fills"] == 2 and "error" not in x
+
+
+def test_exit_poll_exception_and_unparseable_resp_still_writes_exit(env, monkeypatch, pushes):  # noqa: F811
+    fc = FlakyFills([], None)
+    monkeypatch.setattr(autotrade, "_sleep", lambda sec: None)
+    s, w = _open_and_pos(env, fc, monkeypatch)
+    x = autotrade.exit_(s, w)
+    assert x["pnl_usd"] == 0 and x["fills_complete"] is False and "error" not in x and x["position_before"] == -0.0033
+    assert "平仓失败" not in pushes[-1][0]
+
+
+def test_exit_close_order_failure_is_still_a_failure(env, monkeypatch, pushes):  # noqa: F811
+    fc = FakeClient()
+    s, w = _open_and_pos(env, fc, monkeypatch)
+    monkeypatch.setattr(fc, "close", lambda coin: (_ for _ in ()).throw(RuntimeError("拒绝")))
+    x = autotrade.exit_(s, w)
+    assert x["error"] == "拒绝" and pushes[-1][0].startswith("平仓失败")
 
 
 def test_exit_no_position_does_not_poll(env, monkeypatch):  # noqa: F811
