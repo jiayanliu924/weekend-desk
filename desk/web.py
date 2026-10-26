@@ -597,6 +597,136 @@ def reopen_card_html(settings, now: datetime | None = None) -> str:
             + "".join(rows) + _daily_pdf_links(settings) + reopen_daily_log_html(settings, now) + "</div>")
 
 
+# ------------------------------------------------------------------ 周末线：影子 vs 真钱 逐笔对账（G2）
+_LVS_WEEKENDS = 4        # 最近几个周末（按周五）
+_LVS_SIZE_FRAC = 0.9     # 真钱计划金额不到影子的 90% → "规模小"；其余成交差额算"滑点"（成交价、手续费、时点）
+_LVS_CATS = ("没成交", "没下单", "规模小", "滑点")
+
+
+def _lvs_num(x) -> float | None:
+    try:
+        return None if x is None else float(x)
+    except (TypeError, ValueError):
+        return None
+
+
+def _lvs_judge(L: list[dict]) -> dict:
+    """同一周末、同一合约的真钱记录 → 一句状态。字段一律 .get：exch_* / filled_sz / fills_complete 等新字段可能还没写进账本。"""
+    def first(kind: str) -> dict | None:
+        return next((r for r in L if r.get("kind") == kind), None)
+
+    ent, nol, can, ex = first("entry"), first("nolive"), first("cancel"), first("exit")
+    if nol is None and ent is None:
+        return {"status": "没有记录", "cat": "没下单", "pnl": 0.0, "filled": False, "notional": None}
+    if nol is not None or not ent.get("sent"):
+        if nol is not None:
+            why = nol.get("reason") or "原因没有记录"
+        else:   # 注意：entry 的 reason 是交易理由，不是跳过原因
+            why = ent.get("skipped") or ent.get("error") or ("演习模式，没有真下单" if ent.get("mode") == "shadow" else "原因没有记录")
+        return {"status": f"没下单：{why}", "cat": "没下单", "pnl": 0.0, "filled": False, "notional": None}
+    notional = _lvs_num(ent.get("notional_usd"))
+    rej = str(ent.get("exch_error") or "")
+    st = str(ent.get("exch_status") or "")
+    if not rej and any(k in st.lower() for k in ("reject", "err", "fail")):
+        rej = st
+    if rej:
+        return {"status": f"被交易所拒：{rej}", "cat": "没下单", "pnl": 0.0, "filled": False, "notional": notional}
+    filled_sz = _lvs_num(can.get("filled_sz")) if can else None
+    pos_now = _lvs_num(can.get("position")) if can else None
+    pos_before = _lvs_num(ex.get("position_before")) if ex else None
+    n_fills = _lvs_num(ex.get("n_fills")) if ex else None
+    filled = bool((filled_sz or 0) > 0 or (pos_now or 0) != 0 or (pos_before or 0) != 0 or (n_fills or 0) > 0)
+    if not filled:
+        if can is None:
+            return {"status": "挂单，没有撤单记录", "cat": "没成交", "pnl": 0.0, "filled": False, "notional": notional}
+        if can.get("error"):
+            return {"status": f"挂单没成交，撤单出错：{can['error']}", "cat": "没成交", "pnl": 0.0, "filled": False, "notional": notional}
+        return {"status": "挂单没成交被撤", "cat": "没成交", "pnl": 0.0, "filled": False, "notional": notional}
+    if ex is None:
+        return {"status": "成交，还没有平仓记录", "cat": None, "pnl": None, "filled": True, "notional": notional}
+    if ex.get("error"):
+        return {"status": f"成交，平仓出错：{ex['error']}", "cat": None, "pnl": None, "filled": True, "notional": notional}
+    txt = "成交" + ("（平仓没有全部成交）" if ex.get("fills_complete") is False else "")
+    return {"status": txt, "cat": "", "pnl": _lvs_num(ex.get("pnl_usd")), "filled": True, "notional": notional}
+
+
+def _live_vs_shadow_rows(settings) -> list[dict] | None:
+    """最近几个周末里，每笔影子（主策略实际 action）对上真钱账本一行。读不到或没有行 → None。只读。"""
+    off = [r for r in Ledger(settings.data).completed() if evaluate.official(r, settings)]
+    live = Ledger(settings.data, "live").all()
+    if not off:
+        return None
+    window = set(sorted({friday_of(r["weekend"]) for r in off}, reverse=True)[:_LVS_WEEKENDS])
+    default = settings.instruments[0]["name"]
+    by_wid: dict[str, list[dict]] = {}
+    for r in live:
+        by_wid.setdefault(r.get("weekend", ""), []).append(r)
+    ordered = sorted(sorted(off, key=lambda x: x["weekend"]), key=lambda x: friday_of(x["weekend"]), reverse=True)
+    rows = []
+    for r in ordered:
+        if friday_of(r["weekend"]) not in window:
+            continue
+        act = r["lock"].get("action") or {}
+        side = act.get("side")
+        if not side:
+            continue
+        sh_pnl = _lvs_num(r["outcome"].get("pnl_net_fullfee_usd")) or 0.0
+        sh_notional = _lvs_num(act.get("notional_usd")) or 0.0
+        j = _lvs_judge(by_wid.get(r["weekend"], []))
+        real = j["pnl"]
+        diff = None if real is None else real - sh_pnl
+        cat = j["cat"]
+        if j["filled"]:
+            if diff is None:
+                cat = None
+            elif sh_notional > 0 and (j["notional"] or 0) < _LVS_SIZE_FRAC * sh_notional:
+                cat = "规模小"
+            else:
+                cat = "滑点" if abs(diff) >= 0.005 else None
+        rows.append({"friday": friday_of(r["weekend"]), "name": name_of(r["weekend"], default), "side": side,
+                     "sh_pnl": sh_pnl, "status": j["status"], "real": real, "diff": diff, "cat": cat,
+                     "filled": j["filled"]})
+    return rows or None
+
+
+def live_vs_shadow_card(settings) -> str:
+    """/admin 卡「周末线：影子 vs 真钱 逐笔对账」。读不到、为空或没有行，都只写"还没有数据"，不拖垮 /admin。"""
+    title = f"周末线：影子 vs 真钱 逐笔对账（最近 {_LVS_WEEKENDS} 个周末）"
+    head = f'<div class="card" style="margin-top:12px"><div class="k">{E(title)}</div>'
+    try:
+        rows = _live_vs_shadow_rows(settings)
+    except Exception:  # noqa: BLE001
+        rows = None
+    if not rows:
+        return head + '<p class="sub" style="margin-top:8px">还没有数据</p></div>'
+    sh_tot = sum(x["sh_pnl"] for x in rows)
+    real_tot = sum(x["real"] for x in rows if x["real"] is not None)
+    diff_tot = sum(x["diff"] for x in rows if x["diff"] is not None)
+    n_fill = sum(1 for x in rows if x["filled"])
+    cnt = {c: sum(1 for x in rows if x["cat"] == c) for c in _LVS_CATS}
+    amt = {c: sum(x["diff"] for x in rows if x["cat"] == c and x["diff"] is not None) for c in _LVS_CATS}
+    main = max(_LVS_CATS, key=lambda c: (abs(amt[c]), cnt[c]))
+    cnt_txt = "、".join(f"{c} {cnt[c]} 笔" for c in _LVS_CATS)
+    lead = f"差额主要来自「{main}」（{amt[main]:+.2f} $）" if cnt[main] else "两边没有差额"
+    tr = ""
+    for x in rows:
+        side_txt = {1: "买", -1: "卖"}.get(x["side"], "—")
+        tr += (f"<tr><td>{E(x['friday'])}</td><td><b>{E(x['name'])}</b></td><td>{side_txt}</td>"
+               f"<td class='n {_cls(x['sh_pnl'])}'>{_n(x['sh_pnl'], 2, sign=True)}</td>"
+               f"<td>{E(x['status'])}</td>"
+               f"<td class='n {_cls(x['real'])}'>{_n(x['real'], 2, sign=True)}</td>"
+               f"<td class='n {_cls(x['diff'])}'>{_n(x['diff'], 2, sign=True)}</td></tr>")
+    tr += (f"<tr><th>合计</th><th></th><th></th><th class='n {_cls(sh_tot)}'>{_n(sh_tot, 2, sign=True)}</th>"
+           f"<th>{n_fill} 笔成交</th><th class='n {_cls(real_tot)}'>{_n(real_tot, 2, sign=True)}</th>"
+           f"<th class='n {_cls(diff_tot)}'>{_n(diff_tot, 2, sign=True)}</th></tr>")
+    return (head
+            + '<div class="tw" style="margin-top:8px"><table style="font-size:13px"><tr><th>周末（周五）</th><th>合约</th><th>影子方向</th>'
+              '<th class="n">影子盈亏 $</th><th>真钱状态</th><th class="n">真钱盈亏 $</th><th class="n">差额 $（真钱−影子）</th></tr>'
+            + tr + "</table></div>"
+            + f'<div class="ev">影子 {len(rows)} 笔，真钱成交 {n_fill} 笔；{lead}：{cnt_txt}。'
+              f'差额 = 真钱 − 影子，真钱没成交或没下单按 0 算。规模小 = 真钱计划金额不到影子的 90%；滑点 = 其余成交差额（成交价、手续费、时点）。</div></div>')
+
+
 @app.get("/admin", response_class=HTMLResponse)
 def overview(req: Request):
     if (r := _guard(req)):
@@ -742,6 +872,8 @@ def overview(req: Request):
   {shadow_html or '<tr><td colspan=5 class="mut">还没有完成的周末。</td></tr>'}</table></div>
   <div class="ev">{E(strategy_line(S))}。v2 = 实验室走前挑选在美股单票上自己选中、样本外通过的规则；「单票反向>50（不停手）」和 v2 之差 = 停手规则的效果。上真钱的门槛：影子 v2 在 ≥ 8 个日历周末上全额手续费为正，且实验室样本外仍通过。样本外回测见 data/reports/strategy_lab.md。</div>
 </div>
+
+{live_vs_shadow_card(S)}
 
 {_positions_card()}
 

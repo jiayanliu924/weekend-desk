@@ -129,6 +129,11 @@ class Client:
     def fills(self, coin: str, since_ms: int) -> list[dict]:
         return [f for f in self.info.user_fills(self.address) if f.get("coin") == coin and f.get("time", 0) >= since_ms]
 
+    def mid(self, coin: str) -> float:
+        """盘口中间价（只读；平仓前记一笔，事后复盘滑点用）。"""
+        lv = self.info.l2_snapshot(coin)["levels"]
+        return (float(lv[0][0]["px"]) + float(lv[1][0]["px"])) / 2
+
 
 _client_factory = None   # tests replace this
 
@@ -259,16 +264,127 @@ def _vetoed(settings, name: str) -> str | None:
     return None
 
 
-# ------------------------------------------------------------------ the three steps
-def entry(settings, w, lock: dict | None) -> dict | None:
-    cfg = get(settings)
-    if cfg["mode"] == "off" or not lock:
+# ------------------------------------------------------------------ 记录用的小工具（只读/只写账，不改下单行为）
+EXIT_POLL_N = 5        # 平仓后最多读几次成交
+EXIT_POLL_S = 2.0      # 每次间隔（秒）
+
+
+def _sleep(sec: float) -> None:
+    if not _client_factory:      # 测试用假客户端时不真睡（和原来 sleep(2 if ... and not _client_factory) 一致）
+        time.sleep(sec)
+
+
+def _f(x) -> float | None:
+    try:
+        return float(x)
+    except (TypeError, ValueError):
         return None
-    from . import account_stop
-    if account_stop.check(settings).get("tripped"):      # 总账户止损：触发后不再开新仓
+
+
+def parse_order_resp(resp) -> dict:
+    """解析 Hyperliquid 下单返回 → {exch_status: resting/filled/error/unknown, exch_error, oid}。结构缺失一律 unknown，不抛错。"""
+    out = {"exch_status": "unknown", "exch_error": None, "oid": None}
+    try:
+        if not isinstance(resp, dict):
+            return out
+        if str(resp.get("status", "")).lower() == "err":      # 顶层就失败：response 是一段文字
+            return {**out, "exch_status": "error", "exch_error": str(resp.get("response"))[:500]}
+        inner = resp.get("response")
+        data = inner.get("data") if isinstance(inner, dict) else None
+        sts = data.get("statuses") if isinstance(data, dict) else None
+        if not isinstance(sts, list) or not sts:
+            return out
+        for st in sts:
+            if isinstance(st, dict) and st.get("error") is not None:
+                return {**out, "exch_status": "error", "exch_error": str(st["error"])[:500]}
+        first = sts[0]
+        if isinstance(first, dict):
+            for key in ("filled", "resting"):
+                if isinstance(first.get(key), dict):
+                    oid = first[key].get("oid")
+                    return {**out, "exch_status": key, "oid": oid}
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
+def note_nolive(settings, weekend: str, name: str | None, reason: str) -> dict | None:
+    """"没下单"的原因记一笔 kind=nolive。同一 weekend+name+reason 只写一次（调度每分钟可能重复进来）。写账失败不影响调用方。"""
+    try:
+        led = _led(settings)
+        for r in led.all():
+            if r.get("kind") == "nolive" and r.get("weekend") == weekend and r.get("name") == name and r.get("reason") == reason:
+                return None
+        body = {"reason": reason, "ts": time.time()}
+        if name:
+            body["name"] = name
+        return led.append("nolive", weekend, body)
+    except Exception:  # noqa: BLE001
+        log.exception("nolive write failed")
+        return None
+
+
+def note_missed_window(settings, w) -> dict | None:
+    """调度器发现：这个周末锁定已完成（或失败），但真钱发单窗口已过、live_entry 没跑过。mode off 不记。"""
+    if get(settings)["mode"] == "off":
         return None
     led = _led(settings)
     if any(r["kind"] == "entry" and r["weekend"] == w.wid for r in led.all()):
+        return None
+    has_lock = bool(Ledger(settings.data).weekend(w.wid).get("lock"))
+    return note_nolive(settings, w.wid, getattr(w, "name", None),
+                       "错过发单窗口" if has_lock else "错过发单窗口（且没有锁定记录）")
+
+
+def _is_close_fill(f: dict) -> bool:
+    return str(f.get("dir", "")).startswith("Close") or bool(_f(f.get("closedPnl")))
+
+
+def _wavg_px(fills: list[dict]) -> float | None:
+    num = den = 0.0
+    for f in fills:
+        px, sz = _f(f.get("px")), _f(f.get("sz"))
+        if px is not None and sz:
+            num += px * abs(sz)
+            den += abs(sz)
+    return round(num / den, 6) if den else None
+
+
+def _close_seen(fills: list[dict], pos: float) -> bool:
+    """看到平仓成交了吗？有 sz 字段就要求平仓成交量 ≥ 平仓前仓位的 99.9%；没有 sz（只能判断有无）就有就算。"""
+    cl = [f for f in fills if _is_close_fill(f)]
+    if not cl:
+        return False
+    szs = [_f(f.get("sz")) for f in cl]
+    if any(z is None for z in szs):
+        return True
+    return sum(abs(z) for z in szs) >= abs(pos) * 0.999
+
+
+def _mid_of(c, coin: str) -> float | None:
+    try:
+        m = _f(c.mid(coin))
+        return m if m and m > 0 else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+# ------------------------------------------------------------------ the three steps
+def entry(settings, w, lock: dict | None) -> dict | None:
+    cfg = get(settings)
+    if cfg["mode"] == "off":
+        return None
+    nm0 = getattr(w, "name", None) or (lock or {}).get("name")
+    if not lock:
+        note_nolive(settings, w.wid, nm0, "没有锁定记录（lock 缺失），不下单")
+        return None
+    from . import account_stop
+    if account_stop.check(settings).get("tripped"):      # 总账户止损：触发后不再开新仓
+        note_nolive(settings, w.wid, nm0, "总账户止损已触发，不再开新仓")
+        return None
+    led = _led(settings)
+    if any(r["kind"] == "entry" and r["weekend"] == w.wid for r in led.all()):
+        note_nolive(settings, w.wid, nm0, "本周末已有下单记录，不重复下单")
         return None
     a = lock.get("action", {})
     name, coin = w.name or lock.get("name"), w.coin or lock.get("coin")
@@ -324,8 +440,16 @@ def entry(settings, w, lock: dict | None) -> dict | None:
             return led.append("entry", w.wid, {**plan, "skipped": "金额太小，凑不够最小下单单位"})
         c.set_leverage(coin, 1)
         resp = c.post_only(coin, is_buy, sz, px)
-        rec = led.append("entry", w.wid, {**plan, "sent": True, "sz": sz, "px": px, "resp": resp, "t_ms": int(time.time() * 1000)})
-        notify.push(settings, f"已挂单：{name} {plan['side']}", f"{sz} 张 @ {px}（约 ${notional:.0f}），开盘前没成交会自动撤单", priority="high")
+        pr = parse_order_resp(resp)
+        rejected = pr["exch_status"] == "error"
+        extra = {"error": "下单被拒：" + pr["exch_error"]} if rejected else {}      # daily_report 认 error 字段，显示成"挂单失败"
+        rec = led.append("entry", w.wid, {**plan, "sent": not rejected, "sz": sz, "px": px, "resp": resp,
+                                          "t_ms": int(time.time() * 1000), **pr, **extra})
+        if rejected:
+            notify.push(settings, f"自动下单被拒：{name} {plan['side']}", f"下单被拒：{pr['exch_error']}", priority="high")
+        else:
+            verb = "已成交" if pr["exch_status"] == "filled" else "已挂单"
+            notify.push(settings, f"{verb}：{name} {plan['side']}", f"{sz} 张 @ {px}（约 ${notional:.0f}），开盘前没成交会自动撤单", priority="high")
         return rec
     except Exception as e:  # noqa: BLE001
         log.exception("entry failed")
@@ -345,7 +469,22 @@ def cancel_unfilled(settings, w) -> dict | None:
             c.cancel(ent["coin"], o["oid"])
             n += 1
         pos = c.position(ent["coin"])
-        return led.append("cancel", w.wid, {"coin": ent["coin"], "cancelled": n, "position": pos})
+        filled_sz, avg_px = None, None
+        try:      # 只读：从成交记录推入场成交量/均价；读不到就留 null，不影响撤单记录
+            fl = c.fills(ent["coin"], ent.get("t_ms", 0) - 60_000)
+            exp = {"买": "B", "卖": "A"}.get(ent.get("side"))
+            fl = [f for f in fl if not str(f.get("dir", "")).startswith("Close") and (exp is None or f.get("side") in (None, exp))]
+            szs = [abs(_f(f.get("sz")) or 0.0) for f in fl]
+            if fl and sum(szs) > 0:
+                filled_sz, avg_px = round(sum(szs), 8), _wavg_px(fl)
+            elif pos:
+                filled_sz = abs(pos)
+            else:
+                filled_sz = 0.0
+        except Exception:  # noqa: BLE001
+            filled_sz = abs(pos) if pos else None
+        return led.append("cancel", w.wid, {"coin": ent["coin"], "cancelled": n, "position": pos,
+                                            "filled_sz": filled_sz, "entry_avg_px": avg_px})
     except Exception as e:  # noqa: BLE001
         notify.push(settings, f"撤单失败：{ent['name']}", str(e)[:300], priority="high")
         return led.append("cancel", w.wid, {"coin": ent["coin"], "error": str(e)[:300]})
@@ -359,14 +498,29 @@ def exit_(settings, w) -> dict | None:
     try:
         c = client()
         pos = c.position(ent["coin"])
+        mid = _mid_of(c, ent["coin"]) if pos else None
         resp = c.close(ent["coin"]) if pos else None
-        time.sleep(2 if pos and not _client_factory else 0)
-        fills = c.fills(ent["coin"], ent.get("t_ms", 0) - 60_000)
+        since = ent.get("t_ms", 0) - 60_000
+        if pos:      # 等到看见平仓成交再算盈亏：最多读 EXIT_POLL_N 次，每次前等 EXIT_POLL_S 秒
+            complete = False
+            for _ in range(EXIT_POLL_N):
+                _sleep(EXIT_POLL_S)
+                fills = c.fills(ent["coin"], since)
+                if _close_seen(fills, pos):
+                    complete = True
+                    break
+        else:
+            fills, complete = c.fills(ent["coin"], since), True      # 没仓位：没东西可等
         pnl = sum(float(f.get("closedPnl", 0) or 0) - float(f.get("fee", 0) or 0) for f in fills)
+        fee = sum(_f(f.get("fee")) or 0.0 for f in fills)
         rec = led.append("exit", w.wid, {"coin": ent["coin"], "name": ent["name"], "position_before": pos, "resp": resp,
-                                         "n_fills": len(fills), "pnl_usd": round(pnl, 4)})
+                                         "n_fills": len(fills), "pnl_usd": round(pnl, 4),
+                                         "exit_avg_px": _wavg_px([f for f in fills if _is_close_fill(f)]),
+                                         "fee_usd": round(fee, 6), "mid_at_exit": mid, "fills_complete": complete})
         msg = (f"{ent['name']}：没有成交，不赚不亏" if not fills else
                f"{ent['name']}：已平仓，这一笔真实盈亏 ${pnl:+.2f}（含手续费）。累计 ${realized_total(settings):+.2f}")
+        if not complete:
+            msg += "（平仓成交回报没读全，盈亏可能不准，请对一下 Hyperliquid）"
         notify.push(settings, "自动下单结果", msg, priority="high")
         return rec
     except Exception as e:  # noqa: BLE001

@@ -38,6 +38,10 @@ def due_jobs(now: datetime, settings, done: set) -> list[tuple[str, object]]:
             # 自动下单（模式 off 时这些任务什么都不做）
             if k("lock") in done and wk.decision <= now < wk.resume - timedelta(minutes=2) and k("live_entry") not in done:
                 out.append((k("live_entry"), wk))
+            # 锁定做完了、发单窗口却已过、live_entry 没跑过 → 记一条 nolive（mode off 时 note_missed_window 什么都不写）
+            if k("lock") in done and wk.resume - timedelta(minutes=2) <= now < wk.exit and k("live_entry") not in done \
+                    and k("live_missed") not in done:
+                out.append((k("live_missed"), wk))
             if wk.resume - timedelta(minutes=1) <= now < wk.exit and k("live_cancel") not in done:
                 out.append((k("live_cancel"), wk))
             # 看门狗：重开到正式平仓之间，每分钟看一次"已实现+未实现"是否破上限（防重开瞬间跳空）
@@ -204,6 +208,8 @@ def run_job(key: str, wk, settings):
         from .ledger import Ledger
         if name.startswith("live_guard"):
             return autotrade.kill_check(settings)
+        if name == "live_missed":
+            return autotrade.note_missed_window(settings, wk)
         if name == "live_entry":
             return autotrade.entry(settings, wk, Ledger(settings.data).weekend(wk.wid).get("lock"))
         if name == "live_cancel":
@@ -294,7 +300,15 @@ def entry_due_now(wk, now: datetime) -> bool:
 
 async def _entry_right_after_lock(lock_key: str, wk, settings, done: set) -> None:
     ek = lock_key[: -len(":lock")] + ":live_entry"
-    if ek in done or not entry_due_now(wk, datetime.now(timezone.utc)):
+    if ek in done:
+        return
+    if not entry_due_now(wk, datetime.now(timezone.utc)):
+        log.info("live_entry window missed for %s", lock_key)
+        try:      # 锁定完成时已过真钱发单窗口：记 nolive（同 weekend+name+reason 只写一次；mode off 不写）
+            from . import autotrade
+            autotrade.note_missed_window(settings, wk)
+        except Exception as e:  # noqa: BLE001
+            log.warning("note_missed_window failed: %s", e)
         return
     done.add(lock_key)          # live_entry 的前提（和 due_jobs 一致）：先记 lock 已完成，再下单
     try:
