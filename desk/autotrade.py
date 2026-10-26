@@ -541,6 +541,11 @@ def requote_unfilled(settings, w) -> dict | None:
                 return done(skipped="重挂前中断，读不到成交记录，不补挂", exch_error=str(e)[:300])
             if fl > 0:
                 return done(skipped="重挂前中断，期间已有成交，不补挂")
+            try:      # 新单可能已发出并成交、但 user_fills 还没出现：任何方向的非零仓位都不补挂；读不到也不补
+                if abs(_f(c.position(coin)) or 0.0) > 0:
+                    return done(skipped="已有仓位，不补挂")
+            except Exception as e:  # noqa: BLE001
+                return done(skipped="重挂前中断，读不到仓位，不补挂", exch_error=str(e)[:300])
             sz = round_sz(_f(pend.get("remaining_sz")) or 0.0, dec)
             rec["remaining_sz"] = sz
             if sz <= 0:
@@ -769,17 +774,30 @@ def _resp_fill(resp) -> tuple[float, float] | None:
     return None
 
 
-def _resp_pnl_estimate(settings, ent, w, pos: float, resp) -> float | None:
-    """成交明细读不到时的兜底：按平仓返回的 avgPx/totalSz 和入场均价（撤单记录的 entry_avg_px，没有就用挂单价）估算，不含手续费。"""
+def _entry_px_guess(settings, ent, w) -> float | None:
+    """估算用的入场价，回退链：撤单记录的 entry_avg_px（真实成交均价）→ 本周末本合约最新一条 stage=done 且有 new_px 的重挂记录的 new_px
+    （原单被撤、成交多半发生在重挂价）→ entry 的挂单价。"""
+    rows = _led(settings).all()
+    for r in reversed(rows):
+        if r["kind"] == "cancel" and r["weekend"] == w.wid and _f(r.get("entry_avg_px")):
+            return _f(r["entry_avg_px"])
+    for r in reversed(rows):
+        if r["kind"] == "requote" and r["weekend"] == w.wid and r.get("stage") == "done" and _f(r.get("new_px")) \
+                and r.get("coin", ent.get("coin")) == ent.get("coin"):
+            return _f(r["new_px"])
+    return _f(ent.get("px"))
+
+
+def _resp_pnl_estimate(settings, ent, w, pos: float, resp, missing: float | None = None) -> float | None:
+    """成交明细没读全时的兜底：对"没读到成交的那部分数量"（默认整个仓位）按平仓返回的 avgPx 和入场价估算毛盈亏，不含任何手续费。
+    数量取 min(missing, 平仓返回的 totalSz)。"""
     rf = _resp_fill(resp)
     if not rf or not pos:
         return None
     sz, exit_px = rf
-    entry_px = None
-    for r in _led(settings).all():
-        if r["kind"] == "cancel" and r["weekend"] == w.wid and _f(r.get("entry_avg_px")):
-            entry_px = _f(r["entry_avg_px"])
-    entry_px = entry_px or _f(ent.get("px"))
+    if missing is not None:
+        sz = min(sz, max(0.0, missing))
+    entry_px = _entry_px_guess(settings, ent, w)
     if not entry_px:
         return None
     return (exit_px - entry_px) * sz * (1 if pos > 0 else -1)
@@ -827,9 +845,19 @@ def exit_(settings, w) -> dict | None:
     if pos and not has_close:      # 一笔平仓成交都没读到：用平仓返回估算（总比记 0 强），并明确标成估算
         est = _resp_pnl_estimate(settings, ent, w, pos, resp)
         if est is not None:
-            pnl, source = est - fee, "resp_estimate"
+            pnl, source = est - fee, "resp_estimate"      # fee = 已读到的手续费（只有入场那笔）；平仓手续费没法估，不计入
             rf = _resp_fill(resp)
             close_px = rf[1] if rf else close_px
+    elif pos and has_close and not complete:      # 只读到一部分平仓成交（覆盖 < 99.9% 平仓量）：读到的按真实成交，剩余部分按平仓返回估算
+        try:
+            szs = [_f(f.get("sz")) for f in fills if _is_close_fill(f)]
+            covered = sum(abs(z) for z in szs) if all(z is not None for z in szs) else None
+        except Exception:  # noqa: BLE001
+            covered = None
+        if covered is not None and covered < abs(pos) * 0.999:
+            est = _resp_pnl_estimate(settings, ent, w, pos, resp, missing=abs(pos) - covered)
+            if est is not None:
+                pnl, source = pnl + est, "partial_plus_estimate"
     body = {"coin": ent["coin"], "name": ent["name"], "position_before": pos, "resp": resp,
             "n_fills": len(fills), "pnl_usd": round(pnl, 4), "exit_avg_px": close_px,
             "fee_usd": round(fee, 6), "mid_at_exit": mid, "fills_complete": complete, "pnl_source": source}
@@ -841,8 +869,9 @@ def exit_(settings, w) -> dict | None:
             msg = (f"{ent['name']}：没有成交，不赚不亏" if not fills else
                    f"{ent['name']}：已平仓，这一笔真实盈亏 ${pnl:+.2f}（含手续费）。累计 ${realized_total(settings):+.2f}")
         else:
-            msg = (f"{ent['name']}：已平仓，成交明细稍后核对。暂记盈亏 ${pnl:+.2f}"
-                   f"{'（按平仓返回估算，未含手续费）' if source == 'resp_estimate' else ''}"
+            note = {"resp_estimate": "（按平仓返回估算：已含入场手续费，平仓手续费没算进去）",
+                    "partial_plus_estimate": "（已读到的成交按真实算，其余按平仓返回估算：平仓手续费只含已读到的部分）"}.get(source, "")
+            msg = (f"{ent['name']}：已平仓，成交明细稍后核对。暂记盈亏 ${pnl:+.2f}{note}"
                    "（平仓成交回报没读全，盈亏可能不准，请对一下 Hyperliquid）")
         notify.push(settings, "自动下单结果", msg, priority="high")
     except Exception:  # noqa: BLE001

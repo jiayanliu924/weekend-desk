@@ -15,3 +15,4 @@
 - lab_room 在 RLIMIT_AS=900MB 下依赖 LEAN_ENV（pyarrow 用系统分配器）；换服务器/升级 pyarrow 后要重新实测一次
 - 期权研究室（2026-10-25，L4 审计后仍在的）：只在合成数据 + 假 LLM 上跑过；真数据下 900MB 内存上限和 90 分钟超时够不够待实测。开发段只有 18 个月，DSR/PBO 在样本这么少时本身噪声大。金库考试用 v2 的整周自助 p（预登记口径），开发段用平稳块自助，两者不同。critics 按开发段 DSR 正负打分，不是按金库。
 - 测试曾在服务器上从 /opt/weekend-desk/.env 读到真 API key，3 条 lab_room 子进程测试真的调了大模型并超时（2026-10-25）→ 已修：测试进程设 DESK_TEST=1，config.load_env 不读 .env。
+- tests/test_qa.py::test_functional_and_security_all_pass 在沙盒里失败（QA 探测返回 200），与周末线无关，2026-10-26 前已存在。

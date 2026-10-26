@@ -577,3 +577,95 @@ def test_missed_window_not_written_when_lock_has_no_side(env, monkeypatch):  # n
         Ledger(s.data).path.unlink()
     Ledger(s.data).append("lock", w.wid, _rq_lock(side=-1))
     assert autotrade.note_missed_window(s, w)["reason"] == "错过发单窗口"
+
+
+# ------------------------------------------------------------------ 7. 第 3 轮：补挂前看仓位 / 估算入场价回退链
+def _crash_after_post(fc, monkeypatch):
+    real = fc.post_only
+
+    def post_then_die(*a):
+        real(*a)
+        raise Crash()
+    monkeypatch.setattr(fc, "post_only", post_then_die)
+    return real
+
+
+def test_crash_after_post_filled_but_fills_lag_position_nonzero_no_repost(env, monkeypatch, pushes):  # noqa: F811
+    s, w, fc, ent = _placed(env, monkeypatch)
+    fc.book = {"bid": 29998.0, "ask": 30002.0}
+    real = _crash_after_post(fc, monkeypatch)
+    with pytest.raises(Crash):
+        autotrade.requote_unfilled(s, w)
+    assert len(fc.orders) == 2                                    # 新单已发出
+    fc.open, fc.fill_list, fc.pos = [], [], -ent["sz"]            # 已成交，但 user_fills 还没出现；仓位已有
+    monkeypatch.setattr(fc, "post_only", real)
+    rec = autotrade.requote_unfilled(s, w)
+    assert rec["stage"] == "done" and rec["skipped"] == "已有仓位，不补挂" and rec["new_px"] is None
+    assert len(fc.orders) == 2
+
+
+@pytest.mark.parametrize("pos", [0.0007, -0.0007])
+def test_pending_resume_any_direction_position_blocks(env, monkeypatch, pushes, pos):  # noqa: F811
+    s, w, fc, ent = _placed(env, monkeypatch)
+    fc.book = {"bid": 29998.0, "ask": 30002.0}
+    monkeypatch.setattr(fc, "post_only", lambda *a: (_ for _ in ()).throw(Crash()))
+    with pytest.raises(Crash):
+        autotrade.requote_unfilled(s, w)
+    fc.pos = pos
+    assert autotrade.requote_unfilled(s, w)["skipped"] == "已有仓位，不补挂" and len(fc.orders) == 1
+
+
+def test_pending_resume_position_read_error_blocks(env, monkeypatch, pushes):  # noqa: F811
+    s, w, fc, ent = _placed(env, monkeypatch)
+    fc.book = {"bid": 29998.0, "ask": 30002.0}
+    monkeypatch.setattr(fc, "post_only", lambda *a: (_ for _ in ()).throw(Crash()))
+    with pytest.raises(Crash):
+        autotrade.requote_unfilled(s, w)
+    monkeypatch.setattr(fc, "position", lambda coin: (_ for _ in ()).throw(RuntimeError("仓位接口挂了")))
+    rec = autotrade.requote_unfilled(s, w)
+    assert rec["stage"] == "done" and "读不到仓位" in rec["skipped"] and len(fc.orders) == 1
+
+
+def _exit_setup(env, monkeypatch, close_resp):  # noqa: F811
+    s, w, fc, ent = _placed(env, monkeypatch)
+    monkeypatch.setattr(autotrade, "_sleep", lambda sec: None)
+    fc.pos = -ent["sz"]
+    fc.fill_list = []                                              # 成交明细一直读不到
+    monkeypatch.setattr(fc, "close", lambda coin: (setattr(fc, "pos", 0), close_resp)[1])
+    return s, w, fc, ent
+
+
+def _filled_resp(sz, px):
+    return {"status": "ok", "response": {"type": "order", "data": {"statuses": [{"filled": {"totalSz": str(sz), "avgPx": str(px), "oid": 9}}]}}}
+
+
+def test_exit_estimate_entry_px_uses_requote_new_px(env, monkeypatch, pushes):  # noqa: F811
+    """空单原挂 30005、重挂 30002、平仓 29990 → 入场价取 30002 → 估 +12 × 量。"""
+    s, w, fc, ent = _exit_setup(env, monkeypatch, None)
+    sz = ent["sz"]
+    monkeypatch.setattr(fc, "close", lambda coin: (setattr(fc, "pos", 0), _filled_resp(sz, 29990.0))[1])
+    fc.book = {"bid": 29998.0, "ask": 30002.0}
+    fc.pos = 0
+    assert autotrade.requote_unfilled(s, w)["new_px"] == 30002.0
+    fc.pos = -sz
+    x = autotrade.exit_(s, w)
+    assert x["pnl_source"] == "resp_estimate" and x["pnl_usd"] == pytest.approx(12.0 * sz)
+
+
+def test_exit_estimate_entry_px_chain_priority(env, monkeypatch, pushes):  # noqa: F811
+    s, w, fc, ent = _exit_setup(env, monkeypatch, None)
+    sz = ent["sz"]
+    # 只有 entry 挂单价 30005
+    assert autotrade._entry_px_guess(s, ent, w) == 30005.0
+    # 有 done 且带 new_px 的重挂 → 用它（取最新一条）；pending / skipped 的不算
+    led = Ledger(s.data, "live")
+    led.append("requote", w.wid, {"stage": "done", "coin": ent["coin"], "new_px": 30001.0})
+    led.append("requote", w.wid, {"stage": "pending", "coin": ent["coin"], "new_px": 29000.0})
+    led.append("requote", w.wid, {"stage": "done", "coin": ent["coin"], "new_px": None, "skipped": "x"})
+    assert autotrade._entry_px_guess(s, ent, w) == 30001.0
+    # 别的周末的不串
+    led.append("requote", "2000-01-07|XYZ100", {"stage": "done", "coin": ent["coin"], "new_px": 1.0})
+    assert autotrade._entry_px_guess(s, ent, w) == 30001.0
+    # cancel 里有真实成交均价 → 最优先
+    led.append("cancel", w.wid, {"coin": ent["coin"], "entry_avg_px": 30003.5})
+    assert autotrade._entry_px_guess(s, ent, w) == 30003.5

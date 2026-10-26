@@ -290,8 +290,59 @@ def test_exit_second_poll_raises_uses_first_poll_fills(env, monkeypatch, pushes)
     monkeypatch.setattr(autotrade, "_sleep", lambda sec: None)
     s, w = _open_and_pos(env, fc, monkeypatch)
     x = autotrade.exit_(s, w)
-    assert x["pnl_usd"] == pytest.approx((0 - 0.01) + (0.05 - 0.01)) and x["pnl_source"] == "fills"
+    # 读到 0.0010 的真实成交：(0−0.01)+(0.05−0.01)；没读到的 0.0023 用平仓返回 avgPx 29990 对入场价 30010（空单）估算 +0.046
+    assert x["pnl_usd"] == pytest.approx(0.03 + 0.0023 * 20) and x["pnl_source"] == "partial_plus_estimate"
     assert x["fills_complete"] is False and x["n_fills"] == 2 and "error" not in x
+    assert "已含入场手续费" not in pushes[-1][1] and "其余按平仓返回估算" in pushes[-1][1] and "未含手续费" not in pushes[-1][1]
+
+
+class PartialFills(FakeClient):
+    """一直只读到一部分平仓成交（没有异常）。"""
+
+    def __init__(self, resp):
+        super().__init__()
+        self.resp = resp
+
+    def close(self, coin):
+        super().close(coin)
+        return self.resp
+
+
+def test_exit_partial_close_fills_plus_estimate(env, monkeypatch, pushes):  # noqa: F811
+    fc = PartialFills(CLOSE_RESP)
+    monkeypatch.setattr(autotrade, "_sleep", lambda sec: None)
+    s, w = _open_and_pos(env, fc, monkeypatch)
+    fc.fill_list = [CLOSE_FILLS[0], {**CLOSE_FILLS[1], "sz": "0.0020", "closedPnl": "0.12", "fee": "0.02"}]
+    x = autotrade.exit_(s, w)
+    assert x["fills_complete"] is False and x["pnl_source"] == "partial_plus_estimate" and "poll_error" not in x
+    assert x["pnl_usd"] == pytest.approx((0 - 0.01) + (0.12 - 0.02) + 0.0013 * 20)          # 剩 0.0013 按估算
+    assert autotrade.realized_total(s) == pytest.approx(x["pnl_usd"])
+
+
+def test_exit_partial_without_usable_resp_keeps_real_fills_only(env, monkeypatch, pushes):  # noqa: F811
+    fc = PartialFills({"status": "ok"})
+    monkeypatch.setattr(autotrade, "_sleep", lambda sec: None)
+    s, w = _open_and_pos(env, fc, monkeypatch)
+    fc.fill_list = [CLOSE_FILLS[0], {**CLOSE_FILLS[1], "sz": "0.0020", "closedPnl": "0.12", "fee": "0.02"}]
+    x = autotrade.exit_(s, w)
+    assert x["pnl_source"] == "fills" and x["fills_complete"] is False and x["pnl_usd"] == pytest.approx(0.09)
+
+
+def test_exit_full_close_fills_not_estimated(env, monkeypatch, pushes):  # noqa: F811
+    fc = PartialFills(CLOSE_RESP)
+    monkeypatch.setattr(autotrade, "_sleep", lambda sec: None)
+    s, w = _open_and_pos(env, fc, monkeypatch)
+    x = autotrade.exit_(s, w)
+    assert x["pnl_source"] == "fills" and x["fills_complete"] is True and x["pnl_usd"] == pytest.approx(0.16)
+
+
+def test_exit_resp_estimate_message_is_honest_about_fees(env, monkeypatch, pushes):  # noqa: F811
+    fc = FlakyFills(OPEN_ONLY, CLOSE_RESP)
+    monkeypatch.setattr(autotrade, "_sleep", lambda sec: None)
+    s, w = _open_and_pos(env, fc, monkeypatch)
+    autotrade.exit_(s, w)
+    m = pushes[-1][1]
+    assert "已含入场手续费" in m and "平仓手续费没算进去" in m and "未含手续费" not in m
 
 
 def test_exit_poll_exception_and_unparseable_resp_still_writes_exit(env, monkeypatch, pushes):  # noqa: F811
