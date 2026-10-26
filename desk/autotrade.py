@@ -21,7 +21,7 @@ import os
 import time
 from pathlib import Path
 
-from . import model, notify
+from . import hl_rate, model, notify
 from .ledger import Ledger
 
 log = logging.getLogger("autotrade")
@@ -77,7 +77,9 @@ class Client:
         from hyperliquid.utils import constants
         self.address = address
         self.info = Info(constants.MAINNET_API_URL, skip_ws=True, perp_dexs=["", DEX])
+        hl_rate.wrap(self.info)
         self.ex = Exchange(Account.from_key(key), constants.MAINNET_API_URL, account_address=address, perp_dexs=["", DEX])
+        hl_rate.wrap(self.ex)
 
     def spot_usdc(self) -> float:
         """现货里的 USDC。Unified（统一账户）模式下，这笔现货 USDC 就是合约下单用的保证金

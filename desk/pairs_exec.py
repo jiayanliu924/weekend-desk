@@ -37,7 +37,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from . import autotrade, notify
+from . import autotrade, hl_rate, notify
 from . import backtest_lib as bl
 from . import pairs_lab as pl
 from . import universe as uv
@@ -165,7 +165,9 @@ class PairsClient(autotrade.Client):
         self.address = address
         names = ["", *sorted({d for d in dexs if d})]
         self.info = Info(constants.MAINNET_API_URL, skip_ws=True, perp_dexs=names)
+        hl_rate.wrap(self.info)
         self.ex = Exchange(Account.from_key(key), constants.MAINNET_API_URL, account_address=address, perp_dexs=names)
+        hl_rate.wrap(self.ex)
 
     def position(self, coin: str) -> float:
         st = self.info.user_state(self.address, dex=_dex_of(coin))

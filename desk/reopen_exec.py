@@ -36,7 +36,7 @@ from datetime import date, datetime, time as dtime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from . import autotrade, notify
+from . import autotrade, hl_rate, notify
 from . import reopen_study as rs
 from .ledger import Ledger
 
@@ -180,13 +180,14 @@ def _shared_ctx(fetch):
         now = time.monotonic()
         if _CTX_CACHE["mc"] is not None and now - _CTX_CACHE["t"] < CTX_TTL_S:
             return _CTX_CACHE["mc"]
-        if now < _CTX_BACKOFF["until"]:
+        if now < _CTX_BACKOFF["until"] or hl_rate.LIMITER.backoff_remaining() > 0:
             raise RuntimeError("429 shared backoff active")
         try:
             mc = fetch()
         except Exception as e:  # noqa: BLE001
             if is_rate_limited(e):
                 _CTX_BACKOFF["until"] = time.monotonic() + min(BACKOFF_MAX_S, max(POLL_FLOOR_S, 5.0))
+                hl_rate.LIMITER.note_429(5.0)   # 全进程共享退避
             raise
         _CTX_CACHE.update(t=time.monotonic(), mc=mc)
         return mc
@@ -201,11 +202,13 @@ class ReopenClient(autotrade.Client):
         self.address = address
         names = ["", autotrade.DEX]
         self.info = Info(constants.MAINNET_API_URL, skip_ws=True, perp_dexs=names)
+        hl_rate.wrap(self.info)
         self.ex = None
         if key:
             from eth_account import Account
             from hyperliquid.exchange import Exchange
             self.ex = Exchange(Account.from_key(key), constants.MAINNET_API_URL, account_address=address, perp_dexs=names)
+            hl_rate.wrap(self.ex)
 
     def ctxs(self, coins: list[str]) -> dict:
         mc = _shared_ctx(lambda: self.info.post("/info", {"type": "metaAndAssetCtxs", "dex": autotrade.DEX}))
@@ -1140,7 +1143,7 @@ def list_xyz() -> int:
     """只读：xyz dex meta（metaAndAssetCtxs）里的全部币名。不建钱包、不下单。"""
     from hyperliquid.info import Info
     from hyperliquid.utils import constants
-    info = Info(constants.MAINNET_API_URL, skip_ws=True, perp_dexs=["", autotrade.DEX])
+    info = hl_rate.wrap(Info(constants.MAINNET_API_URL, skip_ws=True, perp_dexs=["", autotrade.DEX]))
     mc = info.post("/info", {"type": "metaAndAssetCtxs", "dex": autotrade.DEX})
     names = [u["name"] for u in mc[0]["universe"] if not u.get("isDelisted")]
     for label, ns in group_xyz(names).items():
