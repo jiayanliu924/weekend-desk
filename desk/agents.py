@@ -298,9 +298,14 @@ def build_bundle(settings, now: datetime | None = None) -> Facts:
                                 f"模拟净盈亏 {sc['pnl_net_usd_total']:+.2f} 美元；滚动止损 {'已触发' if sc['rolling_stop'] else '未触发'}。{sc['verdict']}")
         n_paper = len({r["weekend"][:10] for r in recs})
         missing = execution.gate(settings, n_paper)
-        F.add("实盘锁", "实盘仍锁定：" + "；".join(missing) if missing else "实盘条件已全部满足（仍需人工开启下单代码）")
         from . import autotrade
         at = autotrade.get(settings)
+        if at["mode"] == "live":
+            # 旧的 [live] 清单（律师确认等）是早期备忘，不控制下单；真钱开关只看 autotrade 模式。别让两条事实互相打架
+            F.add("实盘锁", "周末线真钱已由负责人人工开启（自动下单=live），这就是现在的真实状态；"
+                         "配置里旧的 [live] 清单只是早期备忘，不影响下单，不要因为它否决或建议全部不出手。")
+        else:
+            F.add("实盘锁", "实盘仍锁定：" + "；".join(missing) if missing else "实盘条件已全部满足（仍需人工开启下单代码）")
         F.add("自动下单", {"off": "自动下单关闭，全部只是模拟。", "shadow": f"自动下单是演习模式：只推送本来会下的单，不真下（本金上限 ${at['capital_usd']:.0f}）。",
                         "live": f"自动下单已打开（真钱）：本金上限 ${at['capital_usd']:.0f}，累计亏 ${at['max_loss_usd']:.0f} 自动停；"
                                 f"目前累计真实盈亏 ${autotrade.realized_total(settings):+.2f}。风控室的否决会直接让对应合约不下单。"}[at["mode"]])

@@ -258,3 +258,15 @@ def test_arena_html_has_honest_limits_when_lab_results_are_shown(env):  # noqa: 
     html = web._arena_html()
     assert "期权研究室的诚实限制" in html and "开发段只有 18 个月" in html and "金库每看一次就" in html and "不保证找到能赚钱的方案" in html
     assert "期权真报价" in html and "卖波动派" in html                         # 赛道也在排行榜里
+
+
+def test_live_lock_fact_not_contradictory(env):  # noqa: F811
+    """真钱开着时，agent 不能同时看到"实盘仍锁定"和"已打开（真钱）"两条打架的事实。"""
+    s, _ = env
+    from desk import autotrade
+    autotrade.put(s, mode="live")
+    txt = " ".join(str(x.get("text", x)) for x in agents.build_bundle(s).items if x["topic"] == "实盘锁")
+    assert "实盘仍锁定" not in txt and "真钱已由负责人人工开启" in txt
+    autotrade.put(s, mode="off")
+    txt = " ".join(str(x.get("text", x)) for x in agents.build_bundle(s).items if x["topic"] == "实盘锁")
+    assert "真钱已由负责人人工开启" not in txt
