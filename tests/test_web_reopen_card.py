@@ -95,6 +95,6 @@ def test_daily_log(env):
     dec(ev2, "SMSN", "no_t0", note="x")
     h = web.reopen_card_html(s, now)
     for t in ("每日明细", "成交 1 笔，合计 +$0.25", "161.15 卖出 $483 → 161 买回", "到时间强制平仓", "挂单没成交，自动撤单",
-              "盘口价差 85 bps 太宽（盘口太空，交易不了）", "overshoot 3.2 bps &lt; 门槛 5.0 bps", "价格没跳（没有重开）",
+              "盘口价差 85 bps 太宽（盘口太空，交易不了）", "过冲 3.2 bps，没到门槛 5.0 bps", "价格没跳（没有重开）",
               "周日美股", "韩国开盘", "WTI原油", "三星", "10-25 周日", "overflow-x:auto"):
         assert t in h, t
